@@ -1,18 +1,17 @@
-# OpenShorts.app
+# 🎬 PeakCut Studio
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Open Source](https://badges.frapsoft.com/os/v1/open-source.svg?v=103)](https://opensource.org/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/shreeharsh-patil/PeakCut/pulls)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![GitHub stars](https://img.shields.io/github/stars/mutonby/openshorts?style=social)](https://github.com/mutonby/openshorts)
-[![Last Commit](https://img.shields.io/github/last-commit/mutonby/openshorts)](https://github.com/mutonby/openshorts/commits/main)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shreeharsh-patil/PeakCut/blob/main/PeakCut_Colab.ipynb)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-shreeharsh--patil%2FPeakCut-blue?logo=github)](https://github.com/shreeharsh-patil/PeakCut)
 
-**Open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
+**PeakCut Studio** is an all-in-one open-source AI video platform with 3 tools in one: **Viral Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
 
-![Your podcast, and the vertical clip OpenShorts makes of it: both speakers stacked, captions on the seam](screenshots/split-before-after.gif)
+![Your podcast, and the vertical clip PeakCut makes of it: both speakers stacked, captions on the seam](screenshots/split-before-after.gif)
 
-Two people on camera? OpenShorts stacks them instead of shrinking the wide shot, puts the captions on the seam where they cover nobody, and switches back to a face-tracked crop when the cut goes to one person. The AI picks the layout per video; nothing to configure.
+Two people on camera? PeakCut stacks them instead of shrinking the wide shot, puts the captions on the seam where they cover nobody, and switches back to a face-tracked crop when the cut goes to one person. The AI picks the layout per video; nothing to configure.
 
 **Two ways to run it, same software either way:**
 
@@ -343,8 +342,8 @@ subprocess.run("python -m uvicorn app:app --host 127.0.0.1 --port 8000", shell=T
 
 ### 1. Clone
 ```bash
-git clone https://github.com/mutonby/openshorts.git
-cd OpenShorts
+git clone https://github.com/shreeharsh-patil/PeakCut.git
+cd PeakCut
 ```
 
 ### 2. Configure (optional)
@@ -540,10 +539,10 @@ skill-capable agent:
 cp -r skills/openshorts ~/.claude/skills/
 
 # Hermes Agent: install straight from this repo
-hermes skills install mutonby/openshorts/skills/openshorts
+hermes skills install shreeharsh-patil/PeakCut/skills/openshorts
 
 # OpenClaw: from ClawHub
-openclaw skills install @mutonby/openshorts
+openclaw skills install @shreeharsh-patil/PeakCut
 ```
 
 ### n8n
@@ -614,7 +613,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=mutonby/openshorts&type=Date)](https://star-history.com/#mutonby/openshorts&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=shreeharsh-patil/PeakCut&type=Date)](https://star-history.com/#shreeharsh-patil/PeakCut&Date)
 
 ## Contributions
 
