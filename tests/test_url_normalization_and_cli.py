@@ -37,7 +37,21 @@ def test_assert_public_url_with_bare_id():
 
 
 def test_main_cli_arguments():
-    # Verify main.py accepts clip duration flags and does not crash with exit code 2 on unknown flags
+    from main import build_arg_parser
+    parser = build_arg_parser()
+    args, unknown = parser.parse_known_args([
+        "-u", "https://youtube.com/watch?v=12345678901",
+        "--clip-min-seconds", "20",
+        "--clip-max-seconds", "45",
+        "--target-clips", "3",
+        "--unrecognized-flag", "value"
+    ])
+    assert args.clip_min_seconds == 20.0
+    assert args.clip_max_seconds == 45.0
+    assert args.target_clips == 3
+    assert unknown == ["--unrecognized-flag", "value"]
+
+    # Also verify subprocess help flag
     cmd = [
         sys.executable,
         "main.py",

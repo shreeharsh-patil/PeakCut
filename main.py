@@ -30,10 +30,20 @@ try:
 except Exception:
     YOLO = None
 
-import torch
+try:
+    import torch
+except Exception:
+    torch = None
+
 import os
 import numpy as np
-from tqdm import tqdm
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 import yt_dlp
 
 try:
@@ -2024,7 +2034,7 @@ def get_visual_clips(video_path, video_duration, language="en"):
     }
 
 
-if __name__ == '__main__':
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -2044,7 +2054,11 @@ if __name__ == '__main__':
                         help="Maximum duration for extracted clips in seconds.")
     parser.add_argument('--target-clips', '--max-clips', type=int, default=None, dest="target_clips",
                         help="Target number of clips to extract.")
+    return parser
 
+
+if __name__ == '__main__':
+    parser = build_arg_parser()
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"ℹ️ Note: Ignoring unrecognized CLI arguments: {unknown}")
