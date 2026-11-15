@@ -274,7 +274,23 @@ Run the full platform on **Google Colab** with free NVIDIA GPU acceleration (Whi
 # 🎬 PeakCut Studio: One-Click Google Colab Runner
 # Repository: https://github.com/shreeharsh-patil/PeakCut.git
 # ============================================================
+# @title 🚀 Run PeakCut Studio (One-Click Start)
+# @markdown ### 🔑 Gemini API Keys (Optional, Comma-Separated)
+# @markdown Enter one or multiple Gemini API keys. If multiple keys are provided, PeakCut will automatically rotate keys when rate limits or quotas are reached. Leave blank to run with the built-in heuristic virality engine.
+GEMINI_API_KEYS = "" # @param {type:"string"}
+
+# @markdown ### 🎙️ Speech-to-Text Model
+WHISPER_MODEL = "base" # @param ["tiny", "base", "small", "medium", "large-v3"]
+
 import os, subprocess, time, re
+
+if GEMINI_API_KEYS.strip():
+    os.environ["GEMINI_API_KEYS"] = GEMINI_API_KEYS.strip()
+    os.environ["GEMINI_API_KEY"] = GEMINI_API_KEYS.strip()
+
+os.environ["WHISPER_MODEL"] = WHISPER_MODEL
+os.environ["WHISPER_DEVICE"] = "cuda"
+os.environ["WHISPER_COMPUTE"] = "float16"
 
 # 1. System packages & hardware tools
 print("📦 Step 1/5: Installing system dependencies (ffmpeg, fonts)...")
@@ -307,9 +323,6 @@ print("🐍 Step 4/5: Installing Python dependencies...")
 subprocess.run("pip install -q -r requirements.txt", shell=True)
 subprocess.run("pip install -q uvicorn fastapi requests", shell=True)
 
-# (Optional) Rotating API Keys (comma-separated: if one hits 429/quota, it rotates automatically)
-# os.environ["GEMINI_API_KEY"] = "AIzaSyKey1...,AIzaSyKey2...,AIzaSyKey3..."
-
 # 5. Start Cloudflare Tunnel in background
 print("🚀 Step 5/5: Starting Cloudflare tunnel & web server...")
 tunnel = subprocess.Popen(
@@ -321,7 +334,7 @@ tunnel = subprocess.Popen(
 public_url = None
 for _ in range(40):
     line = tunnel.stdout.readline()
-    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\\.com', line)
     if match:
         public_url = match.group(0)
         break

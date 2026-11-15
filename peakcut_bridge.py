@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from alerts_dispatcher import AlertDispatcher
@@ -1421,6 +1421,23 @@ async def list_ai_models_endpoint(req: Request):
         return {"models": ["gpt-4o-mini", "gpt-4o", "o3-mini"]}
     else:
         return {"models": ["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest"]}
+
+
+@router.get("/v1/models")
+@router.get("/api/ai/models")
+async def list_models_compat():
+    """List supported AI models in standard format."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "gemini-3.1-flash-lite", "object": "model", "owned_by": "google"},
+            {"id": "gemini-2.5-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-2.5-pro", "object": "model", "owned_by": "google"},
+            {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+        ],
+        "models": ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
+    }
 
 
 @router.post("/api/ai/test")

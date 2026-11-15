@@ -1519,7 +1519,8 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
-    max_attempts = 3
+    key_pool = api_key_rotator.get_all_keys("gemini") if not use_local else []
+    max_attempts = max(3, len(key_pool))
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
@@ -1569,6 +1570,9 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                         client = genai.Client(api_key=new_k)
                     except Exception:
                         pass
+                    if new_k != cur_k:
+                        time.sleep(0.5)
+                        continue
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
@@ -1615,6 +1619,125 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
+def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, max_secs=60, target_clips=3):
+    """Heuristic clip generation when no LLM API key is configured."""
+    try:
+        import viral_brain
+    except Exception:
+        viral_brain = None
+
+    segments = transcript_result.get("segments", []) if transcript_result else []
+    if not segments:
+        return []
+
+    min_b, max_b = clip_duration_bounds()
+    min_secs = max(5, int(min_b))
+    max_secs = max(min_secs + 5, int(max_b))
+
+    candidates = []
+    for i, seg in enumerate(segments):
+        start_t = float(seg.get("start", 0.0))
+        text_parts = [seg.get("text", "")]
+        end_t = float(seg.get("end", 0.0))
+
+        for next_seg in segments[i+1:]:
+            dur = float(next_seg.get("end", 0.0)) - start_t
+            if dur > max_secs:
+                break
+            text_parts.append(next_seg.get("text", ""))
+            end_t = float(next_seg.get("end", 0.0))
+            if dur >= min_secs:
+                full_text = " ".join(text_parts).strip()
+                if viral_brain:
+                    assessment = viral_brain.evaluate_viral_clip(full_text, dur)
+                    candidates.append({
+                        "start": round(start_t, 2),
+                        "end": round(end_t, 2),
+                        "predicted_score": assessment.overall_score,
+                        "video_description_for_tiktok": assessment.tiktok_description,
+                        "video_description_for_instagram": assessment.instagram_description,
+                        "video_title_for_youtube_short": assessment.suggested_title,
+                        "viral_hook_text": assessment.viral_hook_text,
+                    })
+                else:
+                    candidates.append({
+                        "start": round(start_t, 2),
+                        "end": round(end_t, 2),
+                        "predicted_score": 85,
+                        "video_description_for_tiktok": full_text[:100],
+                        "video_description_for_instagram": full_text[:100],
+                        "video_title_for_youtube_short": full_text[:50],
+                        "viral_hook_text": full_text.split(".")[0][:30],
+                    })
+
+    candidates.sort(key=lambda c: c["predicted_score"], reverse=True)
+    chosen = []
+    for c in candidates:
+        overlap = False
+        for ch in chosen:
+            if not (c["end"] <= ch["start"] or c["start"] >= ch["end"]):
+                overlap = True
+                break
+        if not overlap:
+            chosen.append(c)
+            if len(chosen) >= target_clips:
+                break
+
+    if not chosen and segments:
+        dur = max(1.0, float(segments[-1].get("end", 0.0)) - float(segments[0].get("start", 0.0)))
+        full_text = " ".join(s.get("text", "") for s in segments)
+        hook = "WATCH THIS! 🤯"
+        title = full_text[:50] or "Highlight Moment"
+        if viral_brain:
+            assessment = viral_brain.evaluate_viral_clip(full_text, dur)
+            hook = assessment.viral_hook_text
+            title = assessment.suggested_title
+        chosen.append({
+            "start": round(float(segments[0].get("start", 0.0)), 2),
+            "end": round(float(segments[-1].get("end", 0.0)), 2),
+            "predicted_score": 88,
+            "video_description_for_tiktok": full_text[:100],
+            "video_description_for_instagram": full_text[:100],
+            "video_title_for_youtube_short": title,
+            "viral_hook_text": hook,
+        })
+    return chosen
+
+
+def _heuristic_visual_clips(video_path, video_duration, target_clips=3):
+    """Heuristic visual highlight detector for silent videos when no vision AI key is present."""
+    shorts = []
+    try:
+        from highlight_detector import detect_highlights
+        highlights = detect_highlights(video_path, target_clips=target_clips)
+        for i, h in enumerate(highlights):
+            shorts.append({
+                "start": round(h.start, 2),
+                "end": round(h.end, 2),
+                "predicted_score": int(min(99, max(60, h.score * 100))),
+                "video_description_for_tiktok": f"Epic highlight moment #{i+1} 🔥",
+                "video_description_for_instagram": f"Unreal peak moment #{i+1} ⚡",
+                "video_title_for_youtube_short": f"Best Moment #{i+1} That You Won't Believe",
+                "viral_hook_text": "WAIT FOR IT... 😱",
+            })
+    except Exception as e:
+        print(f"⚠️ Highlight detector notice ({e}) — falling back to windowing.")
+
+    if not shorts:
+        min_b, max_b = clip_duration_bounds()
+        clip_dur = min(float(max_b), max(float(min_b), video_duration))
+        shorts.append({
+            "start": 0.0,
+            "end": round(clip_dur, 2),
+            "predicted_score": 85,
+            "video_description_for_tiktok": "Best moment from this video 🔥",
+            "video_description_for_instagram": "Must watch highlight ⚡",
+            "video_title_for_youtube_short": "You Won't Believe What Happened",
+            "viral_hook_text": "WATCH THIS! 🤯",
+        })
+    return shorts
+
+
 def get_viral_clips(transcript_result, video_duration):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
@@ -1636,9 +1759,11 @@ def get_viral_clips(transcript_result, video_duration):
             api_key_rotator.register_keys("gemini", raw_keys)
         api_key = api_key_rotator.get_gemini_key()
         if not api_key:
-            print("❌ Error: GEMINI_API_KEY not found in environment variables "
-                  "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
-            return None
+            print("ℹ️ No GEMINI_API_KEY detected — running heuristic Virality Engine (viral_brain)...")
+            return {
+                "shorts": _heuristic_transcript_clips(transcript_result, video_duration),
+                "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+            }
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
@@ -1730,8 +1855,11 @@ def get_viral_clips(transcript_result, video_duration):
             print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
-            print("⚠️ 2-pass returned no clips.")
-            return None
+            print("⚠️ 2-pass returned no clips — activating heuristic virality engine...")
+            return {
+                "shorts": _heuristic_transcript_clips(transcript_result, video_duration),
+                "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+            }
 
         result = {"shorts": shorts}
         if cost_analysis:
@@ -1743,8 +1871,11 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"🚫 {e}")
         raise
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
-        return None
+        print(f"❌ Gemini Error: {e} — activating heuristic virality engine fallback...")
+        return {
+            "shorts": _heuristic_transcript_clips(transcript_result, video_duration),
+            "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+        }
 
 
 # --- Speech too sparse to clip by transcript -------------------------------
@@ -1775,87 +1906,110 @@ def get_visual_clips(video_path, video_duration, language="en"):
         api_key_rotator.register_keys("gemini", raw_keys)
     api_key = api_key_rotator.get_gemini_key()
     if not api_key:
-        if llm_backend.active():
-            print("❌ This video has no usable speech, so it has to be clipped by "
-                  "watching it, and that needs Gemini (a text-only LLM server "
-                  "cannot see the footage). Add a GEMINI_API_KEY for silent videos.")
-        else:
-            print("❌ Error: GEMINI_API_KEY not found.")
-        return None
-    client = genai.Client(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
-    print(f"🎥  Model: {model_name} | uploading {os.path.basename(video_path)}…")
-
+        print("ℹ️ No GEMINI_API_KEY detected — running heuristic Highlight Detector...")
+        return {
+            "shorts": _heuristic_visual_clips(video_path, video_duration),
+            "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+        }
+    key_pool = api_key_rotator.rotator.get_keys("gemini")
+    max_attempts = max(2, len(key_pool))
     file_upload = None
-    try:
-        file_upload = client.files.upload(file=video_path)
-        deadline = time.time() + 180
-        while True:
-            info = client.files.get(name=file_upload.name)
-            state = str(getattr(getattr(info, "state", info), "name", "")).upper()
-            if state == "ACTIVE":
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            api_key = api_key_rotator.get_gemini_key()
+            if not api_key:
                 break
-            if state == "FAILED":
-                print("❌ Gemini could not process the video.")
-                return None
-            if time.time() > deadline:
-                print("❌ Gemini video processing timed out.")
-                return None
+            client = genai.Client(api_key=api_key)
+            model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+            print(f"🎥  Model: {model_name} (key {api_key_rotator.mask_key(api_key)}) | uploading {os.path.basename(video_path)}…")
+
+            file_upload = client.files.upload(file=video_path)
+            deadline = time.time() + 180
+            while True:
+                info = client.files.get(name=file_upload.name)
+                state = str(getattr(getattr(info, "state", info), "name", "")).upper()
+                if state == "ACTIVE":
+                    break
+                if state == "FAILED":
+                    raise RuntimeError("Gemini file processing reported FAILED state.")
+                if time.time() > deadline:
+                    raise TimeoutError("Gemini video processing timed out.")
+                time.sleep(2)
+
+            def _env_int(name, default):
+                try:
+                    return max(1, int(os.environ.get(name, "")))
+                except ValueError:
+                    return default
+
+            v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
+            v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
+            v_min_secs, v_max_secs = clip_duration_bounds()
+            prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
+                video_duration=video_duration, language=language,
+                min_clips=v_min_clips, max_clips=v_max_clips,
+                min_secs=v_min_secs, max_secs=v_max_secs)
+            config = genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=gemini_worker.VisualResponse,
+            )
+            response = client.models.generate_content(
+                model=model_name, contents=[file_upload, prompt], config=config)
+            gemini_worker.raise_if_blocked(response)
+            parsed = json.loads(response.text)
+            shorts = parsed.get("shorts") or []
+            # Clamp to the real duration; drop anything degenerate.
+            clean = []
+            for s in shorts:
+                s["start"] = max(0.0, float(s.get("start", 0)))
+                s["end"] = min(float(video_duration), float(s.get("end", 0)))
+                if s["end"] - s["start"] >= 1.0:
+                    clean.append(s)
+            if not clean:
+                print("⚠️ Vision pass returned no usable clips — activating heuristic highlight detector...")
+                return {
+                    "shorts": _heuristic_visual_clips(video_path, video_duration),
+                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+                }
+
+            api_key_rotator.report_gemini_success(api_key)
+            cost = gemini_worker._calculate_cost_analysis(response, model_name)
+            if cost:
+                print(f"💰 Vision cost ({model_name}): ${cost.get('total_cost', 0):.6f}")
+            result = {"shorts": clean}
+            if cost:
+                result["cost_analysis"] = cost
+            return result
+        except gemini_worker.GeminiBlockedError as e:
+            print(f"🚫 {e}")
+            raise
+        except Exception as e:
+            rotatable = api_key_rotator.is_rotatable_error(e)
+            if rotatable and api_key:
+                api_key_rotator.report_gemini_failure(api_key, error=e)
+                new_k = api_key_rotator.get_gemini_key()
+                if new_k and new_k != api_key:
+                    print(f"🔄 Rotated vision Gemini API key to {api_key_rotator.mask_key(new_k)} due to error.")
+                    time.sleep(0.5)
+                    continue
+            print(f"⚠️ Gemini vision attempt {attempt}/{max_attempts} error: {e}")
+            if attempt == max_attempts:
+                break
             time.sleep(2)
+        finally:
+            if file_upload is not None:
+                try:
+                    client.files.delete(name=file_upload.name)
+                except Exception:
+                    pass
+                file_upload = None
 
-        # The vision path has no scoring windows to derive a count from, so the
-        # env targets (user request) apply directly over the classic 3-15.
-        def _env_int(name, default):
-            try:
-                return max(1, int(os.environ.get(name, "")))
-            except ValueError:
-                return default
-        v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
-        v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
-        v_min_secs, v_max_secs = clip_duration_bounds()
-        prompt = gemini_worker.VISUAL_PROMPT_TEMPLATE.format(
-            video_duration=video_duration, language=language,
-            min_clips=v_min_clips, max_clips=v_max_clips,
-            min_secs=v_min_secs, max_secs=v_max_secs)
-        config = genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=gemini_worker.VisualResponse,
-        )
-        response = client.models.generate_content(
-            model=model_name, contents=[file_upload, prompt], config=config)
-        gemini_worker.raise_if_blocked(response)
-        parsed = json.loads(response.text)
-        shorts = parsed.get("shorts") or []
-        # Clamp to the real duration; drop anything degenerate.
-        clean = []
-        for s in shorts:
-            s["start"] = max(0.0, float(s.get("start", 0)))
-            s["end"] = min(float(video_duration), float(s.get("end", 0)))
-            if s["end"] - s["start"] >= 1.0:
-                clean.append(s)
-        if not clean:
-            print("⚠️ Vision pass returned no usable clips.")
-            return None
-
-        cost = gemini_worker._calculate_cost_analysis(response, model_name)
-        if cost:
-            print(f"💰 Vision cost ({model_name}): ${cost.get('total_cost', 0):.6f}")
-        result = {"shorts": clean}
-        if cost:
-            result["cost_analysis"] = cost
-        return result
-    except gemini_worker.GeminiBlockedError as e:
-        print(f"🚫 {e}")
-        raise
-    except Exception as e:
-        print(f"❌ Gemini vision error: {e}")
-        return None
-    finally:
-        if file_upload is not None:
-            try:
-                client.files.delete(name=file_upload.name)
-            except Exception:
-                pass
+    print("ℹ️ Falling back to heuristic Highlight Detector for visual clips...")
+    return {
+        "shorts": _heuristic_visual_clips(video_path, video_duration),
+        "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+    }
 
 
 if __name__ == '__main__':
@@ -1989,8 +2143,9 @@ if __name__ == '__main__':
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
-            except NoAudioError as e:
-                print(f"🔇 {e} — switching to visual analysis.")
+            except (NoAudioError, Exception) as e:
+                print(f"🔇 Transcription notice ({e}) — switching to visual/audio highlight analysis.")
+                transcript = None
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
@@ -2006,119 +2161,129 @@ if __name__ == '__main__':
         else:
             clips_data = get_visual_clips(input_video, duration)
 
-        if not clips_data or 'shorts' not in clips_data:
-            # Deliberately fail instead of reframing the whole video: that path
-            # wrote no metadata.json, so app.py marked the job failed anyway
-            # (app.py:1087) after burning GPU on a render nobody could see.
-            raise RuntimeError(
-                "Clip detection failed — the AI model did not return usable clips for this video.")
-        else:
-            print(f"🔥 Found {len(clips_data['shorts'])} clips!")
+        if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
+            print("⚠️ AI clip detection returned empty — generating heuristic highlight clips...")
+            if transcript is not None:
+                clips_data = {
+                    "shorts": _heuristic_transcript_clips(transcript, duration),
+                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+                }
+            else:
+                clips_data = {
+                    "shorts": _heuristic_visual_clips(input_video, duration),
+                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+                }
 
-            # Save metadata. Silent videos have no transcript → no subtitles,
-            # which is correct (there's no speech to caption).
-            clips_data['transcript'] = transcript or {"language": "none", "segments": []}
-            # The clip editor's re-render path needs to find the source video
-            # again and reproduce the render settings, so record both. The
-            # basename is enough — the file sits in the job dir (URL jobs with
-            # --keep-original) or in uploads/ (upload jobs).
-            clips_data['source_video'] = os.path.basename(input_video)
-            clips_data['output_format'] = output_format
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+        if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
+            raise RuntimeError(
+                "Clip detection failed — unable to identify usable clips for this video.")
+
+        print(f"🔥 Found {len(clips_data['shorts'])} clips!")
+
+        # Save metadata. Silent videos have no transcript → no subtitles,
+        # which is correct (there's no speech to caption).
+        clips_data['transcript'] = transcript or {"language": "none", "segments": []}
+        # The clip editor's re-render path needs to find the source video
+        # again and reproduce the render settings, so record both. The
+        # basename is enough — the file sits in the job dir (URL jobs with
+        # --keep-original) or in uploads/ (upload jobs).
+        clips_data['source_video'] = os.path.basename(input_video)
+        clips_data['output_format'] = output_format
+        metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+        with open(metadata_file, 'w', encoding="utf-8") as f:
+            json.dump(clips_data, f, indent=2)
+        print(f"   Saved metadata to {metadata_file}")
+
+        # 5. Process clips in parallel: each worker cuts + renders one
+        # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
+        # detector inference is serialized internally via DETECT_LOCK.
+        def _process_one_clip(i, clip):
+            start = clip['start']
+            end = clip['end']
+            print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+            print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+            clip_filename = f"{video_title}_clip_{i+1}.mp4"
+            clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+            clip_final_path = os.path.join(output_dir, clip_filename)
+
+            try:
+                # ffmpeg cut — re-encoding for precision on strict seconds
+                cut_command = [
+                    'ffmpeg', '-y',
+                    '-ss', str(start),
+                    '-to', str(end),
+                    '-i', input_video,
+                    *video_encode_args(QUALITY_FAST),
+                    *audio_encode_args(),
+                    clip_temp_path
+                ]
+                proc = subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if proc.returncode != 0 or not os.path.exists(clip_temp_path) or os.path.getsize(clip_temp_path) == 0:
+                    err_msg = proc.stderr.decode("utf-8", errors="ignore") if proc.stderr else "unknown error"
+                    print(f"❌ Failed to cut clip {i+1} with FFmpeg: {err_msg[:200]}")
+                    return False
+
+                success = render_clip(clip_temp_path, clip_final_path, output_format)
+                # Layer order: watermark burns into the canonical (so any
+                # later hook replacement, which re-derives from it, keeps
+                # the branding), the hook is a derived hooked_ file, and
+                # captions go last on top of whichever is current. Each
+                # worker writes only its own clip dict, so the re-dump
+                # after the pool is race-free.
+                if success and os.environ.get("WATERMARK") == "1":
+                    apply_watermark(clip_final_path)
+                deliver_path = clip_final_path
+                # Which stretches were stacked (SPLIT): captions go on the
+                # seam there, and /api/subtitle needs it again later.
+                import layout_ranges as _layouts
+                clip['layout_ranges'] = _layouts.read(clip_final_path)
+                # The hook was written from the transcript alone. When the
+                # render put this clip's meaning on the screen, rewrite hook
+                # and title from three of its frames BEFORE burning them.
+                if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                    hook_grounding.reground(clip_final_path, clip, transcript, start, end)
+                if success and os.environ.get("AUTO_HOOK") == "1":
+                    hooked = auto_hook_clip(clip_final_path, clip)
+                    if hooked:
+                        deliver_path, clip['auto_hook'] = hooked
+                if success:
+                    captioned = auto_caption_clip(
+                        deliver_path, transcript, start, end,
+                        split_ranges=_layouts.split_ranges(clip['layout_ranges']))
+                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+                    # Hand the API the file to actually serve for this clip.
+                    # Without it the status poller guesses the clean reframe
+                    # name, so a job in flight showed every clip stripped of
+                    # its hook and captions until the WHOLE job finished and
+                    # the result got rebuilt through _canonical_clip_file.
+                    # Printed only after the full chain (reframe, watermark,
+                    # hook, captions) so the file is complete when it is
+                    # announced, never one that ffmpeg is still writing.
+                    print(f"CLIP_READY {i} "
+                          f"{os.path.basename(captioned or deliver_path)}")
+                return success
+            finally:
+                if os.path.exists(clip_temp_path):
+                    os.remove(clip_temp_path)
+
+        clip_workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
+        shorts = clips_data['shorts']
+        with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
+            futures = {pool.submit(_process_one_clip, i, clip): i
+                       for i, clip in enumerate(shorts)}
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
+
+        # Persist per-clip render results added by the workers (auto_hook)
+        # so the editor can see what is already burned into each clip.
+        if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
             with open(metadata_file, 'w', encoding="utf-8") as f:
                 json.dump(clips_data, f, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
-
-            # 5. Process clips in parallel: each worker cuts + renders one
-            # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
-            # detector inference is serialized internally via DETECT_LOCK.
-            def _process_one_clip(i, clip):
-                start = clip['start']
-                end = clip['end']
-                print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
-                print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
-                clip_final_path = os.path.join(output_dir, clip_filename)
-
-                try:
-                    # ffmpeg cut — re-encoding for precision on strict seconds
-                    cut_command = [
-                        'ffmpeg', '-y',
-                        '-ss', str(start),
-                        '-to', str(end),
-                        '-i', input_video,
-                        *video_encode_args(QUALITY_FAST),
-                        *audio_encode_args(),
-                        clip_temp_path
-                    ]
-                    proc = subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    if proc.returncode != 0 or not os.path.exists(clip_temp_path) or os.path.getsize(clip_temp_path) == 0:
-                        err_msg = proc.stderr.decode("utf-8", errors="ignore") if proc.stderr else "unknown error"
-                        print(f"❌ Failed to cut clip {i+1} with FFmpeg: {err_msg[:200]}")
-                        return False
-
-                    success = render_clip(clip_temp_path, clip_final_path, output_format)
-                    # Layer order: watermark burns into the canonical (so any
-                    # later hook replacement, which re-derives from it, keeps
-                    # the branding), the hook is a derived hooked_ file, and
-                    # captions go last on top of whichever is current. Each
-                    # worker writes only its own clip dict, so the re-dump
-                    # after the pool is race-free.
-                    if success and os.environ.get("WATERMARK") == "1":
-                        apply_watermark(clip_final_path)
-                    deliver_path = clip_final_path
-                    # Which stretches were stacked (SPLIT): captions go on the
-                    # seam there, and /api/subtitle needs it again later.
-                    import layout_ranges as _layouts
-                    clip['layout_ranges'] = _layouts.read(clip_final_path)
-                    # The hook was written from the transcript alone. When the
-                    # render put this clip's meaning on the screen, rewrite hook
-                    # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
-                        hook_grounding.reground(clip_final_path, clip, transcript, start, end)
-                    if success and os.environ.get("AUTO_HOOK") == "1":
-                        hooked = auto_hook_clip(clip_final_path, clip)
-                        if hooked:
-                            deliver_path, clip['auto_hook'] = hooked
-                    if success:
-                        captioned = auto_caption_clip(
-                            deliver_path, transcript, start, end,
-                            split_ranges=_layouts.split_ranges(clip['layout_ranges']))
-                        print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                        # Hand the API the file to actually serve for this clip.
-                        # Without it the status poller guesses the clean reframe
-                        # name, so a job in flight showed every clip stripped of
-                        # its hook and captions until the WHOLE job finished and
-                        # the result got rebuilt through _canonical_clip_file.
-                        # Printed only after the full chain (reframe, watermark,
-                        # hook, captions) so the file is complete when it is
-                        # announced, never one that ffmpeg is still writing.
-                        print(f"CLIP_READY {i} "
-                              f"{os.path.basename(captioned or deliver_path)}")
-                    return success
-                finally:
-                    if os.path.exists(clip_temp_path):
-                        os.remove(clip_temp_path)
-
-            clip_workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
-            shorts = clips_data['shorts']
-            with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
-                futures = {pool.submit(_process_one_clip, i, clip): i
-                           for i, clip in enumerate(shorts)}
-                for future in as_completed(futures):
-                    i = futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
-
-            # Persist per-clip render results added by the workers (auto_hook)
-            # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
-                with open(metadata_file, 'w', encoding="utf-8") as f:
-                    json.dump(clips_data, f, indent=2)
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):

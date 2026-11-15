@@ -6,13 +6,23 @@ import sys
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
                           METADATA_SCRUB)
 
+# Patch PyAV 19+ compatibility with faster-whisper (metadata_errors argument removed in av>=19)
+try:
+    import av
+    _orig_av_open = av.open
+    def _safe_av_open(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        return _orig_av_open(*args, **kwargs)
+    av.open = _safe_av_open
+except Exception:
+    pass
 
 _STDIO_CONFIGURED = False
 
 # Shared faster-whisper config so both transcription paths (this module and
-# main.transcribe_video) behave identically. "small" is meaningfully better at
-# German than "base" without being much slower on CPU.
-DEFAULT_WHISPER_MODEL = "small"
+# main.transcribe_video) behave identically. "base" is fast and lightweight,
+# while "small" or "large-v3" can be selected via WHISPER_MODEL.
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 
 
 def get_whisper_config():

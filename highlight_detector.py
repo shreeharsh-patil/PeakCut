@@ -79,6 +79,15 @@ def extract_audio_energy(
     return rms_envelope, duration_sec
 
 
+def detect_highlights(
+    media_path: Path | str,
+    target_clips: int = 3,
+    **kwargs: Any,
+) -> List[HighlightMoment]:
+    """Alias for detect_hype_moments for generic highlight detection."""
+    return detect_hype_moments(media_path, max_clips=target_clips, **kwargs)
+
+
 def detect_hype_moments(
     media_path: Path | str,
     *,

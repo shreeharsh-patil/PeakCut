@@ -453,6 +453,7 @@ class ApiKeyRotator:
 
 # Global singleton instance
 default_rotator = ApiKeyRotator()
+rotator = default_rotator
 get_rotator = lambda: default_rotator
 
 
