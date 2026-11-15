@@ -279,3 +279,38 @@ def test_ui_ai_settings_usage_and_notifications():
             assert (await client.post("/api/account/delete", json={"confirm": "DELETE"})).status_code == 200
 
     asyncio.run(_test())
+
+
+def test_ui_pages_and_auth_me():
+    async def _test():
+        async with _async_client() as client:
+            # 1. GET /api/auth/me
+            r_me = await client.get("/api/auth/me")
+            assert r_me.status_code == 200
+            assert "user" in r_me.json()
+            assert r_me.json()["user"]["is_admin"] is True
+
+            # 2. Login & Signup HTML pages
+            r_login = await client.get("/login")
+            assert r_login.status_code == 200
+            assert "text/html" in r_login.headers.get("content-type", "")
+
+            r_signup = await client.get("/signup")
+            assert r_signup.status_code == 200
+
+            # 3. Reset password & Admin pages
+            r_reset = await client.get("/reset")
+            assert r_reset.status_code == 200
+
+            r_admin = await client.get("/admin")
+            assert r_admin.status_code == 200
+
+            # 4. Legal pages
+            r_terms = await client.get("/terms")
+            assert r_terms.status_code == 200
+
+            r_privacy = await client.get("/privacy")
+            assert r_privacy.status_code == 200
+
+    asyncio.run(_test())
+

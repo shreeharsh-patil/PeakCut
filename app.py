@@ -159,8 +159,8 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     header = request.headers.get("X-Gemini-Key")
     if header:
         api_key_rotator.register_keys("gemini", header)
-        return header
-    return api_key_rotator.get_all_keys_string("gemini") or api_key_rotator.get_gemini_key()
+        return api_key_rotator.get_gemini_key() or header
+    return api_key_rotator.get_gemini_key()
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -1807,6 +1807,34 @@ def enqueue_output(out, job_id):
     finally:
         out.close()
 
+def _sync_job_status_disk(job_id: str, output_dir: str, status: str, clips: list = None, error: str = None):
+    """Keep status.json on disk strictly in sync with in-memory pipeline state for PeakCut UI."""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        status_file = os.path.join(output_dir, "status.json")
+        data = {}
+        if os.path.exists(status_file):
+            try:
+                with open(status_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        mapped_status = "done" if status == "completed" else status
+        data["id"] = job_id
+        data["status"] = mapped_status
+        if clips is not None:
+            data["clips"] = clips
+        if error:
+            data["error"] = error
+        if mapped_status == "done":
+            data["finished_at"] = time.time()
+        elif mapped_status in ("running", "processing"):
+            data["started_at"] = time.time()
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
     
@@ -1816,6 +1844,7 @@ async def run_job(job_id, job_data):
     
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    _sync_job_status_disk(job_id, output_dir, "running")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
@@ -1915,18 +1944,24 @@ async def run_job(job_id, job_data):
                      clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
                 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+                _sync_job_status_disk(job_id, output_dir, "done", clips=clips)
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
+                 _sync_job_status_disk(job_id, output_dir, "failed", error="No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+            err_msg = _scrub_secrets(f"Process failed with exit code {returncode}")
+            jobs[job_id]['logs'].append(err_msg)
+            _sync_job_status_disk(job_id, output_dir, "failed", error=err_msg)
             
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
-        jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+        err_msg = _scrub_secrets(f"Execution error: {str(e)}")
+        jobs[job_id]['logs'].append(err_msg)
+        _sync_job_status_disk(job_id, output_dir, "failed", error=err_msg)
 
 @app.get("/health")
 async def health():
@@ -2523,6 +2558,89 @@ async def process_endpoint(
     _enqueue_job(job_id, priority)
 
     return {"job_id": job_id, "status": "queued"}
+
+
+def start_job_process_background(
+    job_id: str,
+    url: Optional[str] = None,
+    options: Optional[dict] = None,
+    creator: Optional[str] = None,
+    file_path: Optional[str] = None,
+) -> str:
+    """Bridge PeakCut UI job submission directly into OpenShorts processing pipeline."""
+    opts = options or {}
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+
+    cmd = [sys.executable, "-u", "main.py"]
+    env = os.environ.copy()
+    gemini_key = api_key_rotator.get_gemini_key() or os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        full_keys = api_key_rotator.get_all_keys_string("gemini") or gemini_key
+        env["GEMINI_API_KEY"] = full_keys
+        env["GEMINI_API_KEYS"] = full_keys
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    layout = opts.get("layout") or "auto"
+    if layout in ("split", "two_shot"):
+        env["SPLIT_LAYOUT"] = "1"
+    elif layout == "screencast":
+        env["SCREENCAST_LAYOUT"] = "1"
+
+    style = opts.get("style") or "bounce"
+    if style:
+        env["SUBTITLE_STYLE"] = style
+
+    if opts.get("min_len"):
+        cmd.extend(["--clip-min-seconds", str(opts["min_len"])])
+    if opts.get("max_len"):
+        cmd.extend(["--clip-max-seconds", str(opts["max_len"])])
+
+    if url:
+        cmd.extend(["-u", url, "--keep-original"])
+    elif file_path and os.path.exists(file_path):
+        cmd.extend(["-i", file_path])
+    else:
+        found = False
+        if os.path.exists(job_output_dir):
+            for f in os.listdir(job_output_dir):
+                if f.endswith((".mp4", ".mov", ".webm", ".mkv")):
+                    cmd.extend(["-i", os.path.join(job_output_dir, f)])
+                    found = True
+                    break
+        if not found and os.path.exists(UPLOAD_DIR):
+            for f in os.listdir(UPLOAD_DIR):
+                if f.startswith(f"{job_id}_") and f.endswith((".mp4", ".mov", ".webm", ".mkv")):
+                    cmd.extend(["-i", os.path.join(UPLOAD_DIR, f)])
+                    break
+
+    cmd.extend(["-o", job_output_dir])
+
+    api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or "http://127.0.0.1:8000"
+    jobs[job_id] = {
+        'status': 'queued',
+        'logs': [f"Job {job_id} queued from PeakCut Studio."],
+        'cmd': cmd,
+        'env': env,
+        'output_dir': job_output_dir,
+        'attestation': {"source": "peakcut_studio", "creator": creator, "timestamp": time.time()},
+        'user_id': None,
+        'reservation_id': None,
+        'watermark': False,
+        'webhook_url': None,
+        'webhook_secret': None,
+        'base_url': api_base,
+    }
+
+    _write_resume_manifest(
+        job_id, cmd, priority=0, user_id=None, reservation_id=None,
+        watermark=False, webhook_url=None, webhook_secret=None,
+        base_url=api_base
+    )
+
+    _enqueue_job(job_id, priority=0)
+    print(f"🚀 [PeakCut Studio] Job {job_id} successfully enqueued into processing pipeline!")
+    return job_id
 
 def _job_view_from_disk(job_id):
     """What the disk says about a job this instance does not hold in memory.

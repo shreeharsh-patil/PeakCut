@@ -55,6 +55,17 @@ def _frame_parts(video_path, n=TITLE_FRAMES, width=TITLE_FRAME_WIDTH):
         return []
 
 
+def _clean_api_key(api_key):
+    """Normalize and rotate API keys if comma-separated."""
+    import api_key_rotator
+    if api_key and ("," in str(api_key) or ";" in str(api_key)):
+        api_key_rotator.register_keys("gemini", api_key)
+        return api_key_rotator.get_gemini_key()
+    if not api_key:
+        return api_key_rotator.get_gemini_key()
+    return api_key
+
+
 # ---------------------------------------------------------------------------
 # Titles
 # ---------------------------------------------------------------------------
@@ -67,6 +78,7 @@ def analyze_video_for_titles(api_key, video_path, transcript=None):
     Returns: { "titles", "thumbnail_texts", "transcript_summary", "language",
                "segments", "video_duration", "recommended" }
     """
+    api_key = _clean_api_key(api_key)
     if transcript is None:
         from main import transcribe_video
         print("🎬 [Thumbnail] Transcribing video...")
@@ -197,6 +209,7 @@ def refine_titles(api_key, context, user_message, conversation_history=None):
     """
     Takes video context + user feedback and returns refined title suggestions.
     """
+    api_key = _clean_api_key(api_key)
     client = genai.Client(api_key=api_key)
 
     history_text = ""
@@ -600,6 +613,7 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
     person reference when the user picked a frame instead of uploading a photo.
     Returns [{"url", "text", "why"}] (only the ones that rendered).
     """
+    api_key = _clean_api_key(api_key)
     client = genai.Client(api_key=api_key)
     output_dir = os.path.join("output", "thumbnails", session_id)
     os.makedirs(output_dir, exist_ok=True)
@@ -671,6 +685,7 @@ def generate_youtube_description(api_key, title, transcript_segments, language, 
     Uses Gemini to generate a YouTube description with chapter markers from transcript segments.
     Returns: { "description": "full description text with chapters" }
     """
+    api_key = _clean_api_key(api_key)
     client = genai.Client(api_key=api_key)
 
     # Format segments for the prompt

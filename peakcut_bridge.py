@@ -86,6 +86,61 @@ async def serve_landing_page():
     return FileResponse(landing_file, media_type="text/html")
 
 
+@router.get("/login")
+@router.get("/signup")
+async def serve_auth_page():
+    """Serve auth page (login/signup)."""
+    p = WEB_DIR / "auth.html"
+    if p.exists():
+        return FileResponse(p, media_type="text/html")
+    return RedirectResponse("/app")
+
+
+@router.get("/reset")
+async def serve_reset_page():
+    """Serve password reset page."""
+    p = WEB_DIR / "reset.html"
+    if p.exists():
+        return FileResponse(p, media_type="text/html")
+    return RedirectResponse("/app")
+
+
+@router.get("/admin")
+@router.get("/admin/{rest:path}")
+async def serve_admin_page(rest: str = ""):
+    """Serve admin page."""
+    p = WEB_DIR / "admin.html"
+    if p.exists():
+        return FileResponse(p, media_type="text/html")
+    return RedirectResponse("/app")
+
+
+@router.get("/terms")
+@router.get("/privacy")
+@router.get("/acceptable-use")
+async def serve_legal_page():
+    """Serve terms, privacy, acceptable use legal pages."""
+    p = WEB_DIR / "legal.html"
+    if p.exists():
+        return FileResponse(p, media_type="text/html")
+    return RedirectResponse("/app")
+
+
+@router.get("/api/auth/me")
+async def get_auth_me():
+    """Current authenticated user profile for header and studio views."""
+    return {
+        "user": {
+            "id": "local",
+            "email": "owner@local",
+            "name": "Owner",
+            "is_admin": True,
+            "verified": True,
+            "role": "admin",
+        }
+    }
+
+
 @router.get("/brand/{name}")
 async def serve_brand_asset(name: str):
     """Serve logo, favicon, and demo assets."""
@@ -123,6 +178,25 @@ async def serve_media(jid: str, name: str):
         if p.exists() and p.is_file():
             mime, _ = mimetypes.guess_type(str(p))
             return FileResponse(p, media_type=mime or "application/octet-stream")
+
+    # If it is an image request and the corresponding .mp4 exists, extract 1 poster frame
+    if name.lower().endswith((".jpg", ".jpeg", ".png")):
+        base = name.rsplit(".", 1)[0]
+        for vid_name in (f"{base}.mp4", f"{base}.mov", f"{base}.webm"):
+            vid_p = OUTPUT_DIR / jid / vid_name
+            if not vid_p.exists():
+                vid_p = OUTPUT_DIR / jid / "clips" / vid_name
+            if vid_p.exists():
+                out_jpg = OUTPUT_DIR / jid / name
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", "0.5", "-i", str(vid_p), "-frames:v", "1", "-q:v", "2", str(out_jpg)],
+                        capture_output=True, timeout=5
+                    )
+                    if out_jpg.exists():
+                        return FileResponse(out_jpg, media_type="image/jpeg")
+                except Exception:
+                    pass
 
     raise HTTPException(status_code=404, detail=f"Media file '{name}' for job '{jid}' not found.")
 
@@ -188,43 +262,143 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
     title = jid
     clips: List[Dict[str, Any]] = []
     duration = 0.0
+    stage = "Finished"
+    progress = 1.0
+    error: Optional[str] = None
+    created_at = job_dir.stat().st_mtime if job_dir.exists() else time.time()
+    creator = None
 
-    if status_file.exists():
-        try:
-            d = json.loads(status_file.read_text(encoding="utf-8"))
-            status = d.get("status", "done")
-            title = d.get("title") or title
-            duration = float(d.get("duration", 0.0))
-            raw_clips = d.get("clips") or d.get("result", {}).get("clips") or []
-            for i, c in enumerate(raw_clips):
+    # Check in-memory app.jobs for live state
+    app_job = None
+    try:
+        import sys
+        app_mod = sys.modules.get("app")
+        if app_mod and hasattr(app_mod, "jobs"):
+            app_job = app_mod.jobs.get(jid)
+    except Exception:
+        pass
+
+    if app_job:
+        raw_s = app_job.get("status", "queued")
+        if raw_s in ("completed", "done"):
+            status = "done"
+            stage = "Finished"
+            progress = 1.0
+        elif raw_s in ("processing", "running"):
+            status = "running"
+            progress = 0.65
+            logs = app_job.get("logs") or []
+            stage = logs[-1] if logs else "Processing video..."
+        elif raw_s in ("failed", "error"):
+            status = "failed"
+            stage = "Failed"
+            progress = 0.0
+            logs = app_job.get("logs") or []
+            error = logs[-1] if logs else "Processing failed"
+        elif raw_s == "queued":
+            status = "queued"
+            stage = "Queued in worker"
+            progress = 0.0
+
+        if app_job.get("attestation") and isinstance(app_job["attestation"], dict):
+            creator = app_job["attestation"].get("creator")
+
+        # In-memory clips if available
+        res_clips = app_job.get("result", {}).get("clips") or []
+        if res_clips:
+            for i, c in enumerate(res_clips):
                 cid = c.get("id") or f"c_{i+1:02d}"
                 c_title = c.get("title") or c.get("video_title_for_youtube_short") or f"Clip {i+1}"
-                rel_url = c.get("video_url") or f"/media/{jid}/clip_{i+1:02d}.mp4"
+                raw_file = c.get("file") or c.get("video_url") or f"clip_{i+1:02d}.mp4"
+                file_name = os.path.basename(raw_file)
+                cover_name = os.path.basename(c.get("cover") or "")
                 clips.append({
                     "id": cid,
                     "title": c_title,
-                    "score": c.get("score", 90),
-                    "url": rel_url,
-                    "start": c.get("start", 0.0),
-                    "end": c.get("end", 30.0),
-                    "duration": round(c.get("end", 30.0) - c.get("start", 0.0), 1),
+                    "score": c.get("score") or c.get("predicted_score") or 90,
+                    "status": "done",
+                    "file": file_name,
+                    "cover": cover_name or file_name.replace(".mp4", ".jpg"),
+                    "version": c.get("version", 1),
+                    "url": f"/media/{jid}/{file_name}",
+                    "start": float(c.get("start", 0.0)),
+                    "end": float(c.get("end", 30.0)),
+                    "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
                     "hook": c.get("hook") or c.get("viral_hook_text") or "",
                     "style": c.get("style", "hype"),
                     "layout": c.get("layout", "track"),
                     "description": c.get("description") or c.get("video_description_for_tiktok") or "",
                     "rendered": True,
                 })
+
+    if status_file.exists():
+        try:
+            d = json.loads(status_file.read_text(encoding="utf-8"))
+            if not app_job:
+                raw_s = d.get("status", "done")
+                if raw_s in ("completed", "done"):
+                    status = "done"
+                    stage = "Finished"
+                    progress = 1.0
+                elif raw_s in ("processing", "running"):
+                    status = "running"
+                    progress = 0.65
+                    stage = "Processing video..."
+                elif raw_s in ("failed", "error"):
+                    status = "failed"
+                    stage = "Failed"
+                    progress = 0.0
+                    error = d.get("error") or "Failed"
+                elif raw_s in ("queued", "pending"):
+                    status = "queued"
+                    stage = "Queued"
+                    progress = 0.0
+            title = d.get("title") or title
+            creator = d.get("creator") or creator
+            duration = float(d.get("duration", 0.0))
+            if d.get("created_at"):
+                created_at = float(d["created_at"])
+            raw_clips = d.get("clips") or d.get("result", {}).get("clips") or []
+            if not clips and raw_clips:
+                for i, c in enumerate(raw_clips):
+                    cid = c.get("id") or f"c_{i+1:02d}"
+                    c_title = c.get("title") or c.get("video_title_for_youtube_short") or f"Clip {i+1}"
+                    raw_file = c.get("file") or c.get("video_url") or f"clip_{i+1:02d}.mp4"
+                    file_name = os.path.basename(raw_file)
+                    cover_name = os.path.basename(c.get("cover") or "")
+                    clips.append({
+                        "id": cid,
+                        "title": c_title,
+                        "score": c.get("score") or c.get("predicted_score") or 90,
+                        "status": "done",
+                        "file": file_name,
+                        "cover": cover_name or file_name.replace(".mp4", ".jpg"),
+                        "version": c.get("version", 1),
+                        "url": f"/media/{jid}/{file_name}",
+                        "start": float(c.get("start", 0.0)),
+                        "end": float(c.get("end", 30.0)),
+                        "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
+                        "hook": c.get("hook") or c.get("viral_hook_text") or "",
+                        "style": c.get("style", "hype"),
+                        "layout": c.get("layout", "track"),
+                        "description": c.get("description") or c.get("video_description_for_tiktok") or "",
+                        "rendered": True,
+                    })
         except Exception:
             pass
 
     # If clips is still empty, scan mp4 files in clips/ or job_dir
-    if not clips:
+    if not clips and status == "done":
         clip_files = list((job_dir / "clips").glob("*.mp4")) or list(job_dir.glob("clip_*.mp4"))
         for i, cf in enumerate(clip_files):
             clips.append({
                 "id": cf.stem,
                 "title": f"Clip {i+1}",
                 "score": 85,
+                "status": "done",
+                "file": cf.name,
+                "cover": cf.name.replace(".mp4", ".jpg"),
+                "version": 1,
                 "url": f"/media/{jid}/{cf.name}",
                 "start": 0.0,
                 "end": 30.0,
@@ -240,21 +414,45 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
         "id": jid,
         "title": title,
         "status": status,
-        "stage": "Finished" if status in ("done", "completed") else "Processing",
+        "stage": stage,
+        "progress": progress,
         "duration": duration,
         "clips": clips,
-        "created_at": job_dir.stat().st_mtime,
+        "created_at": created_at,
+        "creator": creator,
+        "error": error,
+        "source": {"kind": "upload" if "source_" in title else "youtube", "name": title},
+        "uploader": creator or "PeakCut",
     }
 
 
 def _list_all_jobs_public() -> List[Dict[str, Any]]:
     jobs = []
+    seen = set()
     if OUTPUT_DIR.exists():
         for d in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if d.is_dir() and d.name not in ("thumbnails", "live", "creators"):
                 job_data = _format_job_public(d)
                 if job_data:
                     jobs.append(job_data)
+                    seen.add(d.name)
+
+    # Include in-memory jobs not yet persisted to disk
+    try:
+        import sys
+        app_mod = sys.modules.get("app")
+        if app_mod and hasattr(app_mod, "jobs"):
+            for jid in app_mod.jobs.keys():
+                if jid not in seen:
+                    j_dir = OUTPUT_DIR / jid
+                    j_dir.mkdir(parents=True, exist_ok=True)
+                    job_data = _format_job_public(j_dir)
+                    if job_data:
+                        jobs.append(job_data)
+                        seen.add(jid)
+    except Exception:
+        pass
+
     return jobs
 
 
@@ -735,9 +933,17 @@ async def create_job_endpoint(req: Request):
 
     # Trigger process in background if app has process worker or async task
     try:
-        import app as app_module
+        import sys
+        app_module = sys.modules.get("app")
+        if not app_module:
+            import app as app_module
         if hasattr(app_module, "start_job_process_background"):
-            app_module.start_job_process_background(jid, url, options, creator)
+            app_module.start_job_process_background(
+                job_id=jid,
+                url=url,
+                options=options,
+                creator=creator
+            )
     except Exception as e:
         logger.warning(f"Background job trigger notice: {e}")
 
@@ -917,6 +1123,23 @@ async def upload_direct_file(
     }
     (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
     _bump_version()
+
+    try:
+        import sys
+        app_module = sys.modules.get("app")
+        if not app_module:
+            import app as app_module
+        if hasattr(app_module, "start_job_process_background"):
+            app_module.start_job_process_background(
+                job_id=jid,
+                url=None,
+                options=opts,
+                creator=creator,
+                file_path=str(dest),
+            )
+    except Exception as e:
+        logger.warning(f"Background upload job trigger notice: {e}")
+
     return _format_job_public(job_dir)
 
 
@@ -998,6 +1221,23 @@ async def upload_finish_endpoint(upid: str):
     }
     (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
     _bump_version()
+
+    try:
+        import sys
+        app_module = sys.modules.get("app")
+        if not app_module:
+            import app as app_module
+        if hasattr(app_module, "start_job_process_background"):
+            app_module.start_job_process_background(
+                job_id=jid,
+                url=None,
+                options=meta.get("options") or {},
+                creator=meta.get("creator"),
+                file_path=str(dest),
+            )
+    except Exception as e:
+        logger.warning(f"Background upload finish job trigger notice: {e}")
+
     return _format_job_public(job_dir)
 
 

@@ -8,15 +8,27 @@ import threading
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
+try:
+    from scenedetect import open_video, SceneManager
+    from scenedetect.detectors import ContentDetector
+except Exception:
+    open_video, SceneManager, ContentDetector = None, None, None
+
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
+
 import torch
 import os
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
-import mediapipe as mp
+
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
 from google.genai import types as genai_types
@@ -83,14 +95,22 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 """
 
 # Load the YOLO model once (Keep for backup or scene analysis if needed)
-# YOLO_MODEL_PATH lets deployments point at a pre-downloaded weights file so a
-# volume mounted over the workdir doesn't trigger a re-download at startup.
-model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+model = None
+if YOLO is not None:
+    try:
+        model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+    except Exception as e:
+        print(f"⚠️ YOLO model init notice: {e}")
 
 # --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+mp_face_detection = None
+face_detection = None
+if mp is not None and hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+    try:
+        mp_face_detection = mp.solutions.face_detection
+        face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+    except Exception as e:
+        print(f"⚠️ MediaPipe face detection init notice: {e}")
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -433,6 +453,14 @@ def detect_face_candidates(frame):
     Boxes are in ORIGINAL frame coordinates (detection runs downscaled;
     MediaPipe's relative coords make the mapping exact).
     """
+    if face_detection is None:
+        height, width, _ = frame.shape
+        w = int(width * 0.4)
+        h = int(height * 0.5)
+        x = (width - w) // 2
+        y = int(height * 0.15)
+        return [{'box': [x, y, w, h], 'score': w * h}]
+
     height, width, _ = frame.shape
     small, _scale = _detection_frame(frame)
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -464,6 +492,8 @@ def detect_person_yolo(frame):
     Returns [x, y, w, h] of the person's 'upper body' approximation, in
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
+    if model is None:
+        return None
     small, scale = _detection_frame(frame)
     # Use the globally loaded model
     with DETECT_LOCK:
