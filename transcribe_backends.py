@@ -148,15 +148,17 @@ def run_whisper_transcription(media_path, **params):
     iterating, so the gate must wrap list(segments), not just transcribe().
     Returns (segments_list, info).
 
-    A CUDA failure (model load OOM or mid-decode) retries once on CPU and
-    pins CPU for the rest of the process — the GPU is shared with other
-    models, so a job must degrade instead of dying when VRAM runs out.
+    A CUDA failure (model load OOM, missing cublas/cudnn libs, or mid-decode)
+    retries once on CPU and pins CPU for the rest of the process — the GPU is
+    shared with other models, so a job must degrade instead of dying when VRAM
+    runs out or libraries mismatch.
     """
     global _whisper_model, _whisper_force_cpu
     try:
         return _run_whisper_once(media_path, **params)
-    except RuntimeError as e:
-        if _whisper_force_cpu or "cuda" not in str(e).lower():
+    except Exception as e:
+        cfg = get_whisper_config()
+        if _whisper_force_cpu or cfg.get("device") == "cpu":
             raise
         print(f"⚠️ [ASR] whisper GPU failed ({e}) — retrying on CPU", flush=True)
         _whisper_force_cpu = True
