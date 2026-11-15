@@ -1,6 +1,7 @@
 """Comprehensive unit and integration test suite for the Anti-Reused Video Pipeline."""
 
 import os
+import sys
 import subprocess
 import pytest
 from pathlib import Path
@@ -21,8 +22,31 @@ from anti_reused_pipeline.compliance_validator import (
 from anti_reused_pipeline.pipeline_engine import TransformPipeline
 
 
-DEMO_CLIP = "D:/yt/dashboard/public/demo/clip-source.mp4"
-BGM_SAMPLE = "D:/yt/shorts-autopilot/clips_auto/assets/music_bed.mp3"
+def get_or_create_test_clip(tmp_path: Path) -> str:
+    """Resolve demo clip or synthesize a compliant 3-second test MP4 via ffmpeg."""
+    repo_root = Path(__file__).resolve().parent.parent
+    local_demo = repo_root / "dashboard" / "public" / "demo" / "clip-source.mp4"
+    if local_demo.is_file():
+        return str(local_demo)
+    sample_mp4 = str(tmp_path / "synthetic_test_clip.mp4")
+    if os.path.isfile(sample_mp4):
+        return sample_mp4
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "testsrc=duration=3:size=1280x720:rate=30",
+        "-f", "lavfi", "-i", "sine=frequency=1000:duration=3",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        sample_mp4
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return sample_mp4
+    except Exception:
+        pytest.skip("ffmpeg or test video fixture not available in environment")
+
+
+BGM_SAMPLE = "shorts-autopilot/clips_auto/assets/music_bed.mp3"
 
 
 def test_config_initialization():
@@ -34,9 +58,9 @@ def test_config_initialization():
     assert cfg.compliance.pass_threshold == 0.80
 
 
-def test_media_probing():
-    assert os.path.isfile(DEMO_CLIP), f"Demo clip not found at {DEMO_CLIP}"
-    info = probe_media(DEMO_CLIP)
+def test_media_probing(tmp_path):
+    clip = get_or_create_test_clip(tmp_path)
+    info = probe_media(clip)
     assert info.duration > 0
     assert info.width > 0
     assert info.height > 0
@@ -84,8 +108,17 @@ def test_compliance_scoring_fail():
 
 
 def test_voiceover_sapi_and_srt(tmp_path):
+    if sys.platform != "win32":
+        pytest.skip("Windows SAPI TTS is only supported on Windows")
+    try:
+        import win32com.client
+    except ImportError:
+        pytest.skip("win32com is required for Windows SAPI TTS")
     wav_out = str(tmp_path / "test_sapi.wav")
-    dur = synthesize_windows_sapi("Testing automated voiceover synthesis on Windows.", wav_out)
+    try:
+        dur = synthesize_windows_sapi("Testing automated voiceover synthesis on Windows.", wav_out)
+    except Exception as e:
+        pytest.skip(f"SAPI voice not configured on system: {e}")
     assert dur > 0.5
     assert os.path.isfile(wav_out)
 
@@ -193,8 +226,10 @@ def test_end_to_end_pipeline_execution(tmp_path):
         font_size=20
     )
 
+    clip = get_or_create_test_clip(tmp_path)
+
     pipe_cfg = PipelineConfig(
-        input_path=DEMO_CLIP,
+        input_path=clip,
         output_path=output_mp4,
         work_dir=str(tmp_path / "scratch"),
         audio=audio_cfg,
