@@ -9,6 +9,7 @@ host that resolves to a private / loopback / link-local / reserved address.
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -32,6 +33,36 @@ def _ip_is_public(ip: str) -> bool:
     )
 
 
+def normalize_media_url(raw_url: str) -> str:
+    """Normalize user input URLs, short-links, and bare video IDs into canonical URLs."""
+    if not raw_url or not isinstance(raw_url, str):
+        return ""
+    s = raw_url.strip()
+    if not s:
+        return ""
+
+    # Check for bare YouTube video ID (11 chars), possibly with query params (?si=... etc)
+    # e.g. BgeNDG5jD60?si=zSjxkinw2zPaaAPH or BgeNDG5jD60
+    bare_match = re.match(r"^([a-zA-Z0-9_-]{11})(?:\?.*)?$", s)
+    if bare_match:
+        return f"https://www.youtube.com/watch?v={bare_match.group(1)}"
+
+    # If scheme is missing (e.g. youtube.com/watch?v=... or youtu.be/...)
+    if not s.startswith(("http://", "https://")):
+        if any(s.startswith(prefix) for prefix in (
+            "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+            "twitch.tv", "www.twitch.tv", "kick.com", "www.kick.com"
+        )):
+            s = "https://" + s
+
+    # Canonicalize any youtu.be, /shorts/, /live/, /embed/, /v/
+    yt_match = re.search(r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})", s)
+    if yt_match:
+        return f"https://www.youtube.com/watch?v={yt_match.group(1)}"
+
+    return s
+
+
 def assert_public_url(url: str) -> str:
     """Return ``url`` if it is safe to fetch, else raise ``UnsafeURLError``.
 
@@ -42,6 +73,7 @@ def assert_public_url(url: str) -> str:
     if not url or not isinstance(url, str):
         raise UnsafeURLError("Empty URL")
 
+    url = normalize_media_url(url)
     parsed = urlparse(url.strip())
     if parsed.scheme.lower() not in ("http", "https"):
         raise UnsafeURLError(f"Unsupported URL scheme: {parsed.scheme!r}")

@@ -720,6 +720,8 @@ def is_youtube_url(url):
     mp4, tmpfiles/catbox, an R2 link) has no IP ban to dodge and downloads
     5-10x faster from the server's own IP than through the ISP proxies."""
     try:
+        from security_utils import normalize_media_url
+        url = normalize_media_url(url)
         from urllib.parse import urlparse
         host = (urlparse(url).hostname or "").lower()
     except Exception:
@@ -769,9 +771,8 @@ def download_youtube_video(url, output_dir="."):
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
     """
-    # SSRF guard: block non-http(s) schemes and private/loopback/metadata hosts
-    # before handing the URL to yt-dlp.
-    from security_utils import assert_public_url
+    from security_utils import assert_public_url, normalize_media_url
+    url = normalize_media_url(url)
     assert_public_url(url)
     # Throwaway hosts agents fall back to (tmpfiles.org) hand out short-lived
     # signed links; refresh through the host's page so yt-dlp gets the file.
@@ -2037,8 +2038,29 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--clip-min-seconds', type=float, default=None,
+                        help="Minimum duration for extracted clips in seconds.")
+    parser.add_argument('--clip-max-seconds', type=float, default=None,
+                        help="Maximum duration for extracted clips in seconds.")
+    parser.add_argument('--target-clips', '--max-clips', type=int, default=None, dest="target_clips",
+                        help="Target number of clips to extract.")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"ℹ️ Note: Ignoring unrecognized CLI arguments: {unknown}")
+
+    if args.clip_min_seconds:
+        os.environ["CLIP_MIN_SECONDS"] = str(args.clip_min_seconds)
+    if args.clip_max_seconds:
+        os.environ["CLIP_MAX_SECONDS"] = str(args.clip_max_seconds)
+    if args.target_clips:
+        os.environ["CLIP_TARGET_MIN"] = str(args.target_clips)
+        os.environ["CLIP_TARGET_MAX"] = str(args.target_clips)
+
+    if args.url:
+        from security_utils import normalize_media_url
+        args.url = normalize_media_url(args.url)
+
     output_format = args.format
 
     script_start_time = time.time()

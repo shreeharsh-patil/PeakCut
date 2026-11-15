@@ -2592,11 +2592,19 @@ def start_job_process_background(
         env["SUBTITLE_STYLE"] = style
 
     if opts.get("min_len"):
+        env["CLIP_MIN_SECONDS"] = str(opts["min_len"])
         cmd.extend(["--clip-min-seconds", str(opts["min_len"])])
     if opts.get("max_len"):
+        env["CLIP_MAX_SECONDS"] = str(opts["max_len"])
         cmd.extend(["--clip-max-seconds", str(opts["max_len"])])
+    if opts.get("max_clips"):
+        env["CLIP_TARGET_MIN"] = str(opts["max_clips"])
+        env["CLIP_TARGET_MAX"] = str(opts["max_clips"])
+        cmd.extend(["--target-clips", str(opts["max_clips"])])
 
     if url:
+        from security_utils import normalize_media_url
+        url = normalize_media_url(url)
         cmd.extend(["-u", url, "--keep-original"])
     elif file_path and os.path.exists(file_path):
         cmd.extend(["-i", file_path])

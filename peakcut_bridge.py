@@ -678,8 +678,8 @@ async def preview_video_endpoint(url: str):
     u = url.strip()
     if not u:
         raise HTTPException(status_code=400, detail="Missing video URL.")
-    if not re.match(r"^https?://", u, re.I):
-        u = "https://" + u
+    from security_utils import normalize_media_url
+    u = normalize_media_url(u)
 
     try:
         import yt_dlp
@@ -905,11 +905,13 @@ async def list_jobs_endpoint():
 async def create_job_endpoint(req: Request):
     """Hero input URL submission to create a video clipping job."""
     body = await req.json()
-    url = str(body.get("url") or "").strip()
-    if not url:
+    raw_url = str(body.get("url") or "").strip()
+    if not raw_url:
         raise HTTPException(status_code=400, detail="Missing video URL.")
-    if not re.match(r"^https?://", url, re.I):
-        url = "https://" + url
+    from security_utils import normalize_media_url
+    url = normalize_media_url(raw_url)
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing or invalid video URL.")
 
     options = body.get("options") or {}
     creator = body.get("creator")
