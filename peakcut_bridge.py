@@ -140,8 +140,8 @@ async def get_peakcut_status():
         "update": None,
         "accounts": False,
         "links": {
-            "repo": "https://github.com/openshorts/openshorts",
-            "follow": "https://x.com/openshortsapp",
+            "repo": "",
+            "follow": "",
         },
         "ai": {
             "configured": True,

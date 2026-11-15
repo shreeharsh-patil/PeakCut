@@ -6,6 +6,7 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 [![GitHub stars](https://img.shields.io/github/stars/mutonby/openshorts?style=social)](https://github.com/mutonby/openshorts)
 [![Last Commit](https://img.shields.io/github/last-commit/mutonby/openshorts)](https://github.com/mutonby/openshorts/commits/main)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shreeharsh-patil/PeakCut/blob/main/PeakCut_Colab.ipynb)
 
 **Open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
 
@@ -259,46 +260,62 @@ Open **`http://localhost:8000/`** in your browser to start making shorts immedia
 
 ---
 
-### ⚡ 2. Run on Google Colab (One-Click Copy & Paste)
+### ⚡ 2. Run on Google Colab (One-Click Start)
 
-You can run this repository on **Google Colab** to take advantage of free NVIDIA GPU acceleration (Whisper, MediaPipe, TransNetV2, NVENC):
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shreeharsh-patil/PeakCut/blob/main/PeakCut_Colab.ipynb)
 
-1. Upload or zip this repository folder to your Google Drive, or open [Google Colab](https://colab.research.google.com).
+Run the full platform on **Google Colab** with free NVIDIA GPU acceleration (Whisper, MediaPipe, TransNetV2, NVENC) by cloning **`https://github.com/shreeharsh-patil/PeakCut.git`**:
+
+1. Open a new notebook on [Google Colab](https://colab.research.google.com).
 2. Set Runtime to GPU (**Runtime** → **Change runtime type** → select **T4 GPU**).
-3. **Copy and paste this single code block into the cell and press Run**:
+3. **Copy and paste this single code block into the first cell and press Run (▶)**:
 
 ```python
 # ============================================================
-# OpenShorts + PeakCut UI One-Click Colab Runner
+# 🎬 PeakCut Studio: One-Click Google Colab Runner
+# Repository: https://github.com/shreeharsh-patil/PeakCut.git
 # ============================================================
-!apt-get update -qq && apt-get install -y -qq ffmpeg libsm6 libxext6 libgl1 fonts-freefont-ttf
-
-# 1. Download Cloudflared for instant zero-config public HTTPS tunnel
-!wget -q -nc -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-!chmod +x cloudflared
-
-# 2. Setup Project Files
-# If you uploaded this repo zip or mounted Google Drive:
 import os, subprocess, time, re
-if os.path.exists("/content/drive/MyDrive/yt"):
-    %cd /content/drive/MyDrive/yt
-elif os.path.exists("/content/yt"):
-    %cd /content/yt
 
-# 3. Install Python Dependencies
-!pip install -q -r requirements.txt
-!pip install -q uvicorn fastapi requests
+# 1. System packages & hardware tools
+print("📦 Step 1/5: Installing system dependencies (ffmpeg, fonts)...")
+subprocess.run(
+    "apt-get update -qq && apt-get install -y -qq ffmpeg libsm6 libxext6 libgl1 fonts-freefont-ttf fonts-dejavu-core",
+    shell=True, check=True
+)
 
-# 4. Optional: Set your Gemini API key (or leave empty for self-hosted zero-key mode)
-# os.environ["GEMINI_API_KEY"] = "your_gemini_api_key_here"
+# 2. Download Cloudflared for instant zero-config public HTTPS tunnel
+print("🌐 Step 2/5: Setting up Cloudflare tunnel binary...")
+subprocess.run(
+    "wget -q -nc -O /content/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x /content/cloudflared",
+    shell=True, check=True
+)
+
+# 3. Clone or update repository from GitHub
+REPO_URL = "https://github.com/shreeharsh-patil/PeakCut.git"
+REPO_DIR = "/content/PeakCut"
+
+print(f"📥 Step 3/5: Fetching repository from {REPO_URL}...")
+if not os.path.exists(REPO_DIR):
+    subprocess.run(f"git clone {REPO_URL} {REPO_DIR}", shell=True, check=True)
+else:
+    subprocess.run(f"git -C {REPO_DIR} pull", shell=True)
+
+os.chdir(REPO_DIR)
+
+# 4. Install Python dependencies
+print("🐍 Step 4/5: Installing Python dependencies...")
+subprocess.run("pip install -q -r requirements.txt", shell=True)
+subprocess.run("pip install -q uvicorn fastapi requests", shell=True)
 
 # 5. Start Cloudflare Tunnel in background
+print("🚀 Step 5/5: Starting Cloudflare tunnel & web server...")
 tunnel = subprocess.Popen(
-    ["./cloudflared", "tunnel", "--url", "http://127.0.0.1:8000"],
+    ["/content/cloudflared", "tunnel", "--url", "http://127.0.0.1:8000"],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
 )
 
-# 6. Extract public URL
+# 6. Extract and display the public HTTPS link
 public_url = None
 for _ in range(40):
     line = tunnel.stdout.readline()
@@ -308,16 +325,16 @@ for _ in range(40):
         break
     time.sleep(0.5)
 
-print("\n" + "=" * 65)
+print("\n" + "=" * 70)
 if public_url:
     print(f"🎉 PEAKCUT STUDIO IS LIVE AT: {public_url}")
-    print("👉 Click the link above to open your dashboard in any browser!")
+    print("👉 Click the link above to open PeakCut Studio in your browser!")
 else:
-    print("⚠️ Tunnel starting... check logs below.")
-print("=" * 65 + "\n")
+    print("⚠️ Tunnel starting... check output below for the link.")
+print("=" * 70 + "\n")
 
-# 7. Start OpenShorts FastAPI Server with PeakCut UI
-!python -m uvicorn app:app --host 127.0.0.1 --port 8000
+# 7. Start FastAPI Server with PeakCut Studio UI
+subprocess.run("python -m uvicorn app:app --host 127.0.0.1 --port 8000", shell=True)
 ```
 
 ---
