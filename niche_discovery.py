@@ -91,7 +91,17 @@ class SeenLedger:
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        for attempt in range(5):
+            try:
+                tmp.replace(self.path)
+                break
+            except (PermissionError, OSError):
+                time.sleep(0.05 * (attempt + 1))
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
     def is_seen(self, video_id: str) -> bool:
         return video_id in self._data
@@ -195,8 +205,8 @@ class NicheDiscoveryEngine:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 enrich_data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
-            logger.error(f"YouTube Data API video enrichment failed: {e}")
-            return []
+            logger.warning(f"YouTube Data API video enrichment failed: {e}; falling back to yt-dlp")
+            return self.search_ytdlp(query, min_sec=min_sec, max_sec=max_sec, max_results=max_results, must_include=must_include)
 
         results: List[DiscoveredVideo] = []
         must_inc = [w.lower() for w in (must_include or [])]
@@ -270,13 +280,13 @@ class NicheDiscoveryEngine:
                         continue
                     vid = entry.get("id", "")
                     title = entry.get("title", "")
-                    dur_sec = int(entry.get("duration") or 0)
+                    dur_sec = int(float(entry.get("duration") or 0))
                     if must_inc and not all(w in title.lower() for w in must_inc):
                         continue
                     if dur_sec and not (min_sec <= dur_sec <= max_sec):
                         continue
 
-                    view_count = int(entry.get("view_count") or 0)
+                    view_count = int(float(entry.get("view_count") or 0))
                     results.append(
                         DiscoveredVideo(
                             video_id=vid,

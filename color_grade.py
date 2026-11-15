@@ -46,9 +46,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def get_color_grade_filter(preset_name: str) -> str:
+def get_color_grade_filter(preset_name: str) -> Optional[str]:
     """Return the FFmpeg video filtergraph fragment for a preset."""
-    preset = PRESETS.get(preset_name.lower())
+    name = (preset_name or "").lower().strip()
+    if name in ("none", "", "default", "normal"):
+        return None
+    preset = PRESETS.get(name)
     if not preset:
         raise ValueError(f"Unknown color grade preset '{preset_name}'. Choose from: {list(PRESETS.keys())}")
     return preset["filter"]
@@ -67,9 +70,15 @@ def apply_color_grade(
     """Apply visual color grading to an input video."""
     input_p = Path(input_video)
     output_p = Path(output_video)
+    if not input_p.exists():
+        raise FileNotFoundError(f"Input video not found: {input_p}")
     output_p.parent.mkdir(parents=True, exist_ok=True)
 
     vf = get_color_grade_filter(preset_name)
+    if not vf:
+        # None/default: stream copy
+        subprocess.run(["ffmpeg", "-y", "-i", str(input_p), "-c", "copy", str(output_p)], check=True)
+        return output_p
 
     cmd = [
         "ffmpeg",

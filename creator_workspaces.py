@@ -22,6 +22,10 @@ logger = logging.getLogger("openshorts.creators")
 
 BASE_CREATORS_DIR = Path("output/creators")
 
+def get_base_creators_dir() -> Path:
+    import os
+    return Path(os.environ.get("CREATORS_DIR", "output/creators"))
+
 DEFAULT_CREATOR = {
     "name": "",
     "channel": "",
@@ -55,8 +59,8 @@ class CreatorWorkspaceManager:
 
     _instance: Optional[CreatorWorkspaceManager] = None
 
-    def __init__(self, base_dir: Path | str = BASE_CREATORS_DIR):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: Optional[Path | str] = None):
+        self.base_dir = Path(base_dir) if base_dir is not None else get_base_creators_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -67,6 +71,10 @@ class CreatorWorkspaceManager:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    @classmethod
+    def reset_instance(cls, instance: Optional[CreatorWorkspaceManager] = None) -> None:
+        cls._instance = instance
 
     def _slug(self, name: str) -> str:
         s = re.sub(r"[^a-zA-Z0-9_-]", "-", name.lower()).strip("-")

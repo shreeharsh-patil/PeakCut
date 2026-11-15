@@ -175,6 +175,15 @@ class LiveClipperSession:
             if self.proc and self.proc.poll() is None:
                 try:
                     self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                except Exception:
+                    pass
+                try:
+                    if self.proc.stdout and not self.proc.stdout.closed:
+                        self.proc.stdout.close()
                 except Exception:
                     pass
         logger.info(f"Stopped LiveClipperSession {self.session_id}")
@@ -250,8 +259,15 @@ class LiveClipperSession:
                         stdout=subprocess.PIPE,
                         stderr=errlog,
                     )
-                    self._read_audio_stream(self.proc.stdout)
-                    self.proc.wait()
+                    try:
+                        self._read_audio_stream(self.proc.stdout)
+                        self.proc.wait()
+                    finally:
+                        try:
+                            if self.proc.stdout and not self.proc.stdout.closed:
+                                self.proc.stdout.close()
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.error(f"FFmpeg ingest process failed: {e}")
 
@@ -269,6 +285,12 @@ class LiveClipperSession:
             data = stdout.read(bytes_per_second)
             if not data:
                 break
+
+            # Prevent ValueError: buffer size must be a multiple of element size
+            if len(data) % 2 != 0:
+                data = data[:len(data) - (len(data) % 2)]
+            if not data:
+                continue
 
             # Calculate RMS loudness in dB
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -322,6 +344,7 @@ class LiveClipperSession:
     def _run_twitch_chat(self, channel: str) -> None:
         """Connect to Twitch IRC chat anonymously and record chat message velocity."""
         while not self.stop_event.is_set():
+            ssl_sock = None
             try:
                 raw_sock = socket.create_connection(("irc.chat.twitch.tv", 6697), timeout=15)
                 ssl_sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname="irc.chat.twitch.tv")
@@ -350,12 +373,15 @@ class LiveClipperSession:
                             with self.lock:
                                 self.chat_counts[current_sec] += 1
                                 self.chat_total += 1
-
-                ssl_sock.close()
             except Exception as e:
                 logger.debug(f"Twitch chat listener disconnected: {e}")
             finally:
                 self.chat_connected = False
+                if ssl_sock:
+                    try:
+                        ssl_sock.close()
+                    except Exception:
+                        pass
 
             self.stop_event.wait(5)
 
@@ -471,14 +497,14 @@ class LiveClipperSession:
             first_seg_start = matching[0][1]
             relative_start = max(0.0, event.start_time - first_seg_start)
 
-            # Fast extract with copy or re-encode for keyframe accuracy
+            # Fast extract with frame-accurate seek across TS boundaries
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
-                "-ss", f"{relative_start:.3f}",
                 "-i", str(concat_txt),
+                "-ss", f"{relative_start:.3f}",
                 "-t", f"{event.duration:.3f}",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
@@ -497,6 +523,12 @@ class LiveClipperSession:
             else:
                 event.status = "failed"
                 logger.error(f"FFmpeg failed to extract clip {event.clip_id}: {res.stderr[-300:]}")
+        except subprocess.TimeoutExpired:
+            event.status = "failed"
+            logger.error(f"FFmpeg extraction timed out for clip {event.clip_id}")
+        except FileNotFoundError as e:
+            event.status = "failed"
+            logger.error(f"FFmpeg executable not found: {e}")
         except Exception as e:
             event.status = "failed"
             logger.error(f"Error during clip extraction: {e}")

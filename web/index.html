@@ -1869,21 +1869,23 @@ function drawLog() {
 /* ============================================================ overview */
 async function loadOverview() { try { S.overview = await api("/api/overview"); } catch { return; } drawOverview(); }
 function barChart(daily) {
-  const W = 720, H = 230, pl = 30, pb = 28, pt = 12, n = daily.length, ch = H - pt - pb;
-  const peak = Math.max(1, ...daily.map(d => Math.max(d.clips, d.posted)));
+  daily = daily || [];
+  const W = 720, H = 230, pl = 30, pb = 28, pt = 12, n = daily.length || 1, ch = H - pt - pb;
+  const peak = Math.max(1, ...daily.map(d => Math.max(Number(d.clips) || 0, Number(d.posted) || 0)));
   const step = Math.max(1, Math.ceil(peak / 4)), top = step * 4, cw = (W - pl) / n, bw = Math.min(14, (cw - 10) / 2);
   const y = v => pt + ch * (1 - v / top);
   let g = "";
   for (let i = 0; i <= 4; i++) g += `<line class="gl" x1="${pl}" x2="${W}" y1="${y(i * step)}" y2="${y(i * step)}"/><text x="${pl - 8}" y="${y(i * step) + 4}" text-anchor="end">${i * step}</text>`;
   daily.forEach((d, i) => {
     const cx = pl + i * cw + cw / 2, lab = new Date(d.day + "T12:00").toLocaleDateString([], {day:"numeric", month:"short"});
-    g += `<g><title>${lab}: ${d.clips} clips made, ${d.posted} posted${d.views ? ", " + d.views.toLocaleString() + " views" : ""}</title>
-      <rect class="b1" x="${cx - bw - 1}" y="${y(d.clips)}" width="${bw}" height="${Math.max(0, ch * d.clips / top)}" rx="3"/>
-      <rect class="b2" x="${cx + 1}" y="${y(d.posted)}" width="${bw}" height="${Math.max(0, ch * d.posted / top)}" rx="3"/>
+    const dClips = Number(d.clips) || 0, dPosted = Number(d.posted) || 0, dViews = Number(d.views) || 0;
+    g += `<g><title>${lab}: ${dClips} clips made, ${dPosted} posted${dViews ? ", " + dViews.toLocaleString() + " views" : ""}</title>
+      <rect class="b1" x="${cx - bw - 1}" y="${y(dClips)}" width="${bw}" height="${Math.max(0, ch * dClips / top)}" rx="3"/>
+      <rect class="b2" x="${cx + 1}" y="${y(dPosted)}" width="${bw}" height="${Math.max(0, ch * dPosted / top)}" rx="3"/>
       <rect x="${pl + i * cw}" y="${pt}" width="${cw}" height="${ch}" fill="transparent"/></g>`;
     if (i % 2 === (n - 1) % 2) g += `<text x="${cx}" y="${H - 8}" text-anchor="middle">${i === n - 1 ? "Today" : lab}</text>`;
   });
-  const none = daily.every(d => !d.clips && !d.posted) ? `<text class="none" x="${(W + pl) / 2}" y="${pt + ch / 2}" text-anchor="middle">No clips in the last 14 days yet</text>` : "";
+  const none = !daily.length || daily.every(d => !(Number(d.clips) || 0) && !(Number(d.posted) || 0)) ? `<text class="none" x="${(W + pl) / 2}" y="${pt + ch / 2}" text-anchor="middle">No clips in the last 14 days yet</text>` : "";
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Clips made and posted per day, last 14 days">${g}${none}</svg>`;
 }
 function nextSteps(o) {
@@ -1896,13 +1898,13 @@ function nextSteps(o) {
 }
 function drawOverview() {
   const o = S.overview, box = $("#ov"); if (!o || !box) return;
-  const sum = k => o.creators.reduce((a, r) => a + r[k], 0);
-  const d14 = k => (o.daily || []).reduce((a, d) => a + d[k], 0);
+  const sum = k => (o.creators || []).reduce((a, r) => a + (Number(r[k]) || 0), 0);
+  const d14 = k => (o.daily || []).reduce((a, d) => a + (Number(d[k]) || 0), 0);
   const state = r => r.state === "recording" ? `<span class="pill live"><span class="dot"></span>Recording</span>` : r.state === "waiting" ? `<span class="pill warn">Waiting for live</span>` : `<span class="pill">Idle</span>`;
   const pst = p => p.status === "posted" ? `<span class="pill ok">Posted</span>` : p.status === "failed" ? `<span class="pill bad">Failed</span>` : p.status === "posting" ? `<span class="pill warn">Posting now</span>` : `<span class="pill warn">${clock(p.due_at)}</span>`;
   const steps = nextSteps(o);
   put(box, `<div class="tiles">
-      <div class="tile"><i>${ic("radio")}</i><b>${o.recording}</b><span>Recording now</span></div>
+      <div class="tile"><i>${ic("radio")}</i><b>${o.recording || 0}</b><span>Recording now</span></div>
       <div class="tile"><i>${ic("scissors")}</i><b>${sum("clips_today")}</b><span>Clips today</span></div>
       <div class="tile"><i>${ic("send")}</i><b>${sum("posted_today")}</b><span>Posted today</span></div>
       <div class="tile"><i>${ic(sum("failed") ? "warn" : "clock")}</i><b>${sum("queued")}</b><span>Waiting to post${sum("failed") ? ` · <span style="color:var(--bad)">${sum("failed")} failed</span>` : ""}</span></div></div>
@@ -1917,12 +1919,12 @@ function drawOverview() {
     ${steps.length ? `<div class="card"><div class="card-head"><div><h2>Next steps</h2><p class="sub">Finish setting up PeakCut</p></div></div>
       <div class="steps across">${steps.map((x, i) => `<button class="step" data-act="step" data-to="${esc(x[2])}"><span class="n">${i + 1}</span><span><b>${esc(x[0])}</b><span class="d">${esc(x[1])}</span></span>${ic("arrowr")}</button>`).join("")}</div></div>` : ""}
     <div class="card"><div class="card-head"><div><h2>Creators</h2><p class="sub">Each creator's status and results</p></div></div>
-      ${o.creators.length ? `<div class="scroll"><table><tr><th>Creator</th><th>Status</th><th>Auto-post</th><th class="num">Clips today</th><th class="num">Posted today</th><th class="num">Waiting</th><th class="num">Failed</th><th class="num">Views</th><th class="num">Est. $</th></tr>
-      ${o.creators.map(r => `<tr><td><a class="lnk" href="#" data-act="go" data-v="c:${esc(r.id)}">${esc(r.name)}</a></td><td>${state(r)}</td><td>${r.autopost ? `<span class="pill ok">On</span>` : `<span class="pill">Off</span>`}</td><td class="num">${r.clips_today} <span class="sub">/ ${r.clips_total}</span></td><td class="num">${r.posted_today} <span class="sub">/ ${r.posted_total}</span></td><td class="num">${r.queued}</td><td class="num">${r.failed}</td><td class="num">${r.views.toLocaleString()}</td><td class="num">${r.earnings.toFixed(2)}</td></tr>`).join("")}</table></div>`
+      ${(o.creators || []).length ? `<div class="scroll"><table><tr><th>Creator</th><th>Status</th><th>Auto-post</th><th class="num">Clips today</th><th class="num">Posted today</th><th class="num">Waiting</th><th class="num">Failed</th><th class="num">Views</th><th class="num">Est. $</th></tr>
+      ${o.creators.map(r => `<tr><td><a class="lnk" href="#" data-act="go" data-v="c:${esc(r.id)}">${esc(r.name)}</a></td><td>${state(r)}</td><td>${r.autopost ? `<span class="pill ok">On</span>` : `<span class="pill">Off</span>`}</td><td class="num">${Number(r.clips_today) || 0} <span class="sub">/ ${Number(r.clips_total) || 0}</span></td><td class="num">${Number(r.posted_today) || 0} <span class="sub">/ ${Number(r.posted_total) || 0}</span></td><td class="num">${Number(r.queued) || 0}</td><td class="num">${Number(r.failed) || 0}</td><td class="num">${(Number(r.views) || 0).toLocaleString()}</td><td class="num">${(Number(r.earnings) || 0).toFixed(2)}</td></tr>`).join("")}</table></div>`
       : `<div class="empty"><img src="/brand/favicon.svg" alt=""><b>No creators yet</b>Add one to give each streamer their own workspace.</div>`}</div>
     <div class="card"><div class="card-head"><div><h2>Post queue</h2><p class="sub">${o.paused ? "Paused. Recording and clipping carry on; nothing is posted." : "Queued clips go out at their scheduled time."}</p></div>
         <button class="btn ${o.paused ? "primary" : ""}" data-act="pause">${ic(o.paused ? "play" : "pause")}${o.paused ? "Resume posting" : "Pause all posting"}</button></div>
-      ${o.posts.length ? `<div class="scroll"><table class="stack"><tr><th>When</th><th>Clip</th><th>Creator</th><th>Account</th><th class="num">Views</th><th></th></tr>
+      ${(o.posts || []).length ? `<div class="scroll"><table class="stack"><tr><th>When</th><th>Clip</th><th>Creator</th><th>Account</th><th class="num">Views</th><th></th></tr>
       ${o.posts.map(p => `<tr><td data-l="Status">${pst(p)}</td><td data-l="Clip" class="c-main">${p.url ? `<a class="lnk" href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>` : esc(p.title)}${p.error ? `<div class="err" style="margin:2px 0 0">${esc(p.error)}</div>` : ""}</td><td data-l="Creator">${esc(p.creator_name || "None")}</td><td data-l="Account">${esc(p.account_name)}</td><td data-l="Views" class="num">${p.views ?? "–"}</td>
         <td class="c-act" style="text-align:right">${p.status === "scheduled" ? `<button class="btn sm" data-act="pcancel" data-id="${p.id}">Cancel</button>` : p.status === "failed" ? `<button class="btn sm" data-act="pretry" data-id="${p.id}">Retry</button>` : ""}</td></tr>`).join("")}</table></div>`
       : `<p class="help">Nothing queued or posted yet.</p>`}</div>`);

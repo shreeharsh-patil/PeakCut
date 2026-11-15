@@ -120,16 +120,17 @@ def test_peakcut_creators_and_jobs_endpoints():
     cid = created["id"]
     assert "test-streamer" in cid
 
-    # Test jobs API
-    jobs_resp = _call("GET", "/api/jobs")
-    assert jobs_resp.status_code == 200
-    assert isinstance(jobs_resp.json(), list)
+    try:
+        # Test jobs API
+        jobs_resp = _call("GET", "/api/jobs")
+        assert jobs_resp.status_code == 200
+        assert isinstance(jobs_resp.json(), list)
 
-    # Test alerts test endpoint
-    alerts_resp = _call("POST", "/api/alerts/test")
-    assert alerts_resp.status_code == 200
-    assert "problems" in alerts_resp.json()
-
-    # Clean up creator
-    del_resp = _call("DELETE", f"/api/creators/{cid}")
-    assert del_resp.status_code == 200
+        # Test alerts test endpoint
+        alerts_resp = _call("POST", "/api/alerts/test")
+        assert alerts_resp.status_code == 200
+        assert "problems" in alerts_resp.json()
+    finally:
+        # Clean up creator
+        del_resp = _call("DELETE", f"/api/creators/{cid}")
+        assert del_resp.status_code == 200

@@ -59,6 +59,11 @@ def extract_audio_energy(
         logger.error(f"FFmpeg audio extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
         return np.array([]), 0.0
 
+    if len(raw_pcm) % 2 != 0:
+        raw_pcm = raw_pcm[:len(raw_pcm) - (len(raw_pcm) % 2)]
+    if not raw_pcm:
+        return np.array([]), 0.0
+
     samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
     total_samples = len(samples)
     duration_sec = total_samples / float(sample_rate) if sample_rate else 0.0

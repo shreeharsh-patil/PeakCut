@@ -37,9 +37,9 @@ def build_overlay_filter(
     x_expr = pos[0].format(margin_x=margin_x, margin_y=margin_y)
     y_expr = pos[1].format(margin_x=margin_x, margin_y=margin_y)
 
-    # Scale logo and adjust alpha channel
+    # Scale logo and adjust alpha channel (use -2 so height is always divisible by 2)
     filter_chain = (
-        f"[1:v]scale={scale_width_px}:-1:flags=lanczos,format=rgba,"
+        f"[1:v]scale={scale_width_px}:-2:flags=lanczos,format=rgba,"
         f"colorchannelmixer=aa={opacity:.2f}[logo];"
         f"[0:v][logo]overlay={x_expr}:{y_expr}"
     )
@@ -59,6 +59,10 @@ def apply_branding_overlay(
     """Burn a logo/watermark overlay onto a video file."""
     input_p = Path(input_video)
     overlay_p = Path(overlay_image)
+    if not input_p.exists():
+        raise FileNotFoundError(f"Input video not found: {input_p}")
+    if not overlay_p.exists():
+        raise FileNotFoundError(f"Branding overlay image not found: {overlay_p}")
     output_p = Path(output_video)
     output_p.parent.mkdir(parents=True, exist_ok=True)
 

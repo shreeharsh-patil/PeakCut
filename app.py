@@ -135,6 +135,14 @@ async def _user_from_request(request: Request):
     return await get_current_user_optional(request)
 
 
+import api_key_rotator
+
+
+def get_gemini_key() -> Optional[str]:
+    """Return the active Gemini API key from the rotator."""
+    return api_key_rotator.get_gemini_key()
+
+
 async def resolve_gemini(request: Request) -> Optional[str]:
     """Resolve the Gemini API key for a request.
 
@@ -150,8 +158,9 @@ async def resolve_gemini(request: Request) -> Optional[str]:
         return None
     header = request.headers.get("X-Gemini-Key")
     if header:
+        api_key_rotator.register_keys("gemini", header)
         return header
-    return os.environ.get("GEMINI_API_KEY")
+    return api_key_rotator.get_all_keys_string("gemini") or api_key_rotator.get_gemini_key()
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -1686,6 +1695,7 @@ app.add_middleware(
 )
 
 # Mount static files for serving videos
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 
 # Mount static files for serving thumbnails
@@ -2319,9 +2329,12 @@ async def process_endpoint(
         # Daily paid-proxy budget hit: this job runs on the free routes only.
         env.pop("PROXY_URL", None)
     if api_key:
-        env["GEMINI_API_KEY"] = api_key # Override with key from request
+        full_keys = api_key_rotator.get_all_keys_string("gemini") or api_key
+        env["GEMINI_API_KEY"] = full_keys # Override with key(s) from request/rotator
+        env["GEMINI_API_KEYS"] = full_keys
     else:
         env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
+        env.pop("GEMINI_API_KEYS", None)
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job

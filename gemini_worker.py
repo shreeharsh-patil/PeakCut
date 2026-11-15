@@ -539,15 +539,17 @@ def main() -> int:
     parser.add_argument("--model", default="gemini-2.5-flash")
     args = parser.parse_args()
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    import api_key_rotator
+
+    raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
+    if not raw_keys:
         raise SystemExit("Missing GEMINI_API_KEY.")
+    api_key_rotator.register_keys("gemini", raw_keys)
 
     with open(args.input_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
     model_name = args.model
-    client = genai.Client(api_key=api_key)
     config = _config_for_strategy(args.strategy, args.mode, model_name)
     language = str(payload.get("language") or "unknown")
 
@@ -565,12 +567,28 @@ def main() -> int:
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)
 
-    _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=config,
-    )
+    keys_pool = api_key_rotator.get_all_keys("gemini")
+    max_attempts = max(len(keys_pool), 3)
+    response = None
+
+    for attempt in range(1, max_attempts + 1):
+        active_key = api_key_rotator.get_gemini_key()
+        try:
+            client = genai.Client(api_key=active_key)
+            _log(f"🤖 Gemini worker request (attempt {attempt}/{max_attempts}, key={api_key_rotator.mask_key(active_key)}): mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+            api_key_rotator.report_gemini_success(active_key)
+            break
+        except Exception as e:
+            if api_key_rotator.is_rotatable_error(e) and attempt < max_attempts:
+                _log(f"⚠️ Gemini API key {api_key_rotator.mask_key(active_key)} encountered quota/rate-limit: {e}. Rotating to next key...")
+                api_key_rotator.report_gemini_failure(active_key, error=e)
+                continue
+            raise
 
     raw_text = _get_response_text(response)
     # With response_schema the SDK returns an already-validated object; fall

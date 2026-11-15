@@ -172,7 +172,11 @@ def detect_content_ranges(video_path, video_duration):
     """
     if not ENABLED:
         return []
-    api_key = os.getenv("GEMINI_API_KEY")
+    import api_key_rotator
+    raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
+    if raw_keys:
+        api_key_rotator.register_keys("gemini", raw_keys)
+    api_key = api_key_rotator.get_gemini_key()
     if not api_key:
         return []
 

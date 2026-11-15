@@ -75,6 +75,22 @@ def detect_silences(
     return silences
 
 
+def has_audio_stream(media_path: Path | str) -> bool:
+    """Check if media file has an audio stream."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0",
+            str(media_path),
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return "audio" in out.stdout.lower()
+    except Exception:
+        return True  # Assume true if probe fails
+
+
 def get_media_duration(media_path: Path | str) -> float:
     """Read media duration via ffprobe or ffmpeg."""
     cmd = [
@@ -88,17 +104,17 @@ def get_media_duration(media_path: Path | str) -> float:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if out.returncode == 0 and out.stdout.strip():
             return float(out.stdout.strip())
-    except Exception:
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
         pass
 
     # Fallback to ffmpeg -i
     try:
-        proc = subprocess.run(["ffmpeg", "-i", str(media_path)], capture_output=True, text=True, errors="ignore")
+        proc = subprocess.run(["ffmpeg", "-i", str(media_path)], capture_output=True, text=True, errors="ignore", timeout=10)
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", proc.stderr)
         if m:
             h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
             return h * 3600 + mn * 60 + s
-    except Exception:
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
         pass
 
     return 0.0
@@ -154,13 +170,16 @@ def apply_smartcut(
     """Detect silences, cut pauses, and produce a high-pace jump-cut video."""
     input_p = Path(input_video)
     output_p = Path(output_video)
+    if input_p.resolve() == output_p.resolve():
+        raise ValueError("input_video and output_video cannot be the same file")
     output_p.parent.mkdir(parents=True, exist_ok=True)
 
     total_dur = get_media_duration(input_p)
     if total_dur <= 0:
         raise ValueError(f"Could not read duration of {input_p}")
 
-    silences = detect_silences(input_p, noise_db=noise_db, min_silence_sec=min_silence_sec)
+    has_audio = has_audio_stream(input_p)
+    silences = detect_silences(input_p, noise_db=noise_db, min_silence_sec=min_silence_sec) if has_audio else []
     speech = compute_speech_segments(total_dur, silences)
 
     if not speech or len(speech) <= 1 and (speech[0][1] - speech[0][0]) >= total_dur - 0.5:
@@ -177,38 +196,62 @@ def apply_smartcut(
         )
 
     # Build FFmpeg complex filter to extract and concatenate speech chunks
-    # [0:v]trim=start=s:end=e,setpts=PTS-STARTPTS[v0]; [0:a]atrim=start=s:end=e,asetpts=PTS-STARTPTS[a0]...
     filter_parts = []
     concat_inputs = []
 
     for i, (start_t, end_t) in enumerate(speech):
         filter_parts.append(f"[0:v]trim=start={start_t:.3f}:end={end_t:.3f},setpts=PTS-STARTPTS[v{i}]")
-        filter_parts.append(f"[0:a]atrim=start={start_t:.3f}:end={end_t:.3f},asetpts=PTS-STARTPTS[a{i}]")
-        concat_inputs.append(f"[v{i}][a{i}]")
+        if has_audio:
+            filter_parts.append(f"[0:a]atrim=start={start_t:.3f}:end={end_t:.3f},asetpts=PTS-STARTPTS[a{i}]")
+            concat_inputs.append(f"[v{i}][a{i}]")
+        else:
+            concat_inputs.append(f"[v{i}]")
 
     num_chunks = len(speech)
-    concat_filter = f"{''.join(concat_inputs)}concat=n={num_chunks}:v=1:a=1[outv][outa]"
+    if has_audio:
+        concat_filter = f"{''.join(concat_inputs)}concat=n={num_chunks}:v=1:a=1[outv][outa]"
+    else:
+        concat_filter = f"{''.join(concat_inputs)}concat=n={num_chunks}:v=1:a=0[outv]"
     filter_parts.append(concat_filter)
 
     full_filter = ";".join(filter_parts)
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", str(input_p),
-        "-filter_complex", full_filter,
-        "-map", "[outv]",
-        "-map", "[outa]",
+    script_path = None
+    cmd = ["ffmpeg", "-y", "-i", str(input_p)]
+    if len(full_filter) > 2000:
+        script_path = output_p.parent / f"filter_{int(time.time()*1000)}.txt"
+        script_path.write_text(full_filter, encoding="utf-8")
+        cmd.extend(["-filter_complex_script", str(script_path)])
+    else:
+        cmd.extend(["-filter_complex", full_filter])
+
+    cmd.extend(["-map", "[outv]"])
+    if has_audio:
+        cmd.extend(["-map", "[outa]"])
+
+    cmd.extend([
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "20",
-        "-c:a", "aac",
-        "-b:a", "160k",
+    ])
+    if has_audio:
+        cmd.extend([
+            "-c:a", "aac",
+            "-b:a", "160k",
+        ])
+    cmd.extend([
         "-movflags", "+faststart",
         str(output_p),
-    ]
+    ])
 
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    finally:
+        if script_path and script_path.exists():
+            try:
+                script_path.unlink()
+            except Exception:
+                pass
     if res.returncode != 0:
         raise RuntimeError(f"FFmpeg SmartCut failed: {res.stderr[-300:]}")
 

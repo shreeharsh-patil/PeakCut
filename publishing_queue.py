@@ -27,6 +27,10 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger("openshorts.publishing_queue")
 
 DEFAULT_QUEUE_PATH = Path("output/posts_queue.json")
+
+def get_default_queue_path() -> Path:
+    return Path(os.environ.get("POSTS_QUEUE_PATH", "output/posts_queue.json"))
+
 DEFAULT_POST_GAP_MINUTES = 45
 DEFAULT_DAILY_CAP = 5
 MAX_RETRY_ATTEMPTS = 5
@@ -66,11 +70,11 @@ class PublishingQueue:
 
     def __init__(
         self,
-        queue_file: Path | str = DEFAULT_QUEUE_PATH,
+        queue_file: Optional[Path | str] = None,
         post_gap_minutes: int = DEFAULT_POST_GAP_MINUTES,
         daily_cap: int = DEFAULT_DAILY_CAP,
     ):
-        self.queue_file = Path(queue_file)
+        self.queue_file = Path(queue_file) if queue_file is not None else get_default_queue_path()
         self.queue_file.parent.mkdir(parents=True, exist_ok=True)
         self.post_gap_minutes = post_gap_minutes
         self.daily_cap = daily_cap
@@ -333,6 +337,17 @@ class QueueWorker:
 
 _GLOBAL_QUEUE: Optional[PublishingQueue] = None
 _GLOBAL_WORKER: Optional[QueueWorker] = None
+
+
+def reset_publishing_queue(queue: Optional[PublishingQueue] = None) -> None:
+    global _GLOBAL_QUEUE, _GLOBAL_WORKER
+    if _GLOBAL_WORKER:
+        try:
+            _GLOBAL_WORKER.stop()
+        except Exception:
+            pass
+        _GLOBAL_WORKER = None
+    _GLOBAL_QUEUE = queue
 
 
 def get_publishing_queue() -> PublishingQueue:

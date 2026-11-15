@@ -73,8 +73,10 @@ class ChannelWatcherService:
         if not self.state_path.exists():
             return {}
         try:
+            import dataclasses
+            allowed = {f.name for f in dataclasses.fields(WatchedChannel)}
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-            return {k: WatchedChannel(**v) for k, v in raw.items()}
+            return {k: WatchedChannel(**{attr: val for attr, val in v.items() if attr in allowed}) for k, v in raw.items()}
         except Exception as e:
             logger.warning(f"Failed to load channel watcher state {self.state_path}: {e}")
             return {}
@@ -170,7 +172,7 @@ class ChannelWatcherService:
 
         return ""
 
-    def check_youtube_rss_vods(self, channel: WatchedChannel) -> List[Dict[str, str]]:
+    def check_youtube_rss_vods(self, channel: WatchedChannel, backfill: bool = True) -> List[Dict[str, str]]:
         """Fetch YouTube RSS Atom feed to find newly uploaded videos with zero API quota."""
         if not channel.resolved_channel_id:
             channel.resolved_channel_id = self.resolve_youtube_channel_id(channel.channel_identifier)
@@ -188,6 +190,8 @@ class ChannelWatcherService:
             root = ET.fromstring(xml_data)
             entries = root.findall("atom:entry", ATOM_NS)
 
+            is_first_run = not channel.last_seen_vod_id and not backfill
+
             for entry in entries:
                 vid_elem = entry.find("yt:videoId", ATOM_NS)
                 title_elem = entry.find("atom:title", ATOM_NS)
@@ -201,7 +205,9 @@ class ChannelWatcherService:
                 if vid_id == channel.last_seen_vod_id:
                     break
 
-                new_videos.append({"video_id": vid_id, "title": title, "url": url})
+                # On first un-backfilled poll, seed watermark without flooding 15 past VODs
+                if not is_first_run:
+                    new_videos.append({"video_id": vid_id, "title": title, "url": url})
 
             if entries:
                 first_vid = entries[0].find("yt:videoId", ATOM_NS)
@@ -249,7 +255,8 @@ class ChannelWatcherService:
 
             # Check VODs
             if channel.mode in ("vod", "both") and channel.platform == "youtube":
-                new_vods = self.check_youtube_rss_vods(channel)
+                first_time = not channel.last_seen_vod_id
+                new_vods = self.check_youtube_rss_vods(channel, backfill=not first_time)
                 for vod in new_vods:
                     logger.info(f"[NEW VOD DETECTED] Channel '{channel.creator_name}': {vod['title']} ({vod['url']})")
                     if self.on_new_vod:
@@ -296,7 +303,7 @@ class ChannelWatcherService:
 
     def stop_background_watcher(self) -> None:
         self.stop_event.set()
-        if self.worker_thread:
+        if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5)
 
 

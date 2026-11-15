@@ -307,6 +307,9 @@ print("🐍 Step 4/5: Installing Python dependencies...")
 subprocess.run("pip install -q -r requirements.txt", shell=True)
 subprocess.run("pip install -q uvicorn fastapi requests", shell=True)
 
+# (Optional) Rotating API Keys (comma-separated: if one hits 429/quota, it rotates automatically)
+# os.environ["GEMINI_API_KEY"] = "AIzaSyKey1...,AIzaSyKey2...,AIzaSyKey3..."
+
 # 5. Start Cloudflare Tunnel in background
 print("🚀 Step 5/5: Starting Cloudflare tunnel & web server...")
 tunnel = subprocess.Popen(

@@ -21,6 +21,7 @@ import mediapipe as mp
 from google import genai
 from google.genai import types as genai_types
 
+import api_key_rotator
 import gemini_worker
 import hook_grounding
 import layout_picker
@@ -745,7 +746,7 @@ def download_youtube_video(url, output_dir="."):
     if cookies_env:
         print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
         try:
-            with open(cookies_path, 'w') as f:
+            with open(cookies_path, 'w', encoding="utf-8") as f:
                 f.write(cookies_env)
             if os.path.exists(cookies_path):
                  # Never print file CONTENT here: with a headerless cookies
@@ -1419,7 +1420,7 @@ def save_transcript_checkpoint(output_dir, transcript, input_video, duration):
     try:
         payload = {"source": _checkpoint_source_key(input_video, duration),
                    "transcript": transcript}
-        with open(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), "w") as f:
+        with open(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), "w", encoding="utf-8") as f:
             json.dump(payload, f)
     except Exception as e:
         print(f"⚠️ Could not save transcript checkpoint: {e}")
@@ -1434,7 +1435,7 @@ def load_transcript_checkpoint(output_dir, input_video, duration):
     if not os.path.isfile(path):
         return None
     try:
-        with open(path) as f:
+        with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
         source = payload.get("source") or {}
         expected = _checkpoint_source_key(input_video, duration)
@@ -1508,11 +1509,14 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             else:
                 parsed = gemini_worker._parse_json_response_text(
                     gemini_worker._get_response_text(response))
+            if not use_local:
+                api_key_rotator.report_gemini_success(api_key_rotator.get_gemini_key())
             return parsed, gemini_worker._calculate_cost_analysis(response, model_name)
         except gemini_worker.GeminiBlockedError:
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
+            rotatable = (not use_local) and api_key_rotator.is_rotatable_error(e)
             transient = any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
                 '500', 'INTERNAL', 'overloaded', 'Deadline',
@@ -1521,9 +1525,20 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
+                'validation error')) or rotatable
             if attempt == max_attempts or not transient:
                 raise
+            if rotatable:
+                cur_k = api_key_rotator.get_gemini_key()
+                api_key_rotator.report_gemini_failure(cur_k, error=e)
+                new_k = api_key_rotator.get_gemini_key()
+                if new_k:
+                    print(f"🔄 Rotated Gemini API key to {api_key_rotator.mask_key(new_k)} due to quota/rate limit.")
+                    try:
+                        from google import genai
+                        client = genai.Client(api_key=new_k)
+                    except Exception:
+                        pass
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
@@ -1586,7 +1601,10 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} (2-pass: score → detail)...")
     else:
         print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
-        api_key = os.getenv("GEMINI_API_KEY")
+        raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
+        if raw_keys:
+            api_key_rotator.register_keys("gemini", raw_keys)
+        api_key = api_key_rotator.get_gemini_key()
         if not api_key:
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
@@ -1722,7 +1740,10 @@ def get_visual_clips(video_path, video_duration, language="en"):
     most engaging visual moments (no transcript). Returns the same
     {"shorts", "cost_analysis"} shape as get_viral_clips, or None."""
     print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
-    api_key = os.getenv("GEMINI_API_KEY")
+    raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
+    if raw_keys:
+        api_key_rotator.register_keys("gemini", raw_keys)
+    api_key = api_key_rotator.get_gemini_key()
     if not api_key:
         if llm_backend.active():
             print("❌ This video has no usable speech, so it has to be clipped by "
@@ -1920,7 +1941,7 @@ if __name__ == '__main__':
         # with the file falls back to transcribing normally rather than failing.
         if args.transcript:
             try:
-                with open(args.transcript, 'r') as f:
+                with open(args.transcript, 'r', encoding="utf-8") as f:
                     transcript = json.load(f)
                 if not transcript.get('segments'):
                     raise ValueError("transcript has no segments")
@@ -1974,7 +1995,7 @@ if __name__ == '__main__':
             clips_data['source_video'] = os.path.basename(input_video)
             clips_data['output_format'] = output_format
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
+            with open(metadata_file, 'w', encoding="utf-8") as f:
                 json.dump(clips_data, f, indent=2)
             print(f"   Saved metadata to {metadata_file}")
 
@@ -2002,7 +2023,11 @@ if __name__ == '__main__':
                         *audio_encode_args(),
                         clip_temp_path
                     ]
-                    subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    proc = subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    if proc.returncode != 0 or not os.path.exists(clip_temp_path) or os.path.getsize(clip_temp_path) == 0:
+                        err_msg = proc.stderr.decode("utf-8", errors="ignore") if proc.stderr else "unknown error"
+                        print(f"❌ Failed to cut clip {i+1} with FFmpeg: {err_msg[:200]}")
+                        return False
 
                     success = render_clip(clip_temp_path, clip_final_path, output_format)
                     # Layer order: watermark burns into the canonical (so any
@@ -2062,7 +2087,7 @@ if __name__ == '__main__':
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
             if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
-                with open(metadata_file, 'w') as f:
+                with open(metadata_file, 'w', encoding="utf-8") as f:
                     json.dump(clips_data, f, indent=2)
 
     # Clean up original if requested
