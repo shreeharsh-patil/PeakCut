@@ -1891,11 +1891,13 @@ def get_viral_clips(transcript_result, video_duration):
     word boundaries so clips don't start/end mid-word.
     """
     language = str(transcript_result.get('language') or 'unknown')
-    if llm_backend.active():
-        # Self-hosted text model: no Google key needed for this stage.
+    is_local_mode = llm_backend.active() or llm_backend.is_colab() or os.environ.get("FORCE_LOCAL_ONLY") == "1"
+    if is_local_mode:
+        # Self-hosted / Colab local text model: no Google key needed for this stage.
         client = None
         model_name = llm_backend.model_name()
-        print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} (2-pass: score → detail)...")
+        endpoint = llm_backend.base_url() or "http://127.0.0.1:11434/v1"
+        print(f"\U0001f916  Analyzing with local LLM ({model_name}) at {endpoint} (2-pass: score → detail)...")
     else:
         print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
         raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
@@ -2015,7 +2017,8 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"🚫 {e}")
         raise
     except Exception as e:
-        print(f"❌ Gemini Error: {e} — activating heuristic virality engine fallback...")
+        who = "Local LLM" if (llm_backend.active() or llm_backend.is_colab()) else "Gemini"
+        print(f"❌ {who} Error: {e} — activating heuristic virality engine fallback...")
         return {
             "shorts": _heuristic_transcript_clips(transcript_result, video_duration),
             "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
@@ -2044,6 +2047,12 @@ def get_visual_clips(video_path, video_duration, language="en"):
     """Clip a SILENT video by vision: Gemini watches the footage and picks the
     most engaging visual moments (no transcript). Returns the same
     {"shorts", "cost_analysis"} shape as get_viral_clips, or None."""
+    if llm_backend.is_colab() or os.environ.get("FORCE_LOCAL_ONLY") == "1":
+        print("🎥  Colab zero-API mode active — running heuristic Highlight Detector (no external APIs)...")
+        return {
+            "shorts": _heuristic_visual_clips(video_path, video_duration),
+            "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+        }
     print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
     raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
     if raw_keys:
@@ -2181,76 +2190,62 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-if __name__ == '__main__':
-    parser = build_arg_parser()
-    args, unknown = parser.parse_known_args()
-    if unknown:
-        print(f"ℹ️ Note: Ignoring unrecognized CLI arguments: {unknown}")
+def process_video_pipeline(
+    input_video_or_url: str,
+    output_dir: Optional[str] = None,
+    is_url: bool = True,
+    output_format: str = "vertical",
+    target_clips: Optional[int] = None,
+    clip_min_seconds: Optional[float] = None,
+    clip_max_seconds: Optional[float] = None,
+    live_record_seconds: Optional[int] = None,
+    keep_original: bool = False,
+    transcript_path: Optional[str] = None,
+    skip_analysis: bool = False,
+) -> dict:
+    """End-to-end programmatic entrypoint for processing a video or YouTube URL.
 
-    if args.live_record_seconds:
-        os.environ["LIVE_RECORD_SECONDS"] = str(args.live_record_seconds)
-    if args.clip_min_seconds:
-        os.environ["CLIP_MIN_SECONDS"] = str(args.clip_min_seconds)
-    if args.clip_max_seconds:
-        os.environ["CLIP_MAX_SECONDS"] = str(args.clip_max_seconds)
-    if args.target_clips:
-        os.environ["CLIP_TARGET_MIN"] = str(args.target_clips)
-        os.environ["CLIP_TARGET_MAX"] = str(args.target_clips)
-
-    if args.url:
-        from security_utils import normalize_media_url
-        args.url = normalize_media_url(args.url)
-
-    output_format = args.format
+    Extracts viral short clips, reframes to vertical 9:16 (or chosen format),
+    applies AI face-tracking and burned subtitles without requiring CLI interaction.
+    """
+    if live_record_seconds:
+        os.environ["LIVE_RECORD_SECONDS"] = str(live_record_seconds)
+    if clip_min_seconds:
+        os.environ["CLIP_MIN_SECONDS"] = str(clip_min_seconds)
+    if clip_max_seconds:
+        os.environ["CLIP_MAX_SECONDS"] = str(clip_max_seconds)
+    if target_clips:
+        os.environ["CLIP_TARGET_MIN"] = str(target_clips)
+        os.environ["CLIP_TARGET_MAX"] = str(target_clips)
 
     script_start_time = time.time()
-    
+
     def _ensure_dir(path: str) -> str:
-        """Create directory if missing and return the same path."""
         if path:
             os.makedirs(path, exist_ok=True)
         return path
-    
-    # 1. Get Input Video
-    if args.url:
-        # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
-        # For whole-video runs (--skip-analysis), --output can be a file path.
-        if args.output and not args.skip_analysis:
-            output_dir = _ensure_dir(args.output)
-        else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default "."
-            if args.output and os.path.isdir(args.output):
-                output_dir = args.output
-            elif args.output and not os.path.isdir(args.output):
-                output_dir = os.path.dirname(args.output) or "."
-            else:
-                output_dir = "."
-        
-        input_video, video_title = download_youtube_video(args.url, output_dir)
+
+    if is_url:
+        from security_utils import normalize_media_url
+        url = normalize_media_url(input_video_or_url)
+        resolved_output_dir = _ensure_dir(output_dir or "./output")
+        input_video, video_title = download_youtube_video(url, resolved_output_dir)
     else:
-        input_video = args.input
+        input_video = input_video_or_url
         video_title = os.path.splitext(os.path.basename(input_video))[0]
-        
-        if args.output and not args.skip_analysis:
-            # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
-            output_dir = _ensure_dir(args.output)
+        if output_dir and not skip_analysis:
+            resolved_output_dir = _ensure_dir(output_dir)
+        elif output_dir and os.path.isdir(output_dir):
+            resolved_output_dir = output_dir
+        elif output_dir and not os.path.isdir(output_dir):
+            resolved_output_dir = os.path.dirname(output_dir) or "."
         else:
-            # If output is a directory, use it; if it's a filename, use its directory; else default to input dir.
-            if args.output and os.path.isdir(args.output):
-                output_dir = args.output
-            elif args.output and not os.path.isdir(args.output):
-                output_dir = os.path.dirname(args.output) or os.path.dirname(input_video)
-            else:
-                output_dir = os.path.dirname(input_video)
+            resolved_output_dir = os.path.dirname(input_video) or "."
 
     if not os.path.exists(input_video):
-        print(f"❌ Input file not found: {input_video}")
-        exit(1)
+        raise FileNotFoundError(f"Input video file not found: {input_video}")
 
-    # Layout choice is per SOURCE video, not per clip: one upload and one call
-    # instead of one per clip, and the answer is a property of the material
-    # ("this is a screencast"), which does not change between its own clips.
-    # It runs before any render so the modules are switched on in time.
+    # Layout choice is per SOURCE video, not per clip
     if layout_picker.ENABLED:
         try:
             _cap = cv2.VideoCapture(input_video)
@@ -2259,10 +2254,7 @@ if __name__ == '__main__':
             _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             _cap.release()
-            from reframe_v2 import source_already_fits  # imports main back
-            # A source already shot vertical has no width to reorganise, and
-            # the render passes it through whatever the model says. Asking
-            # anyway costs a Gemini call per upload to be ignored.
+            from reframe_v2 import source_already_fits
             if _w and _h and source_already_fits(_w, _h, ASPECT_RATIO):
                 print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
             else:
@@ -2270,73 +2262,62 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
 
-    # 2. Decision: Analyze clips or process whole?
-    if args.skip_analysis:
+    ready_clips = []
+    clips_data = None
+    duration = 0.0
+
+    if skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
-        # --output is documented as "directory or file". When it names a
-        # directory we still need a filename: passing the directory through
-        # ends up in os.remove() on it further down and dies with EACCES.
-        output_file = args.output
+        output_file = output_dir
         if (not output_file or os.path.isdir(output_file)
                 or output_file.endswith(("/", os.sep))
                 or not os.path.splitext(output_file)[1]):
-            output_file = os.path.join(output_file or output_dir, f"{video_title}_vertical.mp4")
+            output_file = os.path.join(output_file or resolved_output_dir, f"{video_title}_vertical.mp4")
         os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         render_clip(input_video, output_file, output_format)
+        ready_clips.append(output_file)
     else:
-        # Get duration (needed by both the transcript and the vision path).
+        # Get duration
         cap = cv2.VideoCapture(input_video)
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-        if fps and fps > 0 and frame_count and frame_count > 0:
-            duration = frame_count / fps
-        else:
-            from smartcut import get_media_duration
-            duration = get_media_duration(input_video)
-            if not fps or fps <= 0 or (isinstance(fps, float) and np.isnan(fps)):
-                fps = 30.0
+        duration = frame_count / fps if fps > 0 else 0
+        print(f"🎥 Video Duration: {duration:.2f}s ({frame_count} frames @ {fps:.2f} fps)")
 
-        # 3. Transcribe — unless the video has no audio, in which case fall back
-        # to Gemini vision (picks clips from the imagery instead of the speech).
+        # 3. Transcribe
         from transcribe_backends import NoAudioError
         transcript = None
-        # Module handover (issue #68): another module already transcribed this
-        # exact source with the same backend, so reuse its output. Any problem
-        # with the file falls back to transcribing normally rather than failing.
-        if args.transcript:
+        if transcript_path:
             try:
-                with open(args.transcript, 'r', encoding="utf-8") as f:
+                with open(transcript_path, 'r', encoding="utf-8") as f:
                     transcript = json.load(f)
                 if not transcript.get('segments'):
                     raise ValueError("transcript has no segments")
-                print(f"⏩ Reusing precomputed transcript "
-                      f"({len(transcript['segments'])} segments) — skipping transcription.")
+                print(f"⏩ Reusing precomputed transcript ({len(transcript['segments'])} segments).")
             except Exception as e:
                 print(f"⚠️ Could not use precomputed transcript ({e}) — transcribing normally.")
                 transcript = None
+
         if transcript is None:
-            transcript = load_transcript_checkpoint(output_dir, input_video, duration)
+            transcript = load_transcript_checkpoint(resolved_output_dir, input_video, duration)
             if transcript is not None:
-                print(f"♻️ Reusing the transcript from the interrupted run "
-                      f"({len(transcript['segments'])} segments) — skipping transcription.")
+                print(f"♻️ Reusing transcript checkpoint ({len(transcript['segments'])} segments).")
+
         if transcript is None:
             try:
                 transcript = transcribe_video(input_video)
-                save_transcript_checkpoint(output_dir, transcript, input_video, duration)
+                save_transcript_checkpoint(resolved_output_dir, transcript, input_video, duration)
             except (NoAudioError, Exception) as e:
-                print(f"🔇 Transcription notice ({e}) — switching to visual/audio highlight analysis.")
+                print(f"🔇 Transcription notice ({e}) — switching to visual highlight analysis.")
                 transcript = None
 
-        # Music-only or wordless footage transcribes to a handful of words.
-        # Clip it by what is on screen instead, like a video with no audio.
         if transcript is not None and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
-            print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
-                  f"switching to visual analysis.")
+            print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — switching to visual analysis.")
             transcript = None
 
-        # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
+        # 4. Clip Detection (Local model or heuristic)
         if transcript is not None:
             clips_data = get_viral_clips(transcript, duration)
         else:
@@ -2356,28 +2337,18 @@ if __name__ == '__main__':
                 }
 
         if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
-            raise RuntimeError(
-                "Clip detection failed — unable to identify usable clips for this video.")
+            raise RuntimeError("Clip detection failed — unable to identify usable clips for this video.")
 
         print(f"🔥 Found {len(clips_data['shorts'])} clips!")
 
-        # Save metadata. Silent videos have no transcript → no subtitles,
-        # which is correct (there's no speech to caption).
         clips_data['transcript'] = transcript or {"language": "none", "segments": []}
-        # The clip editor's re-render path needs to find the source video
-        # again and reproduce the render settings, so record both. The
-        # basename is enough — the file sits in the job dir (URL jobs with
-        # --keep-original) or in uploads/ (upload jobs).
         clips_data['source_video'] = os.path.basename(input_video)
         clips_data['output_format'] = output_format
-        metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+        metadata_file = os.path.join(resolved_output_dir, f"{video_title}_metadata.json")
         with open(metadata_file, 'w', encoding="utf-8") as f:
             json.dump(clips_data, f, indent=2)
-        print(f"   Saved metadata to {metadata_file}")
 
-        # 5. Process clips in parallel: each worker cuts + renders one
-        # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
-        # detector inference is serialized internally via DETECT_LOCK.
+        # 5. Process clips in parallel
         def _process_one_clip(i, clip):
             start = clip['start']
             end = clip['end']
@@ -2385,11 +2356,10 @@ if __name__ == '__main__':
             print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
 
             clip_filename = f"{video_title}_clip_{i+1}.mp4"
-            clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
-            clip_final_path = os.path.join(output_dir, clip_filename)
+            clip_temp_path = os.path.join(resolved_output_dir, f"temp_{clip_filename}")
+            clip_final_path = os.path.join(resolved_output_dir, clip_filename)
 
             try:
-                # ffmpeg cut — re-encoding for precision on strict seconds
                 cut_command = [
                     'ffmpeg', '-y',
                     '-ss', str(start),
@@ -2406,22 +2376,11 @@ if __name__ == '__main__':
                     return False
 
                 success = render_clip(clip_temp_path, clip_final_path, output_format)
-                # Layer order: watermark burns into the canonical (so any
-                # later hook replacement, which re-derives from it, keeps
-                # the branding), the hook is a derived hooked_ file, and
-                # captions go last on top of whichever is current. Each
-                # worker writes only its own clip dict, so the re-dump
-                # after the pool is race-free.
                 if success and os.environ.get("WATERMARK") == "1":
                     apply_watermark(clip_final_path)
                 deliver_path = clip_final_path
-                # Which stretches were stacked (SPLIT): captions go on the
-                # seam there, and /api/subtitle needs it again later.
                 import layout_ranges as _layouts
                 clip['layout_ranges'] = _layouts.read(clip_final_path)
-                # The hook was written from the transcript alone. When the
-                # render put this clip's meaning on the screen, rewrite hook
-                # and title from three of its frames BEFORE burning them.
                 if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
                     hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                 if success and os.environ.get("AUTO_HOOK") == "1":
@@ -2432,15 +2391,9 @@ if __name__ == '__main__':
                     captioned = auto_caption_clip(
                         deliver_path, transcript, start, end,
                         split_ranges=_layouts.split_ranges(clip['layout_ranges']))
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                    # Hand the API the file to actually serve for this clip.
-                    # Without it the status poller guesses the clean reframe
-                    # name, so a job in flight showed every clip stripped of
-                    # its hook and captions until the WHOLE job finished and
-                    # the result got rebuilt through _canonical_clip_file.
-                    # Printed only after the full chain (reframe, watermark,
-                    # hook, captions) so the file is complete when it is
-                    # announced, never one that ffmpeg is still writing.
+                    final_ready = captioned or deliver_path
+                    ready_clips.append(final_ready)
+                    print(f"   ✅ Clip {i+1} ready: {final_ready}")
                     print(f"CLIP_READY {i} "
                           f"{os.path.basename(captioned or deliver_path)}")
                 return success
@@ -2451,8 +2404,7 @@ if __name__ == '__main__':
         clip_workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
         shorts = clips_data['shorts']
         with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
-            futures = {pool.submit(_process_one_clip, i, clip): i
-                       for i, clip in enumerate(shorts)}
+            futures = {pool.submit(_process_one_clip, i, clip): i for i, clip in enumerate(shorts)}
             for future in as_completed(futures):
                 i = futures[future]
                 try:
@@ -2460,19 +2412,54 @@ if __name__ == '__main__':
                 except Exception as e:
                     print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
 
-        # Persist per-clip render results added by the workers (auto_hook)
-        # so the editor can see what is already burned into each clip.
         if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
             with open(metadata_file, 'w', encoding="utf-8") as f:
                 json.dump(clips_data, f, indent=2)
 
     # Clean up original if requested
-    if args.url and not args.keep_original and os.path.exists(input_video):
-        os.remove(input_video)
-        print(f"🗑️  Cleaned up downloaded video.")
-    # The job finished: a later run in this directory must transcribe afresh.
-    if not args.skip_analysis:
-        clear_transcript_checkpoint(output_dir)
+    if is_url and not keep_original and os.path.exists(input_video):
+        try:
+            os.remove(input_video)
+            print("🗑️  Cleaned up downloaded video.")
+        except Exception:
+            pass
+
+    if not skip_analysis:
+        clear_transcript_checkpoint(resolved_output_dir)
 
     total_time = time.time() - script_start_time
     print(f"\n⏱️  Total execution time: {total_time:.2f}s")
+    return {
+        "success": True,
+        "video_title": video_title,
+        "input_video": input_video,
+        "output_dir": resolved_output_dir,
+        "clips": ready_clips,
+        "metadata": clips_data,
+        "duration": duration,
+        "execution_time": total_time,
+    }
+
+
+if __name__ == '__main__':
+    parser = build_arg_parser()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"ℹ️ Note: Ignoring unrecognized CLI arguments: {unknown}")
+
+    is_url = bool(args.url)
+    input_target = args.url if is_url else args.input
+
+    process_video_pipeline(
+        input_video_or_url=input_target,
+        output_dir=args.output,
+        is_url=is_url,
+        output_format=args.format,
+        target_clips=args.target_clips,
+        clip_min_seconds=args.clip_min_seconds,
+        clip_max_seconds=args.clip_max_seconds,
+        live_record_seconds=args.live_record_seconds,
+        keep_original=args.keep_original,
+        transcript_path=args.transcript,
+        skip_analysis=args.skip_analysis,
+    )

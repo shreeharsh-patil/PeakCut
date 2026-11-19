@@ -368,5 +368,8 @@ def main():
         sys.exit(1)
 
 
+# Backwards-compatibility alias
+upload_video = upload_youtube_short
+
 if __name__ == "__main__":
     main()

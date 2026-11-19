@@ -145,6 +145,9 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
     """Rewrite ``clip['viral_hook_text']`` / ``video_title_for_youtube_short``
     in place from the clip's frames. Returns what changed (also stored under
     ``clip['hook_grounding']``), or None when skipped or failed."""
+    import llm_backend
+    if llm_backend.is_colab() or os.environ.get("FORCE_LOCAL_ONLY") == "1":
+        return None
     import api_key_rotator
     raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
     if raw_keys:

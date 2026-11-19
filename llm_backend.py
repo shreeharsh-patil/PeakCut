@@ -25,36 +25,78 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Optional, Tuple, Type
 
 import httpx
 from pydantic import BaseModel
 
-DEFAULT_MODEL = "llama3.1:8b"
+DEFAULT_MODEL = "gemma2:2b"
 DEFAULT_TIMEOUT = 600.0  # local models on CPU are slow; a scoring batch can take minutes
 
 
+def is_colab() -> bool:
+    """Return True if executing inside Google Colab environment or Colab mode is forced."""
+    if os.environ.get("IS_COLAB") in ("1", "true", "True"):
+        return True
+    if os.environ.get("FORCE_LOCAL_ONLY") in ("1", "true", "True"):
+        return True
+    if os.environ.get("COLAB_GPU") is not None or os.environ.get("COLAB_RELEASE_TAG") is not None:
+        return True
+    try:
+        import google.colab  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    return os.path.exists("/content") and os.path.isdir("/content") and os.path.exists("/content/sample_data")
+
+
 def provider() -> str:
-    """``"openai"`` when a compatible endpoint is configured, else ``"gemini"``."""
+    """``"openai"`` when a compatible endpoint is configured or running on Colab, else ``"gemini"``."""
     explicit = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
     if explicit in ("openai", "ollama", "local", "openai-compatible"):
         return "openai"
     if explicit == "gemini":
         return "gemini"
+    if is_colab():
+        return "openai"
     return "openai" if base_url() else "gemini"
 
 
 def base_url() -> str:
-    return (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/")
+    url = (os.environ.get("LLM_BASE_URL") or "").strip().rstrip("/")
+    if url:
+        return url
+    if is_colab():
+        return "http://127.0.0.1:11434/v1"
+    return ""
 
 
 def model_name() -> str:
-    return (os.environ.get("LLM_MODEL") or "").strip() or DEFAULT_MODEL
+    explicit = (os.environ.get("LLM_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    if is_colab() or provider() == "openai":
+        return "gemma2:2b"
+    return DEFAULT_MODEL
 
 
 def active() -> bool:
     """True when the moment picker should call the OpenAI-compatible server."""
     return provider() == "openai" and bool(base_url())
+
+
+def is_local_llm_ready() -> bool:
+    """Check if the local OpenAI-compatible / Ollama server is responding."""
+    if not active():
+        return False
+    try:
+        url = f"{base_url()}/models"
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(url, headers=_headers())
+            return resp.status_code == 200
+    except Exception:
+        return False
 
 
 def describe() -> Optional[dict]:

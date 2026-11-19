@@ -172,6 +172,9 @@ def detect_content_ranges(video_path, video_duration):
     """
     if not ENABLED:
         return []
+    import llm_backend
+    if llm_backend.is_colab() or os.environ.get("FORCE_LOCAL_ONLY") == "1":
+        return []
     import api_key_rotator
     raw_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
     if raw_keys:

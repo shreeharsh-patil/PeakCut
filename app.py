@@ -594,10 +594,6 @@ def _recover_jobs_from_disk():
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
-        # Skip synthetic test fixtures with no real video content
-        mp4_files = glob.glob(os.path.join(job_path, "*.mp4"))
-        if not mp4_files or all(os.path.getsize(f) < 50000 for f in mp4_files):
-            continue
         try:
             with open(json_files[0], 'r') as f:
                 data = json.load(f)

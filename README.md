@@ -259,122 +259,31 @@ Open **`http://localhost:8000/`** in your browser to start making shorts immedia
 
 ---
 
-### ⚡ 2. Run on Google Colab (One-Click Start)
+### ⚡ 2. Run on Google Colab (100% Local GPU • Zero API Keys • No CLI)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shreeharsh-patil/PeakCut/blob/main/PeakCut_Colab.ipynb)
 
-Run the full platform on **Google Colab** with free NVIDIA GPU acceleration (Whisper, MediaPipe, TransNetV2, NVENC) by cloning **`https://github.com/shreeharsh-patil/PeakCut.git`**:
+Run the entire platform directly on **Google Colab** with free NVIDIA GPU acceleration (T4 GPU), **Google's local Gemma model**, and **Faster-Whisper on CUDA** with **zero external API keys, zero rate limits, and no terminal / CLI required**:
 
-1. Open a new notebook on [Google Colab](https://colab.research.google.com).
+1. Click the **Open in Colab** badge above or open [PeakCut_Colab.ipynb](https://github.com/shreeharsh-patil/PeakCut/blob/main/PeakCut_Colab.ipynb).
 2. Set Runtime to GPU (**Runtime** → **Change runtime type** → select **T4 GPU**).
-3. **Copy and paste this single code block into the first cell and press Run (▶)**:
+3. **Step 1 (Setup Environment & Gemma)**: Run the setup cell. Google Drive mounts persistently so Gemma model weights cache in `MyDrive/models/ollama` (downloads once on day 1, loads in 3 seconds thereafter).
+4. **Step 2 (Generate Viral Shorts)**: Enter your YouTube URL(s) or live stream in the interactive Colab Form and click **Run ▶**. All vertical 9:16 shorts are automatically extracted, reframed, subtitled, and saved straight to `MyDrive/PeakCut_Shorts`.
 
 ```python
-# ============================================================
-# 🎬 PeakCut Studio: One-Click Google Colab Runner
-# Repository: https://github.com/shreeharsh-patil/PeakCut.git
-# ============================================================
-# @title 🚀 Launch PeakCut Studio (One-Click Start)
-# @markdown ### 🔑 Gemini API Keys (Optional, Comma-Separated)
-# @markdown Enter one or multiple Gemini API keys. Multiple keys automatically rotate if one encounters quota/rate limits. Leave blank to run zero-cost heuristic virality mode.
-GEMINI_API_KEYS = "" # @param {type:"string"}
+# Pure-Python Colab execution (No CLI commands needed):
+import colab_runner
 
-# @markdown ### 🎙️ Speech-to-Text Model
-WHISPER_MODEL = "base" # @param ["tiny", "base", "small", "medium", "large-v3"]
+# 1. Initialize local GPU environment with zero external APIs
+colab_runner.setup_colab_environment(model_name="gemma2:2b", mount_drive=True)
 
-import os, sys, subprocess, time, re
-
-# 0. Terminate lingering background processes from previous runs
-subprocess.run("pkill -9 -f cloudflared; pkill -9 -f uvicorn", shell=True)
-
-# Configure Environment Variables
-if GEMINI_API_KEYS.strip():
-    os.environ["GEMINI_API_KEYS"] = GEMINI_API_KEYS.strip()
-    os.environ["GEMINI_API_KEY"] = GEMINI_API_KEYS.strip()
-
-os.environ["WHISPER_MODEL"] = WHISPER_MODEL
-
-# Auto-detect CUDA hardware acceleration
-try:
-    import torch
-    has_cuda = torch.cuda.is_available()
-except Exception:
-    has_cuda = False
-
-if has_cuda:
-    os.environ["WHISPER_DEVICE"] = "cuda"
-    os.environ["WHISPER_COMPUTE"] = "float16"
-    print(f"⚡ Hardware: NVIDIA GPU detected ({torch.cuda.get_device_name(0)}) — CUDA acceleration enabled.")
-else:
-    os.environ["WHISPER_DEVICE"] = "cpu"
-    os.environ["WHISPER_COMPUTE"] = "int8"
-    print("ℹ️ Hardware: Running on CPU mode (int8). For 5x faster processing, switch runtime to T4 GPU.")
-
-# 1. System packages & hardware tools
-print("📦 Step 1/5: Installing system dependencies (ffmpeg, fonts)...")
-subprocess.run(
-    "apt-get update -qq && apt-get install -y -qq ffmpeg libsm6 libxext6 libgl1 fonts-freefont-ttf fonts-dejavu-core",
-    shell=True, check=True
+# 2. Extract viral vertical shorts directly to Google Drive
+results = colab_runner.run_shorts_pipeline(
+    urls="https://www.youtube.com/watch?v=kYfNvmF0Bqw",
+    clips_per_video=3,
+    format="vertical",
+    subtitle_preset="karaoke"
 )
-
-# 2. Download Cloudflared for instant zero-config public HTTPS tunnel
-print("🌐 Step 2/5: Setting up Cloudflare tunnel binary...")
-if not os.path.exists("/content/cloudflared"):
-    subprocess.run(
-        "wget -q -nc -O /content/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x /content/cloudflared",
-        shell=True, check=True
-    )
-
-# 3. Clone or update repository from GitHub
-REPO_URL = "https://github.com/shreeharsh-patil/PeakCut.git"
-REPO_DIR = "/content/PeakCut"
-
-print(f"📥 Step 3/5: Fetching repository from {REPO_URL}...")
-if not os.path.exists(REPO_DIR):
-    subprocess.run(f"git clone {REPO_URL} {REPO_DIR}", shell=True, check=True)
-else:
-    subprocess.run(f"git -C {REPO_DIR} fetch origin && git -C {REPO_DIR} reset --hard origin/main", shell=True)
-
-os.chdir(REPO_DIR)
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-
-# 4. Install Python dependencies
-print("🐍 Step 4/5: Installing Python dependencies...")
-subprocess.run("pip install -q -r requirements.txt", shell=True)
-
-# 5. Start Cloudflare Tunnel with file-based logging (avoids OS pipe deadlock)
-print("🚀 Step 5/5: Starting Cloudflare tunnel & PeakCut Studio server...")
-log_path = "/content/cloudflared.log"
-if os.path.exists(log_path):
-    os.remove(log_path)
-
-tunnel_cmd = f"/content/cloudflared tunnel --url http://127.0.0.1:8000 --logfile {log_path}"
-tunnel = subprocess.Popen(tunnel_cmd, shell=True)
-
-# 6. Extract and display the public HTTPS link
-public_url = None
-for _ in range(60):
-    if os.path.exists(log_path):
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', text)
-            if match:
-                public_url = match.group(0)
-                break
-    time.sleep(0.5)
-
-print("\n" + "=" * 70)
-if public_url:
-    print(f"🎉 PEAKCUT STUDIO IS LIVE AT: {public_url}")
-    print("👉 Click the link above to open PeakCut Studio in your browser!")
-else:
-    print("⚠️ Cloudflare tunnel starting... check /content/cloudflared.log for details.")
-print("=" * 70 + "\n")
-
-# 7. Start FastAPI Server with PeakCut Studio UI
-subprocess.run("python -m uvicorn app:app --host 0.0.0.0 --port 8000", shell=True)
-```
 ```
 
 ---

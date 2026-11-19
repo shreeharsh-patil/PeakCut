@@ -135,6 +135,87 @@ def configure_hardware(device_arg: str, whisper_model: str):
     os.environ["WHISPER_MODEL"] = whisper_model
 
 
+def process_batch_pipeline(
+    urls: list[str],
+    output_dir: str = "./output",
+    target_clips: int = 3,
+    format: str = "vertical",
+    clip_min_seconds: float = 15.0,
+    clip_max_seconds: float = 60.0,
+    live_record_seconds: int = 900,
+    whisper_model: str = "base",
+    device: str = "auto",
+    keep_original: bool = False,
+) -> dict:
+    """Programmatic batch runner: process multiple YouTube videos without CLI.
+
+    Directly invokes `main.process_video_pipeline` in-process.
+    """
+    if not urls:
+        return {"total_queued": 0, "successful": [], "failed": []}
+
+    configure_hardware(device, whisper_model)
+    output_base = Path(output_dir).resolve()
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    results = {
+        "started_at": datetime.now().isoformat(),
+        "total_queued": len(urls),
+        "successful": [],
+        "failed": [],
+    }
+    start_batch_time = time.time()
+
+    from main import process_video_pipeline
+
+    for idx, url in enumerate(urls, 1):
+        job_start = time.time()
+        print(f"\n[{idx}/{len(urls)}] 🚀 Processing YouTube URL: {url}")
+        job_output_dir = output_base / f"batch_job_{idx}_{int(job_start)}"
+        job_output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            job_result = process_video_pipeline(
+                input_video_or_url=url,
+                output_dir=str(job_output_dir),
+                is_url=True,
+                output_format=format,
+                target_clips=target_clips,
+                clip_min_seconds=clip_min_seconds,
+                clip_max_seconds=clip_max_seconds,
+                live_record_seconds=live_record_seconds,
+                keep_original=keep_original,
+            )
+            duration = round(time.time() - job_start, 2)
+            clips = job_result.get("clips") or []
+            results["successful"].append({
+                "url": url,
+                "title": job_result.get("video_title"),
+                "job_dir": str(job_output_dir),
+                "clips": clips,
+                "duration_seconds": duration,
+            })
+            print(f"✅ Video {idx} finished in {duration}s! Produced {len(clips)} clip(s).")
+        except Exception as ex:
+            duration = round(time.time() - job_start, 2)
+            print(f"❌ Video {idx} failed: {ex}")
+            results["failed"].append({
+                "url": url,
+                "error": str(ex),
+                "duration_seconds": duration,
+            })
+
+    total_duration = round(time.time() - start_batch_time, 2)
+    results["completed_at"] = datetime.now().isoformat()
+    results["total_duration_seconds"] = total_duration
+
+    summary_file = output_base / "batch_summary.json"
+    with open(summary_file, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    return results
+
+
 def run_batch():
     args = parse_args()
     urls = load_urls(args)
