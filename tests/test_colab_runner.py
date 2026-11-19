@@ -8,7 +8,7 @@ import os
 import sys
 import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 
 import colab_runner
 import llm_backend
@@ -299,3 +299,86 @@ def test_heuristic_transcript_clips_fallback_and_unicode():
         assert c["end"] > c["start"]
         assert c["video_title_for_youtube_short"]
         assert c["viral_hook_text"]
+
+
+def test_cli_parser_structure():
+    parser = colab_runner.build_cli_parser()
+    # Test subcommands existence
+    args_clip = parser.parse_args(["clip", "https://youtube.com/watch?v=test", "--clips", "4", "--format", "square"])
+    assert args_clip.subcommand == "clip"
+    assert args_clip.urls == ["https://youtube.com/watch?v=test"]
+    assert args_clip.clips == 4
+    assert args_clip.format == "square"
+
+    args_run = parser.parse_args(["run", "https://youtu.be/abc"])
+    assert args_run.subcommand == "run"
+    assert args_run.clips == 3
+
+    args_setup = parser.parse_args(["setup", "--model", "gemma2:9b", "--no-drive"])
+    assert args_setup.subcommand == "setup"
+    assert args_setup.model == "gemma2:9b"
+    assert args_setup.no_drive is True
+
+    args_status = parser.parse_args(["status"])
+    assert args_status.subcommand == "status"
+
+    args_upload = parser.parse_args(["upload", "/path/to/clip.mp4", "--title", "Custom Title", "--privacy", "private"])
+    assert args_upload.subcommand == "upload"
+    assert args_upload.video_path == "/path/to/clip.mp4"
+    assert args_upload.title == "Custom Title"
+    assert args_upload.privacy == "private"
+
+
+def test_cli_main_status():
+    ret = colab_runner.cli_main(["status"])
+    assert ret == 0
+
+
+def test_cli_main_help_when_no_args(capsys):
+    ret = colab_runner.cli_main([])
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert "PeakCut Studio CLI" in captured.out or "usage:" in captured.out
+
+
+def test_cli_main_clip_invocation():
+    with patch("colab_runner.run_shorts_pipeline", return_value={"successful": [{"id": 1}]}) as mock_pipe:
+        ret = colab_runner.cli_main(["clip", "https://youtube.com/watch?v=sample", "--clips", "2", "--format", "vertical"])
+        assert ret == 0
+        assert mock_pipe.called
+        kwargs = mock_pipe.call_args[1]
+        assert kwargs["urls"] == ["https://youtube.com/watch?v=sample"]
+        assert kwargs["clips_per_video"] == 2
+        assert kwargs["format"] == "vertical"
+
+
+def test_cli_main_upload_invocation():
+    with patch("colab_runner.publish_clip", return_value={"status": "ok"}) as mock_pub:
+        ret = colab_runner.cli_main(["upload", "test_clip.mp4", "--title", "Awesome Clip", "--privacy", "unlisted"])
+        assert ret == 0
+        assert mock_pub.called
+        kwargs = mock_pub.call_args[1]
+        assert kwargs["video_path"] == "test_clip.mp4"
+        assert kwargs["title"] == "Awesome Clip"
+        assert kwargs["privacy"] == "unlisted"
+
+
+def test_cli_main_setup_invocation():
+    with patch("colab_runner.setup_colab_environment", return_value={"status": "ready"}) as mock_setup, \
+         patch("colab_runner.install_cli_launcher", return_value=True) as mock_install:
+        ret = colab_runner.cli_main(["setup", "--model", "gemma2:2b", "--no-drive"])
+        assert ret == 0
+        assert mock_setup.called
+        assert mock_setup.call_args[1]["model_name"] == "gemma2:2b"
+        assert mock_setup.call_args[1]["mount_drive"] is False
+        assert mock_install.called
+
+
+def test_install_cli_launcher_linux(monkeypatch, tmp_path):
+    monkeypatch.setattr(colab_runner.sys, "platform", "linux")
+    with patch("os.path.isdir", return_value=True), \
+         patch("os.access", return_value=True), \
+         patch("builtins.open", mock_open()), \
+         patch("os.chmod"):
+        success = colab_runner.install_cli_launcher()
+        assert success is True

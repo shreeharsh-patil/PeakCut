@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import shutil
+import argparse
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -130,6 +131,7 @@ def setup_colab_environment(
             )
         except Exception:
             pass
+        install_cli_launcher()
 
     # 5. Local Ollama Engine Setup on GPU
     ollama_ready = False
@@ -532,3 +534,229 @@ def publish_clip(
         privacy_status=privacy,
         publish_at=publish_at,
     )
+
+
+def install_cli_launcher() -> bool:
+    """Install a global 'peakcut' executable launcher in system PATH (Linux / Colab)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    candidates = ["/usr/local/bin", "/usr/bin", os.path.expanduser("~/.local/bin")]
+    for target_dir in candidates:
+        if os.path.isdir(target_dir) and os.access(target_dir, os.W_OK):
+            launcher_path = os.path.join(target_dir, "peakcut")
+            try:
+                with open(launcher_path, "w", encoding="utf-8") as f:
+                    f.write("#!/bin/sh\n")
+                    f.write(f'exec "{sys.executable}" -m colab_runner "$@"\n')
+                os.chmod(launcher_path, 0o755)
+                print(f"✅ Global CLI launcher installed at {launcher_path}")
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def show_status() -> Dict[str, Any]:
+    """Print Colab and PeakCut system diagnostics, GPU stats, and running services."""
+    print("\n" + "=" * 65)
+    print("📊 PeakCut Studio System & Process Status")
+    print("=" * 65)
+
+    # 1. Environment & Colab status
+    in_colab = is_colab()
+    print(f"🖥️  Platform: {sys.platform} | Python: {sys.version.split()[0]} | Runtime: {'Google Colab' if in_colab else 'Local / Workstation'}")
+
+    # 2. Hardware / GPU detection
+    cuda_avail = False
+    device_name = "CPU"
+    try:
+        import torch
+        cuda_avail = torch.cuda.is_available()
+        if cuda_avail:
+            device_name = f"{torch.cuda.get_device_name(0)} ({torch.cuda.device_count()} GPU(s))"
+    except Exception:
+        pass
+    print(f"⚡ Hardware Acceleration: {device_name} (CUDA: {'Active' if cuda_avail else 'Inactive'})")
+
+    # 3. Storage targets
+    out_dir = os.environ.get("OUTPUT_DIR", "/content/output" if in_colab else "./output")
+    print(f"📁 Active Output Directory: {out_dir}")
+
+    # 4. Service status (Uvicorn / FastAPI)
+    server_status = "Offline"
+    jobs_count = 0
+    recent_jobs = []
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:8000/api/status", timeout=2.0) as resp:
+            if resp.status == 200:
+                server_status = "Online (http://127.0.0.1:8000)"
+        with urllib.request.urlopen("http://127.0.0.1:8000/api/jobs", timeout=2.0) as resp:
+            if resp.status == 200:
+                jobs_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                jobs_count = len(jobs_data)
+                recent_jobs = jobs_data[:5]
+    except Exception:
+        pass
+    print(f"🌐 Web API Server: {server_status}")
+
+    # 5. Ollama local model service
+    ollama_status = "Not running"
+    ollama_models = []
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2.0) as resp:
+            if resp.status == 200:
+                tags = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                ollama_models = [m.get("name") for m in tags.get("models", [])]
+                ollama_status = f"Online (Models: {', '.join(ollama_models) if ollama_models else 'None loaded'})"
+    except Exception:
+        pass
+    print(f"🦙 Ollama Local Inference: {ollama_status}")
+
+    # 6. Jobs summary if online
+    if recent_jobs:
+        print("\n🎬 Recent Jobs:")
+        for j in recent_jobs:
+            title = j.get("title") or "Untitled Video"
+            status = j.get("status") or "unknown"
+            progress = int((j.get("progress") or 0.0) * 100)
+            clips_cnt = len(j.get("clips") or [])
+            print(f"   • [{status.upper()}] {title} — {progress}% ({clips_cnt} clip(s))")
+
+    print("=" * 65 + "\n")
+    return {
+        "is_colab": in_colab,
+        "cuda_available": cuda_avail,
+        "device": device_name,
+        "server_status": server_status,
+        "ollama_status": ollama_status,
+        "jobs_count": jobs_count,
+        "output_dir": out_dir,
+    }
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser for PeakCut Studio."""
+    parser = argparse.ArgumentParser(
+        prog="peakcut",
+        description="PeakCut Studio CLI: Autonomous AI Shorts Pipeline for Google Colab and Local Workstations.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  peakcut setup --model gemma2:2b --whisper base
+  peakcut clip "https://youtube.com/watch?v=kYfNvmF0Bqw" --clips 3 --format vertical
+  peakcut serve --background
+  peakcut status
+  peakcut upload "/path/to/clip.mp4" --title "Viral Short" --privacy unlisted
+        """,
+    )
+    sub = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+
+    # setup
+    p_setup = sub.add_parser("setup", help="Configure 100%% zero-API local GPU environment & Google Drive")
+    p_setup.add_argument("--model", default="gemma2:2b", help="Local Gemma/Ollama model name (default: gemma2:2b)")
+    p_setup.add_argument("--whisper", default="base", help="Faster-Whisper model size (default: base)")
+    p_setup.add_argument("--no-drive", action="store_true", help="Do not mount Google Drive (use local storage)")
+
+    # clip / run
+    p_clip = sub.add_parser("clip", aliases=["run"], help="Extract vertical shorts from YouTube URLs or video files")
+    p_clip.add_argument("urls", nargs="+", help="YouTube URLs, playlist links, or local video file paths")
+    p_clip.add_argument("-n", "--clips", type=int, default=3, help="Number of clips to generate per video (default: 3)")
+    p_clip.add_argument("-f", "--format", choices=["vertical", "horizontal", "square", "auto"], default="vertical", help="Aspect ratio (default: vertical 9:16)")
+    p_clip.add_argument("-s", "--subtitles", choices=["karaoke", "minimal", "bold", "none"], default="karaoke", help="Subtitle styling preset (default: karaoke)")
+    p_clip.add_argument("--min-len", type=float, default=15.0, help="Minimum clip duration in seconds (default: 15)")
+    p_clip.add_argument("--max-len", type=float, default=60.0, help="Maximum clip duration in seconds (default: 60)")
+    p_clip.add_argument("--live-record", type=int, default=900, help="Live stream recording duration in seconds (default: 900)")
+    p_clip.add_argument("-o", "--output", default=None, help="Output directory (defaults to Google Drive or ./output)")
+    p_clip.add_argument("--keep-original", action="store_true", help="Retain original downloaded source video")
+    p_clip.add_argument("--schedule", action="store_true", help="Auto-schedule generated clips to YouTube Shorts")
+    p_clip.add_argument("--interval", type=float, default=1.0, help="Hours between scheduled uploads (default: 1.0)")
+    p_clip.add_argument("--privacy", choices=["unlisted", "private", "public"], default="unlisted", help="YouTube privacy status (default: unlisted)")
+    p_clip.add_argument("--token", default=None, help="YouTube OAuth access token")
+
+    # serve / launch
+    p_serve = sub.add_parser("serve", aliases=["launch"], help="Launch PeakCut Studio Web UI server & Cloudflare tunnel")
+    p_serve.add_argument("-b", "--background", action="store_true", help="Run server in background process")
+    p_serve.add_argument("-p", "--port", type=int, default=8000, help="Server port (default: 8000)")
+    p_serve.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+
+    # upload / publish
+    p_upload = sub.add_parser("upload", aliases=["publish"], help="Upload or schedule a specific clip to YouTube Shorts")
+    p_upload.add_argument("video_path", help="Path to the clip video file (.mp4)")
+    p_upload.add_argument("-t", "--title", default="Viral Highlight #Shorts", help="Video title")
+    p_upload.add_argument("-d", "--description", default="Created with PeakCut Studio #Shorts #Viral", help="Video description")
+    p_upload.add_argument("-p", "--privacy", choices=["unlisted", "private", "public"], default="unlisted", help="Upload privacy status (default: unlisted)")
+    p_upload.add_argument("--delay", type=float, default=0.0, help="Delay in hours before publishing (0 = immediate)")
+    p_upload.add_argument("--token", default=None, help="YouTube OAuth access token")
+
+    # status
+    sub.add_parser("status", help="Inspect active server, jobs, GPU diagnostics, and storage")
+
+    return parser
+
+
+def cli_main(argv: Optional[List[str]] = None) -> int:
+    """Main CLI entrypoint for PeakCut Studio."""
+    parser = build_cli_parser()
+    parsed_args = parser.parse_args(argv)
+
+    if not parsed_args.subcommand:
+        parser.print_help()
+        return 0
+
+    sub = parsed_args.subcommand
+
+    if sub == "setup":
+        setup_colab_environment(
+            model_name=parsed_args.model,
+            mount_drive=not parsed_args.no_drive,
+            whisper_model=parsed_args.whisper,
+        )
+        install_cli_launcher()
+        return 0
+
+    elif sub in ("clip", "run"):
+        results = run_shorts_pipeline(
+            urls=parsed_args.urls,
+            clips_per_video=parsed_args.clips,
+            format=parsed_args.format,
+            clip_min_seconds=parsed_args.min_len,
+            clip_max_seconds=parsed_args.max_len,
+            subtitle_preset=parsed_args.subtitles,
+            live_record_seconds=parsed_args.live_record,
+            output_dir=parsed_args.output,
+            keep_original=parsed_args.keep_original,
+            schedule_to_youtube=parsed_args.schedule,
+            youtube_interval_hours=parsed_args.interval,
+            youtube_privacy=parsed_args.privacy,
+            youtube_access_token=parsed_args.token,
+        )
+        has_success = bool(results.get("successful"))
+        has_failure = bool(results.get("failed"))
+        return 0 if (has_success or not has_failure) else 1
+
+    elif sub in ("serve", "launch"):
+        launch_web_ui(run_in_background=parsed_args.background)
+        return 0
+
+    elif sub in ("upload", "publish"):
+        publish_clip(
+            video_path=parsed_args.video_path,
+            title=parsed_args.title,
+            description=parsed_args.description,
+            privacy=parsed_args.privacy,
+            delay_hours=parsed_args.delay,
+            access_token=parsed_args.token,
+        )
+        return 0
+
+    elif sub == "status":
+        show_status()
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli_main())
