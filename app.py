@@ -1149,9 +1149,9 @@ async def cleanup_jobs():
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
-async def process_queue():
-    """Background worker to process jobs from the queue with concurrency limit."""
-    print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
+async def process_queue(worker_id: int = 1):
+    """Background worker coroutine to process jobs from the queue in parallel."""
+    print(f"🚀 Job Queue Worker #{worker_id} started (pool capacity: {MAX_CONCURRENT_JOBS} concurrent jobs).")
     while True:
         try:
             # Wait for a job (priority, seq, job_id) — lowest priority first.
@@ -1159,7 +1159,7 @@ async def process_queue():
 
             if _draining:
                 # Leave it on disk for the next instance (manifest, no heartbeat).
-                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+                print(f"⏸️ [Worker #{worker_id}] Draining — leaving {job_id} for the next instance.")
                 job_queue.task_done()
                 continue
 
@@ -1168,17 +1168,17 @@ async def process_queue():
             if _draining:
                 concurrency_semaphore.release()
                 job_queue.task_done()
-                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+                print(f"⏸️ [Worker #{worker_id}] Draining — leaving {job_id} for the next instance.")
                 continue
-            print(f"🔄 Acquired slot for job: {job_id}")
+            print(f"🔄 [Worker #{worker_id}] Acquired slot for job: {job_id}")
             _running_jobs.add(job_id)
             _touch_manifest(job_id)
 
-            # Process in background task to not block the loop (allowing other slots to fill)
+            # Process in background task to not block the worker loop
             asyncio.create_task(run_job_wrapper(job_id))
             
         except Exception as e:
-            print(f"❌ Queue dispatch error: {e}")
+            print(f"❌ [Worker #{worker_id}] Queue dispatch error: {e}")
             await asyncio.sleep(1)
 
 # Monthly proxy bandwidth counter (in-memory; an alert threshold, not a bill —
@@ -1668,8 +1668,9 @@ async def lifespan(app: FastAPI):
     _install_drain_signal_handler()
     asyncio.create_task(_handover_watch())
     asyncio.create_task(_resume_scan())
-    # Start worker and cleanup
-    worker_task = asyncio.create_task(process_queue())
+    # Start multiple parallel job queue workers and cleanup
+    num_workers = max(1, int(os.environ.get("NUM_QUEUE_WORKERS", str(MAX_CONCURRENT_JOBS))))
+    worker_tasks = [asyncio.create_task(process_queue(worker_id=i + 1)) for i in range(num_workers)]
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
@@ -1785,6 +1786,14 @@ def _visible_logs(logs):
     return friendly_logs(logs)
 
 
+def _notify_peakcut_state() -> None:
+    """Bump PeakCut UI reactive sync version whenever job state or clip readiness changes."""
+    try:
+        _peakcut_bridge.notify_state_changed()
+    except Exception:
+        pass
+
+
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
     try:
@@ -1800,6 +1809,7 @@ def enqueue_output(out, job_id):
                         _, index, filename = decoded_line.split(" ", 2)
                         if job_id in jobs:
                             jobs[job_id].setdefault('ready_files', {})[int(index)] = filename
+                            _notify_peakcut_state()
                     except ValueError:
                         pass
                     continue
@@ -1824,12 +1834,13 @@ def enqueue_output(out, job_id):
                 print(f"📝 [Job Output] {decoded_line}")
                 if job_id in jobs:
                     jobs[job_id]['logs'].append(decoded_line)
+                    _notify_peakcut_state()
     except Exception as e:
         print(f"Error reading output for job {job_id}: {e}")
     finally:
         out.close()
 
-def _sync_job_status_disk(job_id: str, output_dir: str, status: str, clips: list = None, error: str = None):
+def _sync_job_status_disk(job_id: str, output_dir: str, status: str, clips: list = None, error: str = None, title: Optional[str] = None):
     """Keep status.json on disk strictly in sync with in-memory pipeline state for PeakCut UI."""
     try:
         os.makedirs(output_dir, exist_ok=True)
@@ -1844,16 +1855,41 @@ def _sync_job_status_disk(job_id: str, output_dir: str, status: str, clips: list
         mapped_status = "done" if status == "completed" else status
         data["id"] = job_id
         data["status"] = mapped_status
+        if title:
+            cur_title = str(data.get("title") or "").strip().lower()
+            if (
+                not cur_title
+                or cur_title == job_id.lower()
+                or cur_title.startswith(("watch?v=", "http://", "https://", "youtube video ("))
+                or cur_title in ("new video job", "video", "video link")
+            ):
+                data["title"] = title
         if clips is not None:
-            data["clips"] = clips
+            normalized_clips = []
+            for idx, clip in enumerate(clips):
+                c_copy = dict(clip) if isinstance(clip, dict) else {}
+                c_copy.setdefault("id", f"c_{idx+1:02d}")
+                if not c_copy.get("title") and c_copy.get("video_title_for_youtube_short"):
+                    c_copy["title"] = c_copy["video_title_for_youtube_short"]
+                if not c_copy.get("hook") and c_copy.get("viral_hook_text"):
+                    c_copy["hook"] = c_copy["viral_hook_text"]
+                if not c_copy.get("description"):
+                    c_copy["description"] = (
+                        c_copy.get("video_description_for_tiktok")
+                        or c_copy.get("video_description_for_instagram")
+                        or ""
+                    )
+                normalized_clips.append(c_copy)
+            data["clips"] = normalized_clips
         if error:
             data["error"] = error
         if mapped_status == "done":
             data["finished_at"] = time.time()
         elif mapped_status in ("running", "processing"):
-            data["started_at"] = time.time()
+            data.setdefault("started_at", time.time())
         with open(status_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        _notify_peakcut_state()
     except Exception:
         pass
 
@@ -1964,9 +2000,11 @@ async def run_job(job_id, job_data):
                 for i, clip in enumerate(clips):
                      clip_filename = _canonical_clip_file(output_dir, base_name, i)
                      clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                     clip.setdefault('id', f"c_{i+1:02d}")
                 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
-                _sync_job_status_disk(job_id, output_dir, "done", clips=clips)
+                clean_job_title = re.sub(r"_+", " ", base_name.removeprefix("source_")).strip()
+                _sync_job_status_disk(job_id, output_dir, "done", clips=clips, title=clean_job_title or None)
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -2599,6 +2637,7 @@ def start_job_process_background(
     options: Optional[dict] = None,
     creator: Optional[str] = None,
     file_path: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> str:
     """Bridge PeakCut UI job submission directly into OpenShorts processing pipeline."""
     opts = options or {}
@@ -2607,6 +2646,10 @@ def start_job_process_background(
 
     cmd = [sys.executable, "-u", "main.py"]
     env = os.environ.copy()
+    env["CLIP_WORKERS"] = str(os.environ.get("CLIP_WORKERS", "4"))
+    env["MAX_CONCURRENT_JOBS"] = str(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+    env["WHISPER_WORKERS"] = str(os.environ.get("WHISPER_WORKERS", "2"))
+    env["WHISPER_THREADS"] = str(os.environ.get("WHISPER_THREADS", "4"))
     gemini_key = api_key_rotator.get_gemini_key() or os.environ.get("GEMINI_API_KEY")
     if gemini_key:
         full_keys = api_key_rotator.get_all_keys_string("gemini") or gemini_key
@@ -2664,6 +2707,7 @@ def start_job_process_background(
     api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or "http://127.0.0.1:8000"
     jobs[job_id] = {
         'status': 'queued',
+        'title': title or "Processing Video",
         'logs': [f"Job {job_id} queued from PeakCut Studio."],
         'cmd': cmd,
         'env': env,

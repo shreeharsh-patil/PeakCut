@@ -47,6 +47,14 @@ def normalize_media_url(raw_url: str) -> str:
     if bare_match:
         return f"https://www.youtube.com/watch?v={bare_match.group(1)}"
 
+    # Check for watch?v=... or /watch?v=... or shorts/... without domain
+    if s.startswith("/watch?v="):
+        s = "https://www.youtube.com" + s
+    elif s.startswith("watch?v="):
+        s = "https://www.youtube.com/" + s
+    elif s.startswith(("/shorts/", "shorts/")):
+        s = "https://www.youtube.com/" + s.lstrip("/")
+
     # If scheme is missing (e.g. youtube.com/watch?v=... or youtu.be/...)
     if not s.startswith(("http://", "https://")):
         if any(s.startswith(prefix) for prefix in (

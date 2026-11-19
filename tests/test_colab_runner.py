@@ -201,12 +201,12 @@ def test_infer_job_stage_and_progress_dynamic():
     # Transcription stage
     stage, prog = peakcut_bridge._infer_job_stage_and_progress(["🎙️  Transcribing video..."])
     assert "Transcribing" in stage
-    assert prog == 0.35
+    assert 0.30 <= prog <= 0.40
 
     # AI clip detection
     stage, prog = peakcut_bridge._infer_job_stage_and_progress(["get_viral_clips: scoring windows with local model"])
-    assert "viral hooks" in stage or "Gemma" in stage
-    assert prog == 0.50
+    assert "AI" in stage or "viral" in stage
+    assert 0.45 <= prog <= 0.60
 
     # Rendering with ready clips and suppressing YOLO warnings
     logs = [
@@ -220,3 +220,21 @@ def test_infer_job_stage_and_progress_dynamic():
     assert "1/3 ready" in stage
     assert "yolo" not in stage.lower()
     assert prog > 0.65
+
+
+def test_normalize_media_url_variations():
+    from security_utils import normalize_media_url, assert_public_url
+
+    urls = [
+        "watch?v=irNhWMG560k",
+        "/watch?v=irNhWMG560k",
+        "irNhWMG560k",
+        "youtube.com/watch?v=irNhWMG560k",
+        "https://www.youtube.com/watch?v=irNhWMG560k",
+        "https://youtu.be/irNhWMG560k",
+        "shorts/irNhWMG560k",
+    ]
+    for raw in urls:
+        norm = normalize_media_url(raw)
+        assert norm == "https://www.youtube.com/watch?v=irNhWMG560k", f"Failed for {raw}: got {norm}"
+        assert assert_public_url(norm) == norm

@@ -26,7 +26,7 @@ import datetime as dt
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -70,8 +70,173 @@ def _bump_version() -> None:
     _STATE_VERSION += 1
 
 
+def notify_state_changed() -> None:
+    """Public hook called by app.py workers whenever job progress or clips update."""
+    _bump_version()
+
+
 def _sync_token() -> str:
     return f"{int(_BOOT_TIME)}.{_STATE_VERSION}"
+
+
+def _get_worker_config() -> Dict[str, int]:
+    """Return active multi-worker concurrency settings for jobs, clips, and LLM scoring."""
+    cpu = os.cpu_count() or 4
+    job_workers = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "5")))
+    clip_workers = max(1, int(os.environ.get("CLIP_WORKERS", str(min(max(cpu, 4), 8)))))
+    llm_workers = max(1, int(os.environ.get("LLM_WORKERS", "3")))
+    return {
+        "job_workers": job_workers,
+        "clip_workers": clip_workers,
+        "llm_workers": llm_workers,
+    }
+
+
+def _looks_like_raw_url_title(title: str) -> bool:
+    t = (title or "").strip().lower()
+    if not t:
+        return True
+    return (
+        t.startswith(("watch?v=", "http://", "https://", "shorts/", "live/"))
+        or t in ("new video job", "video", "video link")
+    )
+
+
+def _clean_media_title(raw: str) -> str:
+    """Turn a metadata base_name or filename into a clean human-readable title."""
+    t = (raw or "").strip()
+    if t.startswith("source_"):
+        t = t[len("source_"):]
+    t = re.sub(r"\.(mp4|mov|mkv|webm|m4v|ts|flv)$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"_+", " ", t).strip(" -_")
+    return t or raw or "Untitled Video"
+
+
+def _resolve_clip_info(job_dir: Path, cid: str) -> Dict[str, Any]:
+    """Resolve a clip ID (e.g. 'c_01' or filename stem) to its real file path and metadata."""
+    info: Dict[str, Any] = {
+        "id": cid,
+        "file_path": None,
+        "file_name": "",
+        "title": "",
+        "description": "",
+        "hook": "",
+        "score": 85,
+        "start": 0.0,
+        "end": 30.0,
+    }
+
+    # Parse numeric 1-based index from 'c_01', 'clip_1', etc.
+    clip_idx: Optional[int] = None
+    m = re.match(r"^(?:c_|clip_)?0*(\d+)$", str(cid or "").strip(), re.IGNORECASE)
+    if m:
+        clip_idx = int(m.group(1)) - 1
+
+    # 1. Inspect status.json first
+    status_file = job_dir / "status.json"
+    matched_entry: Optional[Dict[str, Any]] = None
+    if status_file.exists():
+        try:
+            d = json.loads(status_file.read_text(encoding="utf-8"))
+            clips = d.get("clips") or d.get("result", {}).get("clips") or []
+            for i, c in enumerate(clips):
+                c_id = c.get("id") or f"c_{i+1:02d}"
+                raw_file = c.get("file") or c.get("video_url") or ""
+                fname = os.path.basename(raw_file) if raw_file else ""
+                stem = Path(fname).stem if fname else ""
+                if c_id == cid or stem == cid or (clip_idx is not None and i == clip_idx):
+                    matched_entry = c
+                    info["id"] = c_id
+                    info["title"] = (
+                        c.get("title")
+                        or c.get("video_title_for_youtube_short")
+                        or c.get("hook")
+                        or c.get("viral_hook_text")
+                        or ""
+                    )
+                    info["description"] = (
+                        c.get("description")
+                        or c.get("video_description_for_tiktok")
+                        or c.get("video_description_for_instagram")
+                        or ""
+                    )
+                    info["hook"] = c.get("hook") or c.get("viral_hook_text") or ""
+                    info["score"] = c.get("score") or c.get("predicted_score") or 85
+                    info["start"] = float(c.get("start", 0.0))
+                    info["end"] = float(c.get("end", 30.0))
+                    if fname:
+                        info["file_name"] = fname
+                    break
+        except Exception:
+            pass
+
+    # 2. Fall back to *_metadata.json if status.json didn't have full details
+    if not matched_entry or not info["file_name"]:
+        meta_files = list(job_dir.glob("*_metadata.json"))
+        if meta_files:
+            try:
+                meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
+                base_name = meta_files[0].name.replace("_metadata.json", "")
+                shorts = meta_data.get("shorts") or []
+                for i, c in enumerate(shorts):
+                    c_id = c.get("id") or f"c_{i+1:02d}"
+                    if c_id == cid or (clip_idx is not None and i == clip_idx):
+                        info["title"] = info["title"] or c.get("video_title_for_youtube_short") or c.get("title") or ""
+                        info["description"] = (
+                            info["description"]
+                            or c.get("video_description_for_tiktok")
+                            or c.get("video_description_for_instagram")
+                            or ""
+                        )
+                        info["hook"] = info["hook"] or c.get("viral_hook_text") or c.get("hook") or ""
+                        info["score"] = c.get("predicted_score") or c.get("score") or info["score"]
+                        info["start"] = float(c.get("start", info["start"]))
+                        info["end"] = float(c.get("end", info["end"]))
+                        if not info["file_name"]:
+                            # Prefer subtitled/hooked version if present on disk
+                            suffixed = sorted(
+                                [f for f in job_dir.glob(f"*{base_name}_clip_{i+1}.mp4") if not f.name.startswith("temp_")],
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True,
+                            )
+                            if suffixed:
+                                info["file_name"] = suffixed[0].name
+                            else:
+                                info["file_name"] = f"{base_name}_clip_{i+1}.mp4"
+                        break
+            except Exception:
+                pass
+
+    # 3. Resolve actual file path on disk
+    candidates: List[Path] = []
+    if info["file_name"]:
+        candidates.extend([
+            job_dir / info["file_name"],
+            job_dir / "clips" / info["file_name"],
+        ])
+    candidates.extend([
+        job_dir / f"{cid}.mp4",
+        job_dir / "clips" / f"{cid}.mp4",
+        job_dir / f"clip_{cid}.mp4",
+    ])
+    if clip_idx is not None:
+        candidates.extend(
+            sorted(
+                [f for f in job_dir.glob(f"*_clip_{clip_idx + 1}.mp4") if not f.name.startswith("temp_")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            info["file_path"] = cand
+            info["file_name"] = cand.name
+            break
+
+    if not info["title"]:
+        info["title"] = info["hook"] or f"Clip {clip_idx + 1 if clip_idx is not None else cid}"
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +443,9 @@ def _infer_job_stage_and_progress(
     clips_count: int = 0
 ) -> Tuple[str, float]:
     """Parse log history and ready markers to produce user-friendly stages and dynamic progress."""
+    workers = _get_worker_config()
+    clip_workers = workers["clip_workers"]
+
     ready_count = len(ready_files or {})
     if not ready_count:
         ready_count = sum(1 for line in logs if "CLIP_READY " in line or "ready:" in line.lower())
@@ -285,7 +453,6 @@ def _infer_job_stage_and_progress(
     detected_clips = clips_count
     for line in reversed(logs):
         if "Found " in line and "clips" in line:
-            import re
             m = re.search(r"Found\s+(\d+)\s+clips", line)
             if m:
                 try:
@@ -294,37 +461,43 @@ def _infer_job_stage_and_progress(
                 except ValueError:
                     pass
 
-    total_target = max(detected_clips, ready_count + 1, 1)
+    total_target = max(detected_clips, ready_count, 1)
 
     has_cut_or_render = any("Processing Clip" in line or "CLIP_READY " in line or "Auto-captions burned" in line for line in logs)
     if ready_count > 0 or has_cut_or_render:
-        pct = min(0.65 + 0.30 * (ready_count / float(total_target)), 0.95)
+        pct = min(0.65 + 0.32 * (ready_count / float(total_target)), 0.97)
         if ready_count > 0:
-            return f"Rendering 9:16 Shorts with subtitles ({ready_count}/{total_target} ready)", round(pct, 2)
-        return "Reframing video & rendering vertical 9:16 clips in parallel...", round(pct, 2)
+            return f"Rendering 9:16 Shorts ({ready_count}/{total_target} ready · {clip_workers} workers)", round(pct, 2)
+        return f"Rendering {total_target} vertical 9:16 clips in parallel ({clip_workers} workers)...", round(pct, 2)
 
     if any("Found " in line and "clips" in line for line in logs):
-        return "AI detected viral moments, preparing parallel renderers...", 0.62
+        return f"AI picked {total_target} viral moments — launching {clip_workers} parallel clip workers...", 0.62
 
     if any("Active Tracking" in line or "Analyzing Scenes" in line or "Detecting scenes" in line for line in logs):
-        return "AI active face-tracking & scene analysis on GPU...", 0.58
+        return "AI active face-tracking & scene analysis...", 0.58
 
-    if any("get_viral_clips" in line or "Finding viral clips" in line or "AI clip detection" in line or "speech in" in line for line in logs):
-        return "AI analyzing viral hooks & moments (Gemma 2 on GPU)...", 0.50
+    if any("get_viral_clips" in line or "Finding viral clips" in line or "AI clip detection" in line or "scoring window" in line.lower() or "Shortlisted" in line or "Analyzing with" in line for line in logs):
+        return "AI analyzing viral hooks & writing titles...", 0.48
 
     if any("Transcribing video" in line or "Whisper" in line or "transcribe_video" in line or "transcribing" in line.lower() for line in logs):
-        return "Transcribing audio (Faster-Whisper on GPU)...", 0.35
+        return "Transcribing audio (Faster-Whisper)...", 0.34
 
     if any("Extracting audio" in line for line in logs):
-        return "Extracting high-fidelity audio track...", 0.25
+        return "Extracting audio track...", 0.24
 
     if any("Downloading video" in line or "yt-dlp" in line or "[download]" in line or "Direct file URL" in line for line in logs):
-        return "Downloading video from YouTube...", 0.15
+        # Parse live yt-dlp download percentage if present
+        for line in reversed(logs[-15:]):
+            m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+            if m:
+                dl_pct = float(m.group(1))
+                return f"Downloading source video ({int(dl_pct)}%)...", round(0.10 + 0.14 * (dl_pct / 100.0), 2)
+        return "Downloading video...", 0.15
 
     if any("Job started by worker" in line for line in logs):
-        return "Job started by processing worker...", 0.08
+        return f"Worker started ({clip_workers} clip workers ready)...", 0.08
 
-    return "Processing video with local GPU AI...", 0.50
+    return "Queued for multi-worker pipeline...", 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +540,7 @@ async def get_peakcut_status():
         "max_upload_mb": 4096,
         "upload_part_mb": 40,
         "max_batch": 5,
+        "workers": _get_worker_config(),
         "styles": {
             "bounce": "Bounce (Active Karaoke)",
             "hype": "Hype (High Energy Pop)",
@@ -381,6 +555,48 @@ async def get_peakcut_status():
     }
 
 
+def _build_accounts_public() -> List[Dict[str, Any]]:
+    """Return connected publishing accounts with platform labels and live auth status."""
+    yt_detail = "OAuth connected"
+    try:
+        from youtube_uploader import is_youtube_auth_configured
+        if not is_youtube_auth_configured():
+            yt_detail = "Ready (dry-run until YouTube OAuth keys are added in Settings)"
+    except Exception:
+        pass
+    out = []
+    for aid, acc in _CONNECTED_ACCOUNTS.items():
+        pf = (acc.get("platform") or "").lower()
+        label = {"youtube": "YouTube", "tiktok": "TikTok", "instagram": "Instagram"}.get(pf, pf.title() or "Social")
+        detail = yt_detail if pf == "youtube" else acc.get("detail", "Queue ready")
+        out.append({
+            **acc,
+            "label": label,
+            "connected": True,
+            "detail": detail,
+        })
+    return out
+
+
+def _has_active_jobs() -> bool:
+    """Return True if any in-memory or live job is currently running/queued."""
+    try:
+        import sys
+        app_mod = sys.modules.get("app")
+        if app_mod and hasattr(app_mod, "jobs"):
+            if any(j.get("status") in ("queued", "processing", "running") for j in app_mod.jobs.values()):
+                return True
+    except Exception:
+        pass
+    try:
+        live_mgr = LiveClipperManager.get_instance()
+        if any(s.is_running for s in live_mgr.sessions.values()):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
     """Convert an OpenShorts or PeakCut output job directory to PeakCut UI format."""
     jid = job_dir.name
@@ -389,13 +605,43 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
 
     status = "done"
     title = jid
+    uploader = ""
+    thumb_url = ""
+    source_kind = "youtube"
     clips: List[Dict[str, Any]] = []
     duration = 0.0
+    took: Optional[float] = None
     stage = "Finished"
     progress = 1.0
     error: Optional[str] = None
     created_at = job_dir.stat().st_mtime if job_dir.exists() else time.time()
     creator = None
+    target_clips_opt = 0
+
+    # Pre-read status.json metadata so title/options/uploader are available even for active jobs
+    status_disk: Dict[str, Any] = {}
+    if status_file.exists():
+        try:
+            status_disk = json.loads(status_file.read_text(encoding="utf-8"))
+            title = status_disk.get("title") or title
+            uploader = status_disk.get("uploader") or ""
+            thumb_url = status_disk.get("thumb_url") or status_disk.get("thumb") or ""
+            creator = status_disk.get("creator") or creator
+            duration = float(status_disk.get("duration") or 0.0)
+            if status_disk.get("created_at"):
+                created_at = float(status_disk["created_at"])
+            if status_disk.get("started_at") and status_disk.get("finished_at"):
+                took = max(0.0, float(status_disk["finished_at"]) - float(status_disk["started_at"]))
+            opts_disk = status_disk.get("options") or {}
+            if opts_disk.get("max_clips"):
+                try:
+                    target_clips_opt = int(opts_disk["max_clips"])
+                except (TypeError, ValueError):
+                    pass
+            if status_disk.get("source_type") == "file" or (not status_disk.get("url") and any(job_dir.glob("source_*"))):
+                source_kind = "file"
+        except Exception:
+            status_disk = {}
 
     # Check in-memory app.jobs for live state
     app_job = None
@@ -407,6 +653,48 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
+    def _normalize_clip(i: int, c: Dict[str, Any], default_file: str = "") -> Dict[str, Any]:
+        cid = c.get("id") or f"c_{i+1:02d}"
+        c_hook = c.get("hook") or c.get("viral_hook_text") or ""
+        c_title = (
+            c.get("title")
+            or c.get("video_title_for_youtube_short")
+            or c_hook
+            or f"Clip {i+1}"
+        )
+        c_desc = (
+            c.get("description")
+            or c.get("video_description_for_tiktok")
+            or c.get("video_description_for_instagram")
+            or ""
+        )
+        raw_file = c.get("file") or c.get("video_url") or default_file or f"clip_{i+1:02d}.mp4"
+        file_name = os.path.basename(raw_file)
+        cover_name = os.path.basename(c.get("cover") or "")
+        start_s = float(c.get("start", 0.0))
+        end_s = float(c.get("end", 30.0))
+        return {
+            "id": cid,
+            "title": c_title,
+            "score": c.get("score") or c.get("predicted_score") or 90,
+            "status": c.get("status") or "done",
+            "file": file_name,
+            "cover": cover_name or file_name.replace(".mp4", ".jpg"),
+            "version": c.get("version", 1),
+            "url": f"/media/{jid}/{file_name}",
+            "start": start_s,
+            "end": end_s,
+            "duration": round(max(0.0, end_s - start_s), 1),
+            "hook": c_hook or c_title,
+            "style": c.get("style", "hype"),
+            "layout": c.get("layout", "track"),
+            "description": c_desc,
+            "reason": c.get("reason") or "",
+            "hashtags": c.get("hashtags") or [],
+            "posts": {},
+            "rendered": True,
+        }
+
     if app_job:
         raw_s = app_job.get("status", "queued")
         if raw_s in ("completed", "done"):
@@ -417,8 +705,8 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
             status = "running"
             logs = app_job.get("logs") or []
             ready_files = app_job.get("ready_files") or {}
-            target_clips = len(clips)
-            stage, progress = _infer_job_stage_and_progress(logs, ready_files, target_clips)
+            res_clips_len = len((app_job.get("result") or {}).get("clips") or [])
+            stage, progress = _infer_job_stage_and_progress(logs, ready_files, max(target_clips_opt, res_clips_len))
         elif raw_s in ("failed", "error"):
             status = "failed"
             stage = "Failed"
@@ -429,131 +717,76 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
                 error = "Processing failed. Check worker logs."
         elif raw_s == "queued":
             status = "queued"
-            stage = "Queued in worker"
+            stage = f"Queued ({_get_worker_config()['job_workers']} job workers active)"
             progress = 0.05
 
         if app_job.get("attestation") and isinstance(app_job["attestation"], dict):
-            creator = app_job["attestation"].get("creator")
+            creator = app_job["attestation"].get("creator") or creator
 
         # In-memory clips if available
-        res_clips = app_job.get("result", {}).get("clips") or []
+        res_clips = (app_job.get("result") or {}).get("clips") or []
         if res_clips:
             for i, c in enumerate(res_clips):
-                cid = c.get("id") or f"c_{i+1:02d}"
-                c_title = c.get("title") or c.get("video_title_for_youtube_short") or f"Clip {i+1}"
-                raw_file = c.get("file") or c.get("video_url") or f"clip_{i+1:02d}.mp4"
-                file_name = os.path.basename(raw_file)
-                cover_name = os.path.basename(c.get("cover") or "")
-                clips.append({
-                    "id": cid,
-                    "title": c_title,
-                    "score": c.get("score") or c.get("predicted_score") or 90,
-                    "status": "done",
-                    "file": file_name,
-                    "cover": cover_name or file_name.replace(".mp4", ".jpg"),
-                    "version": c.get("version", 1),
-                    "url": f"/media/{jid}/{file_name}",
-                    "start": float(c.get("start", 0.0)),
-                    "end": float(c.get("end", 30.0)),
-                    "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
-                    "hook": c.get("hook") or c.get("viral_hook_text") or "",
-                    "style": c.get("style", "hype"),
-                    "layout": c.get("layout", "track"),
-                    "description": c.get("description") or c.get("video_description_for_tiktok") or "",
-                    "rendered": True,
-                })
+                clips.append(_normalize_clip(i, c))
 
-    if status_file.exists():
-        try:
-            d = json.loads(status_file.read_text(encoding="utf-8"))
-            if not app_job:
-                raw_s = d.get("status", "done")
-                if raw_s in ("completed", "done"):
-                    status = "done"
-                    stage = "Finished"
-                    progress = 1.0
-                elif raw_s in ("processing", "running"):
-                    status = "running"
-                    disk_clips = list(job_dir.glob("*_clip_*.mp4")) or list((job_dir / "clips").glob("*.mp4"))
-                    if disk_clips:
-                        progress = min(0.65 + 0.30 * (len(disk_clips) / 3.0), 0.95)
-                        stage = f"Rendering 9:16 Shorts with subtitles ({len(disk_clips)} ready)"
-                    else:
-                        progress = 0.50
-                        stage = d.get("stage") or "Processing video on local GPU..."
-                elif raw_s in ("failed", "error"):
-                    status = "failed"
-                    stage = "Failed"
-                    progress = 0.0
-                    error = d.get("error") or "Failed"
-                elif raw_s in ("queued", "pending"):
-                    status = "queued"
-                    stage = "Queued"
-                    progress = 0.05
-            title = d.get("title") or title
-            creator = d.get("creator") or creator
-            duration = float(d.get("duration", 0.0))
-            if d.get("created_at"):
-                created_at = float(d["created_at"])
-            raw_clips = d.get("clips") or d.get("result", {}).get("clips") or []
-            if not clips and raw_clips:
-                for i, c in enumerate(raw_clips):
-                    cid = c.get("id") or f"c_{i+1:02d}"
-                    c_title = c.get("title") or c.get("video_title_for_youtube_short") or f"Clip {i+1}"
-                    raw_file = c.get("file") or c.get("video_url") or f"clip_{i+1:02d}.mp4"
-                    file_name = os.path.basename(raw_file)
-                    cover_name = os.path.basename(c.get("cover") or "")
-                    clips.append({
-                        "id": cid,
-                        "title": c_title,
-                        "score": c.get("score") or c.get("predicted_score") or 90,
-                        "status": "done",
-                        "file": file_name,
-                        "cover": cover_name or file_name.replace(".mp4", ".jpg"),
-                        "version": c.get("version", 1),
-                        "url": f"/media/{jid}/{file_name}",
-                        "start": float(c.get("start", 0.0)),
-                        "end": float(c.get("end", 30.0)),
-                        "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
-                        "hook": c.get("hook") or c.get("viral_hook_text") or "",
-                        "style": c.get("style", "hype"),
-                        "layout": c.get("layout", "track"),
-                        "description": c.get("description") or c.get("video_description_for_tiktok") or "",
-                        "rendered": True,
-                    })
-        except Exception:
-            pass
+    if status_disk:
+        if not app_job:
+            raw_s = status_disk.get("status", "done")
+            if raw_s in ("completed", "done"):
+                status = "done"
+                stage = "Finished"
+                progress = 1.0
+            elif raw_s in ("processing", "running"):
+                status = "running"
+                disk_clips = list(job_dir.glob("*_clip_*.mp4")) or list((job_dir / "clips").glob("*.mp4"))
+                w = _get_worker_config()["clip_workers"]
+                if disk_clips:
+                    denom = float(max(target_clips_opt, len(disk_clips), 3))
+                    progress = min(0.65 + 0.30 * (len(disk_clips) / denom), 0.95)
+                    stage = f"Rendering 9:16 Shorts ({len(disk_clips)} ready · {w} workers)"
+                else:
+                    progress = 0.50
+                    stage = status_disk.get("stage") or f"Processing video ({w} workers)..."
+            elif raw_s in ("failed", "error"):
+                status = "failed"
+                stage = "Failed"
+                progress = 0.0
+                error = status_disk.get("error") or "Failed"
+            elif raw_s in ("queued", "pending"):
+                status = "queued"
+                stage = "Queued"
+                progress = 0.05
+
+        raw_clips = status_disk.get("clips") or status_disk.get("result", {}).get("clips") or []
+        if not clips and raw_clips:
+            for i, c in enumerate(raw_clips):
+                clips.append(_normalize_clip(i, c))
+
+    # Upgrade raw URL titles (e.g. 'watch?v=...') using *_metadata.json when available
+    meta_files = list(job_dir.glob("*_metadata.json"))
+    if meta_files and _looks_like_raw_url_title(title):
+        base_name = meta_files[0].name.replace("_metadata.json", "")
+        cleaned = _clean_media_title(base_name)
+        if cleaned and not _looks_like_raw_url_title(cleaned):
+            title = cleaned
 
     # If clips is still empty, scan *_metadata.json or mp4 files in clips/ or job_dir
     if not clips and status == "done":
-        meta_files = list(job_dir.glob("*_metadata.json"))
         if meta_files:
             try:
                 meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
                 base_name = meta_files[0].name.replace("_metadata.json", "")
                 shorts = meta_data.get("shorts", [])
                 for i, c in enumerate(shorts):
-                    c_title = c.get("video_title_for_youtube_short") or c.get("title") or f"Clip {i+1}"
-                    file_name = f"{base_name}_clip_{i+1}.mp4"
+                    # Prefer subtitled/hooked version if present on disk
+                    suffixed = sorted(
+                        [f for f in job_dir.glob(f"*{base_name}_clip_{i+1}.mp4") if not f.name.startswith("temp_")],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    file_name = suffixed[0].name if suffixed else f"{base_name}_clip_{i+1}.mp4"
                     if (job_dir / file_name).exists() or (job_dir / "clips" / file_name).exists():
-                        clips.append({
-                            "id": f"c_{i+1:02d}",
-                            "title": c_title,
-                            "score": c.get("predicted_score") or c.get("score") or 90,
-                            "status": "done",
-                            "file": file_name,
-                            "cover": file_name.replace(".mp4", ".jpg"),
-                            "version": 1,
-                            "url": f"/media/{jid}/{file_name}",
-                            "start": float(c.get("start", 0.0)),
-                            "end": float(c.get("end", 30.0)),
-                            "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
-                            "hook": c.get("viral_hook_text") or c.get("hook") or "",
-                            "style": c.get("style", "hype"),
-                            "layout": c.get("layout", "track"),
-                            "description": c.get("video_description_for_tiktok") or "",
-                            "rendered": True,
-                        })
+                        clips.append(_normalize_clip(i, c, default_file=file_name))
             except Exception:
                 pass
 
@@ -562,52 +795,66 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
                 f for f in job_dir.glob("*.mp4")
                 if not f.name.startswith("temp_")
                 and not f.name.endswith((".v1video.mp4", "_original.mp4"))
+                and not f.name.startswith("source_")
                 and f.name != "input.mp4"
                 and f.stat().st_size > 50000
             ]
             for i, cf in enumerate(clip_files):
-                clips.append({
-                    "id": cf.stem,
-                    "title": f"Clip {i+1}",
-                    "score": 85,
-                    "status": "done",
-                    "file": cf.name,
-                    "cover": cf.name.replace(".mp4", ".jpg"),
-                    "version": 1,
-                    "url": f"/media/{jid}/{cf.name}",
-                    "start": 0.0,
-                    "end": 30.0,
-                    "duration": 30.0,
-                    "hook": "",
-                    "style": "hype",
-                    "layout": "track",
-                    "description": "",
-                    "rendered": True,
-                })
+                clips.append(_normalize_clip(i, {"id": cf.stem, "title": f"{_clean_media_title(title)} — Clip {i+1}"}, default_file=cf.name))
+
+    # Attach matching scheduled/posted queue entries onto each clip
+    if clips:
+        try:
+            q_posts = get_publishing_queue().list_posts()
+            for p in q_posts:
+                if p.get("job_id") == jid:
+                    for c in clips:
+                        if c["id"] == p.get("clip_id"):
+                            c.setdefault("posts", {})[p["id"]] = {
+                                "id": p["id"],
+                                "account_name": p.get("account_name") or p.get("platform", "").title(),
+                                "status": p.get("status", "scheduled"),
+                                "due_at": p.get("due_at", 0.0),
+                                "url": p.get("remote_url") or "",
+                                "error": p.get("error_message") or "",
+                            }
+        except Exception:
+            pass
 
     # Filter out empty or synthetic test fixtures with no clips and no real video content
     has_real_clips = bool(clips)
     has_real_video = any(
-        f.is_file() and f.stat().st_size > 50000 
+        f.is_file() and f.stat().st_size > 50000
         for f in (list(job_dir.glob("*.mp4")) + list((job_dir / "clips").glob("*.mp4")))
     )
     is_active_job = bool(app_job and app_job.get("status") in ("processing", "running", "queued"))
     if not has_real_clips and not has_real_video and not is_active_job:
         return None
 
+    has_local_thumb = (job_dir / "thumb.jpg").exists() or (job_dir / "thumbnail.jpg").exists() or bool(clips)
+    clean_title = _clean_media_title(title) if title.startswith("source_") else title
+    if _looks_like_raw_url_title(clean_title) and meta_files:
+        clean_title = _clean_media_title(meta_files[0].name.replace("_metadata.json", ""))
     return {
         "id": jid,
-        "title": title,
+        "title": clean_title,
         "status": status,
         "stage": stage,
         "progress": progress,
         "duration": duration,
+        "took": took,
+        "thumb": has_local_thumb,
+        "thumb_url": thumb_url,
         "clips": clips,
         "created_at": created_at,
         "creator": creator,
         "error": error,
-        "source": {"kind": "upload" if "source_" in title else "youtube", "name": title},
-        "uploader": creator or "PeakCut",
+        "source": {
+            "type": "file" if (source_kind == "file" or "source_" in title) else "url",
+            "kind": "upload" if (source_kind == "file" or "source_" in title) else "youtube",
+            "name": clean_title,
+        },
+        "uploader": uploader or creator or "PeakCut",
     }
 
 
@@ -616,7 +863,7 @@ def _list_all_jobs_public() -> List[Dict[str, Any]]:
     seen = set()
     if OUTPUT_DIR.exists():
         for d in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if d.is_dir() and d.name not in ("thumbnails", "live", "creators"):
+            if d.is_dir() and d.name not in ("thumbnails", "live", "creators", "uploads"):
                 job_data = _format_job_public(d)
                 if job_data:
                     jobs.append(job_data)
@@ -645,12 +892,12 @@ def _list_all_jobs_public() -> List[Dict[str, Any]]:
 async def sync_state(v: str = ""):
     """Reactive delta sync queried every few seconds by the Web UI."""
     token = _sync_token()
-    if v == token:
+    # Never short-circuit while jobs are actively running so live progress & partial clips update smoothly.
+    if v == token and not _has_active_jobs():
         return {"v": token}
     ai_info = _get_ai_status_info()
 
     creators_mgr = CreatorWorkspaceManager.get_instance()
-    queue = get_publishing_queue()
 
     creators_list = []
     for c in creators_mgr.list_creators():
@@ -670,11 +917,7 @@ async def sync_state(v: str = ""):
         "v": token,
         "jobs": _list_all_jobs_public(),
         "creators": creators_list,
-        "accounts": [
-            {"id": "yt_main", "platform": "youtube", "name": "YouTube Shorts Channel", "connected": True},
-            {"id": "tt_main", "platform": "tiktok", "name": "TikTok Creator Account", "connected": True},
-            {"id": "ig_main", "platform": "instagram", "name": "Instagram Reels", "connected": True},
-        ],
+        "accounts": _build_accounts_public(),
         "ai": {
             "ready": ai_info["ready"],
             "configured": ai_info["configured"],
@@ -764,6 +1007,7 @@ async def get_overview():
             "title": p.get("title", ""),
             "score": p.get("score") or p.get("metadata", {}).get("score", 0),
             "url": p.get("remote_url") or "",
+            "error": p.get("error_message") or "",
             "views": int(p.get("views") or 0) if p.get("views") is not None else 0,
         })
 
@@ -1103,6 +1347,20 @@ async def create_job_endpoint(req: Request):
 
     options = body.get("options") or {}
     creator = body.get("creator")
+    video_title = str(body.get("title") or "").strip()
+    uploader = str(body.get("uploader") or "").strip()
+    thumb_url = str(body.get("thumb") or "").strip()
+    try:
+        duration = float(body.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    if not video_title or _looks_like_raw_url_title(video_title):
+        yt_match = re.search(r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})", url)
+        if yt_match:
+            video_title = f"YouTube Video ({yt_match.group(1)})"
+        else:
+            video_title = url.split("/")[-1][:60] or "New Video Job"
 
     jid = str(uuid.uuid4())
     job_dir = OUTPUT_DIR / jid
@@ -1112,7 +1370,10 @@ async def create_job_endpoint(req: Request):
         "id": jid,
         "status": "queued",
         "url": url,
-        "title": url.split("/")[-1][:60] or "New Video Job",
+        "title": video_title,
+        "uploader": uploader,
+        "thumb_url": thumb_url,
+        "duration": duration,
         "creator": creator,
         "options": options,
         "created_at": time.time(),
@@ -1132,7 +1393,8 @@ async def create_job_endpoint(req: Request):
                 job_id=jid,
                 url=url,
                 options=options,
-                creator=creator
+                creator=creator,
+                title=video_title,
             )
     except Exception as e:
         logger.warning(f"Background job trigger notice: {e}")
@@ -1167,44 +1429,89 @@ async def delete_clip_endpoint(jid: str, cid: str):
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    candidates = [
-        job_dir / f"{cid}.mp4",
-        job_dir / "clips" / f"{cid}.mp4",
-        job_dir / f"clip_{cid}.mp4",
-    ]
-    for p in candidates:
-        if p.exists():
-            try:
-                p.unlink()
-                _bump_version()
-                return {"status": "deleted", "clip": cid}
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to delete clip: {e}")
+    resolved = _resolve_clip_info(job_dir, cid)
+    target_path = resolved.get("file_path")
+    if target_path and Path(target_path).exists():
+        try:
+            Path(target_path).unlink()
+            # Also remove clip entry from status.json so it disappears immediately
+            status_file = job_dir / "status.json"
+            if status_file.exists():
+                try:
+                    d = json.loads(status_file.read_text(encoding="utf-8"))
+                    clips = d.get("clips") or []
+                    d["clips"] = [
+                        c for i, c in enumerate(clips)
+                        if (c.get("id") or f"c_{i+1:02d}") != cid and os.path.basename(c.get("file") or c.get("video_url") or "") != Path(target_path).name
+                    ]
+                    status_file.write_text(json.dumps(d, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            _bump_version()
+            return {"status": "deleted", "clip": cid}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete clip: {e}")
 
     return {"status": "not_found", "clip": cid}
 
 
 @router.post("/api/jobs/{jid}/clips/{cid}/render")
 async def remake_clip_endpoint(jid: str, cid: str, req: Request):
-    """Save updated clip cuts, captions, styles, layout, and rerender."""
+    """Save updated clip cuts, captions, styles, layout, title, description, and hook."""
     job_dir = OUTPUT_DIR / jid
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Job not found.")
 
     body = await req.json()
+    m = re.match(r"^(?:c_|clip_)?0*(\d+)$", str(cid or "").strip(), re.IGNORECASE)
+    clip_idx = int(m.group(1)) - 1 if m else None
+
+    def _apply_updates(target: Dict[str, Any]) -> None:
+        for k in ("start", "end", "hook", "title", "style", "layout", "description"):
+            if k in body and body[k] is not None:
+                target[k] = body[k]
+        # Keep OpenShorts canonical keys in sync so reads from either format stay consistent
+        if "title" in body and body["title"] is not None:
+            target["video_title_for_youtube_short"] = body["title"]
+        if "hook" in body and body["hook"] is not None:
+            target["viral_hook_text"] = body["hook"]
+        if "description" in body and body["description"] is not None:
+            target["video_description_for_tiktok"] = body["description"]
+            target["video_description_for_instagram"] = body["description"]
+        target["version"] = int(target.get("version") or 1) + 1
+
     status_file = job_dir / "status.json"
     if status_file.exists():
         try:
             d = json.loads(status_file.read_text(encoding="utf-8"))
             clips = d.get("clips") or d.get("result", {}).get("clips") or []
-            target = next((c for c in clips if c.get("id") == cid), None)
-            if target:
-                for k in ("start", "end", "hook", "title", "style", "layout", "description"):
-                    if k in body:
-                        target[k] = body[k]
+            target = None
+            for i, c in enumerate(clips):
+                c_id = c.get("id") or f"c_{i+1:02d}"
+                fname = os.path.basename(c.get("file") or c.get("video_url") or "")
+                if c_id == cid or (fname and Path(fname).stem == cid) or (clip_idx is not None and i == clip_idx):
+                    c["id"] = c_id
+                    target = c
+                    break
+            if target is not None:
+                _apply_updates(target)
                 status_file.write_text(json.dumps(d, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"Error updating status.json for remake: {e}")
+
+    # Also update in-memory app.jobs cache if present
+    try:
+        import sys
+        app_mod = sys.modules.get("app")
+        app_job = app_mod.jobs.get(jid) if (app_mod and hasattr(app_mod, "jobs")) else None
+        if app_job and (app_job.get("result") or {}).get("clips"):
+            for i, c in enumerate(app_job["result"]["clips"]):
+                c_id = c.get("id") or f"c_{i+1:02d}"
+                if c_id == cid or (clip_idx is not None and i == clip_idx):
+                    _apply_updates(c)
+                    break
+    except Exception:
+        pass
 
     _bump_version()
     return _format_job_public(job_dir)
@@ -1219,15 +1526,10 @@ async def download_clips_zip(ids: str = ""):
     with zipfile.ZipFile(zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for jid, cid in pairs:
             job_dir = OUTPUT_DIR / jid
-            candidates = [
-                job_dir / f"{cid}.mp4",
-                job_dir / "clips" / f"{cid}.mp4",
-                job_dir / f"clip_{cid}.mp4",
-            ]
-            for c_path in candidates:
-                if c_path.exists() and c_path.is_file():
-                    zf.write(c_path, arcname=f"{jid}_{cid}.mp4")
-                    break
+            resolved = _resolve_clip_info(job_dir, cid)
+            c_path = resolved.get("file_path")
+            if c_path and Path(c_path).exists() and Path(c_path).is_file():
+                zf.write(c_path, arcname=f"{jid}_{cid}.mp4")
 
     zip_bytes.seek(0)
     return Response(
@@ -1260,13 +1562,14 @@ async def bulk_delete_jobs(req: Request):
             continue
 
         job_dir = OUTPUT_DIR / jid
-        for candidate in (job_dir / f"{cid}.mp4", job_dir / "clips" / f"{cid}.mp4", job_dir / f"clip_{cid}.mp4"):
-            if candidate.exists():
-                try:
-                    candidate.unlink()
-                    deleted_clips.append(f"{jid}.{cid}")
-                except Exception:
-                    pass
+        resolved = _resolve_clip_info(job_dir, cid)
+        candidate = resolved.get("file_path")
+        if candidate and Path(candidate).exists():
+            try:
+                Path(candidate).unlink()
+                deleted_clips.append(f"{jid}.{cid}")
+            except Exception:
+                pass
 
     _bump_version()
     return {
@@ -1286,13 +1589,15 @@ async def upload_direct_file(
     file: UploadFile = File(...),
     options: str = Form("{}"),
     creator: str = Form(""),
+    title: str = Form(""),
 ):
     """Direct single-part upload fallback."""
     jid = str(uuid.uuid4())
     job_dir = OUTPUT_DIR / jid
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = job_dir / f"source_{file.filename or 'upload.mp4'}"
+    raw_filename = os.path.basename(file.filename or "upload.mp4")
+    dest = job_dir / f"source_{raw_filename}"
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
 
@@ -1302,10 +1607,12 @@ async def upload_direct_file(
     except Exception:
         pass
 
+    clean_title = title.strip() or _clean_media_title(raw_filename) or "Uploaded Video"
     status_data = {
         "id": jid,
         "status": "queued",
-        "title": file.filename or "Uploaded Video",
+        "source_type": "file",
+        "title": clean_title,
         "creator": creator or None,
         "options": opts,
         "created_at": time.time(),
@@ -1326,6 +1633,7 @@ async def upload_direct_file(
                 options=opts,
                 creator=creator,
                 file_path=str(dest),
+                title=clean_title,
             )
     except Exception as e:
         logger.warning(f"Background upload job trigger notice: {e}")
@@ -1337,7 +1645,8 @@ async def upload_direct_file(
 async def upload_start_endpoint(req: Request):
     """Request chunked upload token and part layout."""
     data = await req.json()
-    name = str(data.get("name") or "upload.mp4")
+    name = os.path.basename(str(data.get("name") or "upload.mp4"))
+    title = str(data.get("title") or "").strip() or _clean_media_title(name)
     size = int(data.get("size") or 0)
     opts = data.get("options") or {}
     creator = data.get("creator") or ""
@@ -1352,6 +1661,7 @@ async def upload_start_endpoint(req: Request):
     meta = {
         "id": upid,
         "name": name,
+        "title": title,
         "size": size,
         "part": part_size,
         "parts": parts,
@@ -1400,10 +1710,12 @@ async def upload_finish_endpoint(upid: str):
 
     shutil.rmtree(up_dir, ignore_errors=True)
 
+    clean_title = str(meta.get("title") or "").strip() or _clean_media_title(meta["name"])
     status_data = {
         "id": jid,
         "status": "queued",
-        "title": meta["name"],
+        "source_type": "file",
+        "title": clean_title,
         "creator": meta.get("creator") or None,
         "options": meta.get("options") or {},
         "created_at": time.time(),
@@ -1424,6 +1736,7 @@ async def upload_finish_endpoint(upid: str):
                 options=meta.get("options") or {},
                 creator=meta.get("creator"),
                 file_path=str(dest),
+                title=clean_title,
             )
     except Exception as e:
         logger.warning(f"Background upload finish job trigger notice: {e}")
@@ -1454,7 +1767,7 @@ _CONNECTED_ACCOUNTS = {
 @router.get("/api/accounts")
 async def list_connected_accounts():
     """List connected social accounts from publishing queue."""
-    return list(_CONNECTED_ACCOUNTS.values())
+    return _build_accounts_public()
 
 
 @router.delete("/api/accounts/{aid}")
@@ -1467,59 +1780,180 @@ async def remove_connected_account(aid: str):
 
 
 @router.get("/api/apps")
-async def get_connected_apps():
-    """Get connected apps configuration."""
+async def get_connected_apps(req: Request):
+    """Get connected apps configuration with full fields expected by Settings -> Connected apps."""
+    base = os.environ.get("PEAKCUT_PUBLIC_URL", "").strip().rstrip("/") or str(req.base_url).rstrip("/")
+    is_https = base.startswith("https://")
+    yt_cid = os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
+    yt_sec = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
+    yt_rt = os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
+    ig_cid = os.environ.get("INSTAGRAM_CLIENT_ID", "").strip()
+    tt_cid = os.environ.get("TIKTOK_CLIENT_KEY", "").strip()
     return {
-        "youtube": {"configured": True, "client_id": "openshorts-youtube-app"},
-        "instagram": {"configured": True, "client_id": "openshorts-ig-app"},
-        "tiktok": {"configured": True, "client_id": "openshorts-tiktok-app"},
+        "youtube": {
+            "configured": bool(yt_cid and yt_sec),
+            "ready": bool(yt_cid and yt_sec),
+            "oauth_ready": bool(yt_cid and yt_sec and yt_rt),
+            "client_id": yt_cid or "openshorts-youtube-app",
+            "id_label": "OAuth Client ID",
+            "secret_label": "OAuth Client Secret",
+            "id_hint": (yt_cid[:12] + "...") if yt_cid else "",
+            "redirect": f"{base}/oauth/youtube/callback",
+            "https": is_https,
+        },
+        "instagram": {
+            "configured": bool(ig_cid),
+            "ready": bool(ig_cid),
+            "client_id": ig_cid or "openshorts-ig-app",
+            "id_label": "Instagram App ID",
+            "secret_label": "Instagram App Secret",
+            "id_hint": (ig_cid[:10] + "...") if ig_cid else "",
+            "redirect": f"{base}/oauth/instagram/callback",
+            "https": is_https,
+        },
+        "tiktok": {
+            "configured": bool(tt_cid),
+            "ready": bool(tt_cid),
+            "client_id": tt_cid or "openshorts-tiktok-app",
+            "id_label": "TikTok Client Key",
+            "secret_label": "TikTok Client Secret",
+            "id_hint": (tt_cid[:10] + "...") if tt_cid else "",
+            "redirect": f"{base}/oauth/tiktok/callback",
+            "https": is_https,
+        },
     }
 
 
 @router.put("/api/apps")
 async def update_connected_apps(req: Request):
-    """Save app credentials for social platforms."""
+    """Save app credentials for social platforms into runtime env."""
     data = await req.json()
-    platform = data.get("platform")
-    cid = data.get("client_id")
-    logger.info(f"Saved OAuth credentials for platform {platform}: {cid}")
+    platform = str(data.get("platform") or "").strip().lower()
+    cid = str(data.get("client_id") or "").strip()
+    csec = str(data.get("client_secret") or "").strip()
+    rtoken = str(data.get("refresh_token") or "").strip()
+    if platform == "youtube":
+        if cid:
+            os.environ["YOUTUBE_CLIENT_ID"] = cid
+        if csec:
+            os.environ["YOUTUBE_CLIENT_SECRET"] = csec
+        if rtoken:
+            os.environ["YOUTUBE_REFRESH_TOKEN"] = rtoken
+    elif platform == "instagram":
+        if cid:
+            os.environ["INSTAGRAM_CLIENT_ID"] = cid
+        if csec:
+            os.environ["INSTAGRAM_CLIENT_SECRET"] = csec
+    elif platform == "tiktok":
+        if cid:
+            os.environ["TIKTOK_CLIENT_KEY"] = cid
+        if csec:
+            os.environ["TIKTOK_CLIENT_SECRET"] = csec
+    logger.info(f"Saved OAuth credentials for platform {platform}")
     _bump_version()
     return {"ok": True}
 
 
 @router.post("/api/posts")
 async def add_post_to_queue(req: Request):
-    """Schedule a clip for posting across selected social accounts."""
+    """Schedule or immediately publish a clip across selected social accounts."""
     data = await req.json()
-    jid = data.get("job")
-    cid = data.get("clip")
+    jid = str(data.get("job") or "").strip()
+    cid = str(data.get("clip") or "").strip()
     accs = data.get("accounts") or []
     is_now = bool(data.get("now"))
+    custom_title = str(data.get("title") or "").strip()
+    custom_desc = str(data.get("description") or "").strip()
+    privacy = str(data.get("privacy") or os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "private")).strip().lower()
+    if privacy not in ("private", "unlisted", "public"):
+        privacy = "private"
+    publish_at = str(data.get("publish_at") or "").strip() or None
 
     q = get_publishing_queue()
     job_dir = OUTPUT_DIR / jid if jid else None
-    clip_file = None
-    if job_dir:
-        for cand in (job_dir / f"{cid}.mp4", job_dir / "clips" / f"{cid}.mp4", job_dir / f"clip_{cid}.mp4"):
-            if cand.exists():
-                clip_file = cand
-                break
+    resolved = _resolve_clip_info(job_dir, cid) if (job_dir and job_dir.exists()) else {
+        "file_path": None, "title": "", "description": "", "score": 85
+    }
 
+    clip_file = resolved.get("file_path")
+    final_title = custom_title or resolved.get("title") or f"AI Clip {cid} #shorts"
+    final_desc = custom_desc if custom_desc else (resolved.get("description") or "")
+
+    # Persist edited title/description back to status.json when provided
+    if job_dir and (custom_title or custom_desc):
+        status_file = job_dir / "status.json"
+        if status_file.exists():
+            try:
+                d = json.loads(status_file.read_text(encoding="utf-8"))
+                clips = d.get("clips") or []
+                m = re.match(r"^(?:c_|clip_)?0*(\d+)$", cid, re.IGNORECASE)
+                c_idx = int(m.group(1)) - 1 if m else None
+                for i, c in enumerate(clips):
+                    c_id = c.get("id") or f"c_{i+1:02d}"
+                    if c_id == cid or (c_idx is not None and i == c_idx):
+                        if custom_title:
+                            c["title"] = custom_title
+                            c["video_title_for_youtube_short"] = custom_title
+                        if custom_desc:
+                            c["description"] = custom_desc
+                            c["video_description_for_tiktok"] = custom_desc
+                        status_file.write_text(json.dumps(d, indent=2), encoding="utf-8")
+                        break
+            except Exception:
+                pass
+
+    # Parse optional scheduled publish_at timestamp
+    requested_ts: Optional[float] = time.time() if is_now else None
+    if publish_at and not is_now:
+        try:
+            parsed_dt = dt.datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.astimezone()
+            requested_ts = parsed_dt.timestamp()
+            publish_at = parsed_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            # Enforce Privacy First rule: scheduled YouTube posts must upload as private with publishAt
+            privacy = "private"
+        except Exception:
+            publish_at = None
+
+    enqueued = []
     for acc_id in accs:
-        platform = "youtube" if "yt" in str(acc_id).lower() else "tiktok" if "tt" in str(acc_id).lower() else "instagram"
-        q.enqueue(
-            job_id=str(jid or "job_manual"),
-            clip_id=str(cid or "clip_manual"),
+        acc_meta = _CONNECTED_ACCOUNTS.get(str(acc_id), {})
+        platform = acc_meta.get("platform") or (
+            "youtube" if "yt" in str(acc_id).lower() else "tiktok" if "tt" in str(acc_id).lower() else "instagram"
+        )
+        acc_name = acc_meta.get("name") or str(acc_id)
+        meta: Dict[str, Any] = {
+            "privacy": privacy,
+            "privacy_status": privacy,
+            "score": resolved.get("score", 85),
+        }
+        if publish_at:
+            meta["publish_at"] = publish_at
+
+        item = q.enqueue(
+            job_id=jid or "job_manual",
+            clip_id=cid or "clip_manual",
             platform=platform,
             account_id=str(acc_id),
-            title=f"AI Clip {cid} #shorts",
+            account_name=acc_name,
+            title=final_title,
+            description=final_desc,
             video_path=str(clip_file or (OUTPUT_DIR / f"{cid}.mp4")),
             schedule_now=is_now,
-            requested_time=time.time() if is_now else None,
+            requested_time=requested_ts,
+            metadata=meta,
         )
+        enqueued.append(item.to_dict())
 
     _bump_version()
-    return {"ok": True, "scheduled": len(accs)}
+    yt_ready = False
+    try:
+        from youtube_uploader import is_youtube_auth_configured
+        yt_ready = is_youtube_auth_configured()
+    except Exception:
+        pass
+    return {"ok": True, "scheduled": len(enqueued), "posts": enqueued, "youtube_ready": yt_ready}
 
 
 @router.post("/api/posts/{pid}/cancel")
@@ -1567,18 +2001,51 @@ async def get_ai_settings():
     import llm_backend
     active_model = ai_info["model"]
     if ai_info["provider"] == "ollama":
-        models = [active_model, "gemma2:2b", "gemma2:9b", "llama3.2"]
+        models = list(dict.fromkeys([active_model, "gemma2:2b", "gemma2:9b", "llama3.2"]))
     else:
-        models = [active_model, "gemini-3.1-flash-lite", "gemini-2.5-flash"]
+        models = list(dict.fromkeys([active_model, "gemini-3.1-flash-lite", "gemini-2.5-flash"]))
+    g_key = api_key_rotator.get_gemini_key() or ""
+    has_key = bool(g_key) or ai_info["provider"] == "ollama"
+    key_hint = g_key[-4:] if len(g_key) >= 4 else ""
     return {
         "ready": ai_info["ready"],
         "label": ai_info["label"],
         "provider": ai_info["provider"],
+        "has_key": has_key,
+        "key_hint": key_hint,
         "providers": [
-            {"id": "ollama", "label": "Local Gemma / Ollama (GPU Zero-API)"},
-            {"id": "gemini", "label": "Google Gemini"},
-            {"id": "openai", "label": "OpenAI / Compatible"},
-            {"id": "anthropic", "label": "Anthropic Claude"},
+            {
+                "id": "ollama",
+                "label": "Local Gemma / Ollama (GPU Zero-API)",
+                "needs_key": False,
+                "key_url": "https://ollama.com",
+                "example": "gemma2:2b",
+                "address": "http://127.0.0.1:11434/v1",
+            },
+            {
+                "id": "gemini",
+                "label": "Google Gemini",
+                "needs_key": True,
+                "key_url": "https://aistudio.google.com/apikey",
+                "example": "gemini-2.5-flash",
+                "address": "",
+            },
+            {
+                "id": "openai",
+                "label": "OpenAI / Compatible",
+                "needs_key": True,
+                "key_url": "https://platform.openai.com/api-keys",
+                "example": "gpt-4o-mini",
+                "address": "https://api.openai.com/v1",
+            },
+            {
+                "id": "anthropic",
+                "label": "Anthropic Claude",
+                "needs_key": True,
+                "key_url": "https://console.anthropic.com",
+                "example": "claude-3-5-haiku-latest",
+                "address": "",
+            },
         ],
         "models": models,
         "base_url": llm_backend.base_url(),
@@ -1589,18 +2056,34 @@ async def get_ai_settings():
 async def put_ai_settings(req: Request):
     """Update AI provider, keys, and model from Settings -> AI."""
     data = await req.json()
-    prov = data.get("provider") or "gemini"
-    key = data.get("key")
-    if key:
-        api_key_rotator.register_keys(prov, key)
+    prov = str(data.get("provider") or "gemini").strip().lower()
+    key = str(data.get("key") or "").strip()
     models = data.get("models")
-    if models:
-        m_list = [m.strip() for m in str(models).split(",") if m.strip()]
+    m_list = [m.strip() for m in str(models or "").split(",") if m.strip()]
+    base_url = str(data.get("base_url") or "").strip()
+
+    if prov in ("ollama", "local"):
+        os.environ["LLM_PROVIDER"] = "ollama"
+        os.environ["LLM_BASE_URL"] = base_url or "http://127.0.0.1:11434/v1"
+        if m_list:
+            os.environ["LLM_MODEL"] = m_list[0]
+    elif prov == "openai":
+        os.environ["LLM_PROVIDER"] = "openai"
+        if base_url:
+            os.environ["LLM_BASE_URL"] = base_url
+        if key:
+            os.environ["LLM_API_KEY"] = key
+            api_key_rotator.register_keys("openai", key)
+        if m_list:
+            os.environ["LLM_MODEL"] = m_list[0]
+    else:
+        os.environ["LLM_PROVIDER"] = "gemini"
+        if key:
+            api_key_rotator.register_keys(prov, key)
         if m_list:
             os.environ["GEMINI_MODEL"] = m_list[0]
-    base_url = data.get("base_url")
-    if base_url:
-        os.environ["LLM_BASE_URL"] = str(base_url).strip()
+        if base_url:
+            os.environ["LLM_BASE_URL"] = base_url
 
     _bump_version()
     return await get_ai_settings()

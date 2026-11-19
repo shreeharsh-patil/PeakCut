@@ -65,6 +65,8 @@ def setup_colab_environment(
     os.environ["YOLO_VERBOSE"] = "False"
     os.environ["CLIP_WORKERS"] = "4"
     os.environ["MAX_CONCURRENT_JOBS"] = "2"
+    os.environ["WHISPER_WORKERS"] = "2"
+    os.environ["WHISPER_THREADS"] = "4"
 
     for key in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "OPENAI_API_KEY", "OPENAI_API_KEYS"]:
         os.environ.pop(key, None)
@@ -244,12 +246,14 @@ def parse_url_list(urls_input: Union[str, List[str]]) -> List[str]:
         raw_urls = [str(u).strip() for u in urls_input if str(u).strip()]
 
     # Preserve order while deduplicating
+    from security_utils import normalize_media_url
     seen = set()
     cleaned = []
     for u in raw_urls:
-        if u not in seen:
-            seen.add(u)
-            cleaned.append(u)
+        norm = normalize_media_url(u) or u
+        if norm not in seen:
+            seen.add(norm)
+            cleaned.append(norm)
     return cleaned
 
 

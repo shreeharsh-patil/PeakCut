@@ -1437,9 +1437,23 @@ const att = () => DRAFTS[draftKey()] ||= {files: [], links: [], note: null, busy
 const VIDEO_EXT = /\.(mp4|mov|mkv|webm|m4v|ts|flv)$/i;
 const fmtLen = s => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
 const fmtSize = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(b / 1e6)) + " MB";
-const isChannel = u => /^(https?:\/\/)?(www\.)?(twitch\.tv|kick\.com)\/[A-Za-z0-9_]+\/?$/.test(u) || /youtube\.com\/(@[^/]+|channel\/[^/]+)\/?(live|videos|streams)?\/?$/.test(u);
-const looksLink = u => /^https?:\/\/([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com)\//i.test(u);
-const fullLink = u => /[?&]v=[\w-]{11}\b|youtu\.be\/[\w-]{11}\b|\/(shorts|live|embed)\/[\w-]{11}\b|twitch\.tv\/videos\/\d{6,}|clips\.twitch\.tv\/\w|twitch\.tv\/\w+\/clip\/\w|kick\.com\/[\w-]+\/(videos?|clips?)\/[\w-]{6,}/i.test(u);
+const normalizeUrl = u => {
+  u = (u || "").trim();
+  if (/^[a-zA-Z0-9_-]{11}(?:\?.*)?$/.test(u)) return "https://www.youtube.com/watch?v=" + u.split("?")[0];
+  if (/^\/?watch\?v=[a-zA-Z0-9_-]{11}/i.test(u)) return "https://www.youtube.com/" + u.replace(/^\//, "");
+  if (/^\/?shorts\/[a-zA-Z0-9_-]{11}/i.test(u)) return "https://www.youtube.com/" + u.replace(/^\//, "");
+  if (!/^https?:\/\//i.test(u) && /^([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com)/i.test(u)) return "https://" + u;
+  return u;
+};
+const isChannel = u => /^(https?:\/\/)?(www\.)?(twitch\.tv|kick\.com)\/[A-Za-z0-9_]+\/?$/.test(normalizeUrl(u)) || /youtube\.com\/(@[^/]+|channel\/[^/]+)\/?(live|videos|streams)?\/?$/.test(normalizeUrl(u));
+const looksLink = u => {
+  const n = normalizeUrl(u);
+  return /^https?:\/\/([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com)\//i.test(n);
+};
+const fullLink = u => {
+  const n = normalizeUrl(u);
+  return /[?&]v=[\w-]{11}\b|youtu\.be\/[\w-]{11}\b|\/(shorts|live|embed)\/[\w-]{11}\b|twitch\.tv\/videos\/\d{6,}|clips\.twitch\.tv\/\w|twitch\.tv\/\w+\/clip\/\w|kick\.com\/[\w-]+\/(videos?|clips?)\/[\w-]{6,}/i.test(n);
+};
 const batchMax = () => S.status.max_batch || 5;
 const batchUsed = A => A.files.length + A.links.filter(l => l.state !== "bad").length;
 const newId = () => Math.random().toString(36).slice(2);
@@ -1513,6 +1527,7 @@ async function lookUp(u) {
   }
 }
 function takeLink(A, u, input) {
+  u = normalizeUrl(u);
   if (A.links.some(l => l.url === u && l.state !== "bad")) { A.note = null; if (input) input.value = ""; return drawAtt(); }
   if (batchUsed(A) >= batchMax()) { A.note = `You can send up to ${batchMax()} videos at a time. Remove one first.`; return drawAtt(); }
   const l = {id: newId(), url: u, state: "wait"};
@@ -1530,13 +1545,13 @@ function takeLink(A, u, input) {
 let linkTimer = 0;
 function onLink(input) {
   clearTimeout(linkTimer);
-  const A = att(), u = input.value.trim();
-  if (!u) { A.note = null; return drawAtt(); }
+  const A = att(), raw = input.value.trim(), u = normalizeUrl(raw);
+  if (!raw) { A.note = null; return drawAtt(); }
   if (isChannel(u)) { A.note = "That's a channel, not a video. To clip their live streams, add them as a creator and press Start recording."; return drawAtt(); }
-  if (!looksLink(u)) { A.note = u.length > 10 ? "Paste a full YouTube, Twitch or Kick video link." : null; return drawAtt(); }
+  if (!looksLink(raw)) { A.note = raw.length > 8 ? "Paste a YouTube, Twitch or Kick video link." : null; return drawAtt(); }
   A.note = null; drawAtt();
-  if (fullLink(u)) return takeLink(A, u, input);
-  linkTimer = setTimeout(() => { if (input.value.trim() === u) takeLink(A, u, input); }, 900);   // other link shapes: take it once typing stops
+  if (fullLink(raw)) return takeLink(A, u, input);
+  linkTimer = setTimeout(() => { if (input.value.trim() === raw) takeLink(A, u, input); }, 900);   // other link shapes: take it once typing stops
 }
 document.addEventListener("input", e => { if (e.target.id === "url") onLink(e.target);
   if (e.target.closest?.("#cform") && e.target.dataset.k && !/checkbox|radio/.test(e.target.type)) dirty(true); });
@@ -1610,8 +1625,9 @@ function sendFile(f, who) {
 async function makeClips() {
   const A = att();
   if (A.busy) return;
-  const typed = $("#url")?.value.trim();
-  if (typed && looksLink(typed) && !isChannel(typed)) { clearTimeout(linkTimer); takeLink(A, typed, $("#url")); }
+  const raw = $("#url")?.value.trim();
+  const typed = normalizeUrl(raw);
+  if (typed && looksLink(raw) && !isChannel(typed)) { clearTimeout(linkTimer); takeLink(A, typed, $("#url")); }
   if (A.links.some(l => l.state === "wait")) {   // still looking a link up: start as soon as it is found
     A.queued = true; drawAtt();
     toast("Finding the video first. Clipping starts as soon as it's found.");
@@ -1627,7 +1643,7 @@ async function makeClips() {
   const who = targetCreator(), opts = jobOptions();
   for (const l of A.links.filter(x => x.state === "ok")) {
     l.sending = true; drawAtt();
-    try { await send("/api/jobs", {url: l.url, options: opts, creator: who}); l.state = "done"; started++; }
+    try { await send("/api/jobs", {url: l.url, options: opts, creator: who, title: l.info?.title}); l.state = "done"; started++; }
     catch (e) { l.state = "bad"; l.msg = e.message; failed++; }
     l.sending = false; drawAtt();
   }
