@@ -2646,8 +2646,10 @@ def start_job_process_background(
 
     cmd = [sys.executable, "-u", "main.py"]
     env = os.environ.copy()
-    env["CLIP_WORKERS"] = str(os.environ.get("CLIP_WORKERS", "4"))
-    env["MAX_CONCURRENT_JOBS"] = str(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+    default_clip_workers = str(min(max(os.cpu_count() or 4, 4), 8))
+    env["CLIP_WORKERS"] = str(os.environ.get("CLIP_WORKERS", default_clip_workers))
+    env["LLM_WORKERS"] = str(os.environ.get("LLM_WORKERS", "3"))
+    env["MAX_CONCURRENT_JOBS"] = str(os.environ.get("MAX_CONCURRENT_JOBS", str(MAX_CONCURRENT_JOBS)))
     env["WHISPER_WORKERS"] = str(os.environ.get("WHISPER_WORKERS", "2"))
     env["WHISPER_THREADS"] = str(os.environ.get("WHISPER_THREADS", "4"))
     gemini_key = api_key_rotator.get_gemini_key() or os.environ.get("GEMINI_API_KEY")
@@ -2728,6 +2730,7 @@ def start_job_process_background(
     )
 
     _enqueue_job(job_id, priority=0)
+    _notify_peakcut_state()
     print(f"🚀 [PeakCut Studio] Job {job_id} successfully enqueued into processing pipeline!")
     return job_id
 

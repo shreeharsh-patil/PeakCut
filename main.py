@@ -1950,10 +1950,39 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        for b in range(0, len(windows), SCORE_BATCH):
-            scored.extend(_run_stage_split(
-                client, model_name, windows[b:b + SCORE_BATCH], _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+        batches = [windows[b:b + SCORE_BATCH] for b in range(0, len(windows), SCORE_BATCH)]
+        llm_workers = max(1, int(os.environ.get("LLM_WORKERS", "3")))
+        if len(batches) > 1 and llm_workers > 1:
+            active_llm_workers = min(llm_workers, len(batches))
+            print(f"   ⚡ Scoring {len(batches)} window batches across {active_llm_workers} parallel AI workers...")
+            batch_results = [None] * len(batches)
+            batch_costs = [[] for _ in range(len(batches))]
+
+            def _score_batch(idx, ws_batch):
+                local_costs = []
+                res = _run_stage_split(
+                    client, model_name, ws_batch, _score_prompt,
+                    gemini_worker.ScoreResponse, "windows", local_costs, "score"
+                )
+                return idx, res, local_costs
+
+            with ThreadPoolExecutor(max_workers=active_llm_workers) as score_pool:
+                futs = [score_pool.submit(_score_batch, idx, ws_batch) for idx, ws_batch in enumerate(batches)]
+                for fut in as_completed(futs):
+                    idx, res, local_costs = fut.result()
+                    batch_results[idx] = res
+                    batch_costs[idx] = local_costs
+
+            for res in batch_results:
+                if res:
+                    scored.extend(res)
+            for lc in batch_costs:
+                costs.extend(lc)
+        else:
+            for ws_batch in batches:
+                scored.extend(_run_stage_split(
+                    client, model_name, ws_batch, _score_prompt,
+                    gemini_worker.ScoreResponse, "windows", costs, "score"))
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -2352,7 +2381,14 @@ def process_video_pipeline(
         with open(metadata_file, 'w', encoding="utf-8") as f:
             json.dump(clips_data, f, indent=2)
 
-        # 5. Process clips in parallel
+        # 5. Process clips in parallel across multiple workers
+        shorts = clips_data['shorts']
+        default_clip_workers = min(max(os.cpu_count() or 4, 4), 8)
+        clip_workers = max(int(os.environ.get("CLIP_WORKERS", str(default_clip_workers))), 1)
+        active_clip_workers = max(1, min(clip_workers, len(shorts)))
+        ffmpeg_threads_per_worker = max(1, (os.cpu_count() or 4) // active_clip_workers)
+        print(f"⚡ Launching {active_clip_workers} parallel clip workers for {len(shorts)} clip(s) ({ffmpeg_threads_per_worker} FFmpeg threads/worker)...")
+
         def _process_one_clip(i, clip):
             start = clip['start']
             end = clip['end']
@@ -2366,6 +2402,7 @@ def process_video_pipeline(
             try:
                 cut_command = [
                     'ffmpeg', '-y',
+                    '-threads', str(ffmpeg_threads_per_worker),
                     '-ss', str(start),
                     '-to', str(end),
                     '-i', input_video,
@@ -2405,9 +2442,7 @@ def process_video_pipeline(
                 if os.path.exists(clip_temp_path):
                     os.remove(clip_temp_path)
 
-        clip_workers = max(int(os.environ.get("CLIP_WORKERS", "4")), 1)
-        shorts = clips_data['shorts']
-        with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
+        with ThreadPoolExecutor(max_workers=active_clip_workers) as pool:
             futures = {pool.submit(_process_one_clip, i, clip): i for i, clip in enumerate(shorts)}
             for future in as_completed(futures):
                 i = futures[future]

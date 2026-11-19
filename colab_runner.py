@@ -63,8 +63,12 @@ def setup_colab_environment(
     os.environ["LLM_MODEL"] = model_name
     os.environ["WHISPER_MODEL"] = whisper_model
     os.environ["YOLO_VERBOSE"] = "False"
-    os.environ["CLIP_WORKERS"] = "4"
-    os.environ["MAX_CONCURRENT_JOBS"] = "2"
+    os.environ["OLLAMA_NUM_PARALLEL"] = "4"
+    os.environ["CLIP_WORKERS"] = str(max(4, min(os.cpu_count() or 4, 8)))
+    os.environ["LLM_WORKERS"] = "3"
+    os.environ["MAX_CONCURRENT_JOBS"] = "4"
+    os.environ["NUM_QUEUE_WORKERS"] = "4"
+    os.environ["FFMPEG_ENCODER"] = "auto"
     os.environ["WHISPER_WORKERS"] = "2"
     os.environ["WHISPER_THREADS"] = "4"
 

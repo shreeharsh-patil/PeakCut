@@ -303,6 +303,8 @@ label.ck input{accent-color:var(--brand);margin:0}
 .lp .tx{min-width:0;flex:1}
 .lp .tx b{display:block;font-size:14px;font-weight:600;color:var(--brand-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lp .tx span{display:block;font-size:12px;color:var(--faint);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lp-title-in{width:100%;height:30px;padding:0 8px;margin-bottom:3px;font-size:13px;font-weight:600;color:var(--brand-ink);background:#fff;border:1px solid var(--line-2);border-radius:7px}
+.lp-title-in:focus{border-color:var(--brand)}
 .lp .ok{flex:none;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:#1F7A4D;background:#E3F4EA;padding:4px 10px;border-radius:999px}
 .lp .ok svg{width:14px;height:14px}
 .lp .ok.live{background:#E5323F;color:#fff}
@@ -581,15 +583,17 @@ a.lnk{color:var(--brand-ink);text-decoration:none;font-weight:600}
 .plan:has(input:focus-visible){outline:2px solid var(--brand);outline-offset:2px}
 
 /* ---------- dialogs + toasts */
-dialog{border:1px solid var(--line);background:#fff;color:var(--text);border-radius:var(--r-lg);padding:0;max-width:calc(100vw - 32px)}
+dialog{border:1px solid var(--line);background:#fff;color:var(--text);border-radius:var(--r-lg);padding:0;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px)}
+#clipdlg{overflow:hidden}
 dialog::backdrop{background:rgba(14,12,11,.42);animation:fadein .16s ease}
 .dlg{padding:24px;width:450px;max-width:100%;display:flex;flex-direction:column;gap:14px}
 .dlg h2{font-size:18px;font-weight:600;color:var(--brand-ink)}
 .dlg-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
-.editor{display:grid;grid-template-columns:minmax(240px,340px) minmax(300px,450px);max-height:calc(100vh - 48px)}
-.editor .stage{background:#17110E;display:grid;place-items:center;position:relative;min-height:320px}
+.editor{display:grid;grid-template-columns:minmax(240px,340px) minmax(320px,460px);height:min(780px,calc(100vh - 48px));max-height:calc(100vh - 48px)}
+.editor .stage{background:#17110E;display:grid;place-items:center;position:relative;min-height:320px;overflow:hidden}
 .editor video,.editor .stage img{width:100%;max-height:calc(100vh - 48px);aspect-ratio:9/16;object-fit:contain;display:block}
-.editor .panel{padding:22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+.editor .panel{padding:22px;min-height:0;max-height:calc(100vh - 48px);overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:14px}
+.editor .panel>*{flex-shrink:0}
 .editor h3{font-size:13px;font-weight:600;color:var(--dim);margin-top:6px}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 #toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:50}
@@ -1466,7 +1470,8 @@ function attach(list) {
     if (f.size > max) { toast(`${f.name} is over the ${S.status.max_upload_mb} MB limit.`, "bad"); continue; }
     if (A.files.some(x => x.file.name === f.name && x.file.size === f.size)) continue;
     if (batchUsed(A) >= batchMax()) { full = true; continue; }
-    A.files.push({id: newId(), file: f, src: URL.createObjectURL(f), dur: 0, state: "ready", pct: 0, err: ""});
+    const cleanTitle = f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim() || f.name;
+    A.files.push({id: newId(), file: f, title: cleanTitle, src: URL.createObjectURL(f), dur: 0, state: "ready", pct: 0, err: ""});
   }
   if (full) toast(`You can send up to ${batchMax()} videos at a time. Start these, then add more.`, "bad");
   drawAtt();
@@ -1474,9 +1479,12 @@ function attach(list) {
 function canGo(A = att()) { return !A.busy && (A.files.length > 0 || A.links.some(l => l.state === "ok")); }
 
 /* one row style for everything: picture on the left, name and details, state on the right */
-function rowHtml(A, {id, kind, thumb, len, title, sub, side, bar}) {
+function rowHtml(A, {id, kind, thumb, len, title, sub, side, bar, editableTitle}) {
+  const titleEl = editableTitle && !A.busy
+    ? `<input class="lp-title-in" type="text" data-ftitle="${id}" value="${esc(title)}" placeholder="Video title…" aria-label="Video title">`
+    : `<b title="${esc(title)}">${esc(title)}</b>`;
   return `<div class="lp" data-row="${id}"><div class="th">${thumb}${len ? `<span class="du">${len}</span>` : ""}</div>
-    <div class="tx"><b title="${esc(title)}">${esc(title)}</b><span>${sub}</span></div>${side || ""}
+    <div class="tx">${titleEl}<span>${sub}</span></div>${side || ""}
     ${A.busy ? "" : `<button type="button" class="rm" data-rm="${kind}" data-id="${id}" aria-label="Remove ${esc(title)}">${ic("x")}</button>`}
     ${bar != null ? `<i class="pbar" style="width:${bar}%"></i>` : ""}</div>`;
 }
@@ -1495,8 +1503,8 @@ function drawAtt() {
       side: l.sending ? `<span class="ok up">Sending</span>` : i.is_live ? `<span class="ok live"><i></i>Live now</span>` : `<span class="ok">${ic("check")}Ready</span>`});
   }).join("");
   h += A.files.map(f => rowHtml(A, {id: f.id, kind: "file", thumb: `<video src="${f.src}#t=1" muted preload="metadata" playsinline></video>`,
-    len: f.dur ? fmtLen(f.dur) : "", title: f.file.name,
-    sub: f.state === "error" ? `<em>${esc(f.err)}</em>` : fmtSize(f.file.size) + " · uploaded file",
+    len: f.dur ? fmtLen(f.dur) : "", title: f.title || f.file.name, editableTitle: true,
+    sub: f.state === "error" ? `<em>${esc(f.err)}</em>` : `${esc(f.file.name)} · ${fmtSize(f.file.size)}`,
     side: f.state === "up" ? `<span class="ok up">${f.pct < 100 ? f.pct + "%" : "Starting"}</span>` : f.state === "error" ? "" : `<span class="ok">${ic("check")}Ready</span>`,
     bar: f.state === "up" ? f.pct : null})).join("");
   const n = batchUsed(A);
@@ -1554,6 +1562,7 @@ function onLink(input) {
   linkTimer = setTimeout(() => { if (input.value.trim() === raw) takeLink(A, u, input); }, 900);   // other link shapes: take it once typing stops
 }
 document.addEventListener("input", e => { if (e.target.id === "url") onLink(e.target);
+  if (e.target.dataset?.ftitle) { const f = att().files.find(x => x.id === e.target.dataset.ftitle); if (f) f.title = e.target.value; }
   if (e.target.closest?.("#cform") && e.target.dataset.k && !/checkbox|radio/.test(e.target.type)) dirty(true); });
 document.addEventListener("keydown", e => { if (e.target.id === "url" && e.key === "Enter" && e.target.value.trim() && looksLink(e.target.value.trim())) { e.preventDefault(); clearTimeout(linkTimer); takeLink(att(), e.target.value.trim(), e.target); } });
 document.addEventListener("click", e => {
@@ -1568,7 +1577,7 @@ document.addEventListener("click", e => {
 // and a piece that fails is simply sent again. The bar shows the whole file.
 async function sendBig(f, who) {
   const file = f.file;
-  const s = await send("/api/upload/start", {name: file.name, size: file.size, options: jobOptions(), creator: who});
+  const s = await send("/api/upload/start", {name: file.name, title: f.title || file.name, size: file.size, options: jobOptions(), creator: who});
   const sent = new Array(s.parts).fill(0);
   const show = () => { f.pct = Math.min(99, Math.round(sent.reduce((a, b) => a + b, 0) / file.size * 100)); drawAtt(); };
   const put = i => new Promise((ok, fail) => {
@@ -1609,7 +1618,7 @@ function sendFile(f, who) {
   if (S.status.upload_part_mb && f.file.size > S.status.upload_part_mb * 1048576) return sendBig(f, who);
   return new Promise((ok, fail) => {
     const x = new XMLHttpRequest(), fd = new FormData();
-    fd.append("file", f.file); fd.append("options", JSON.stringify(jobOptions())); fd.append("creator", who);
+    fd.append("file", f.file); fd.append("title", f.title || f.file.name); fd.append("options", JSON.stringify(jobOptions())); fd.append("creator", who);
     x.open("POST", "/api/upload");
     x.upload.onprogress = e => { if (e.lengthComputable) { f.pct = Math.round(e.loaded / e.total * 100); drawAtt(); } };
     x.onload = () => {
@@ -1643,7 +1652,8 @@ async function makeClips() {
   const who = targetCreator(), opts = jobOptions();
   for (const l of A.links.filter(x => x.state === "ok")) {
     l.sending = true; drawAtt();
-    try { await send("/api/jobs", {url: l.url, options: opts, creator: who, title: l.info?.title}); l.state = "done"; started++; }
+    const info = l.info || {};
+    try { await send("/api/jobs", {url: l.url, options: opts, creator: who, title: info.title || "", uploader: info.uploader || "", duration: info.duration || 0, thumb: info.thumb || ""}); l.state = "done"; started++; }
     catch (e) { l.state = "bad"; l.msg = e.message; failed++; }
     l.sending = false; drawAtt();
   }
@@ -1728,7 +1738,7 @@ function jobHtml(j) {
   const who = !creatorId() && j.creator ? S.creators.find(c => c.id === j.creator)?.name : "";
   const meta = [who, j.uploader, j.duration ? fmt(j.duration) + " long" : "", j.clips.length ? j.clips.length + (j.clips.length === 1 ? " clip" : " clips") : "",
                 j.took ? "made in " + fmt(j.took) : "", j.kind === "live" ? "recording, " + j.stage.toLowerCase() : ""].filter(Boolean).map(esc).join(" · ");
-  const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
+  const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : j.thumb_url ? `<img src="${esc(j.thumb_url)}" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
       <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
@@ -2113,24 +2123,29 @@ function drawClipDlg(full) {
     : c.status === "error" ? `<div class="err" style="padding:20px;text-align:center">${esc(c.error || "Could not make this clip.")}</div>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   if (full) {
+    const clipTitle = c.title || c.hook || "Viral Short";
+    const clipHook = c.hook || c.title || "";
+    const clipDesc = c.description || "";
     dlg.innerHTML = `<div class="editor"><div class="stage" id="stage">${stage}</div>
       <div class="panel">
         <div class="job-head" style="margin:0"><div><span class="badge ${scoreCls(c.score)}" style="position:static">${c.judges ? "Words " + c.judges.words + (c.judges.reaction ? " · Reaction " + c.judges.reaction : "") : c.score ? "Score " + c.score : "Clipped by hand"}</span>
           <p class="sub" style="margin-top:8px">${esc(c.reason || "")}</p></div><button class="btn icon ghost" data-act="closedlg" aria-label="Close">${ic("x")}</button></div>
+        <h3>Post text</h3>
+        <label class="f">Title<input data-f="title" value="${esc(clipTitle)}" placeholder="YouTube Shorts title…"></label>
+        <label class="f">Description<textarea data-f="description" rows="2" placeholder="Caption and hashtags…">${esc(clipDesc)}</textarea></label>
         <h3>On the video</h3>
-        <label class="f">Big text<input data-f="hook" value="${esc(c.hook)}"></label>
+        <label class="f">Big text<input data-f="hook" value="${esc(clipHook)}" placeholder="On-screen hook text…"></label>
         <div class="two"><label class="f">Caption style<select data-f="style">${opts(S.status.styles, c.style)}</select></label>
           <label class="f">Layout<select data-f="layout">${opts(S.status.layouts, c.layout)}</select></label></div>
         <div class="two"><label class="f">Start (seconds)<input data-f="start" type="number" step="0.5" value="${c.start}"></label>
           <label class="f">End (seconds)<input data-f="end" type="number" step="0.5" value="${c.end}"></label></div>
-        <h3>Post text</h3>
-        <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
-        <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
-        <button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>
+        <button class="btn" data-act="remake">${ic("scissors")}Save edits</button>
         <h3>Post it</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
-        ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
-          <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
+        ${S.accounts.length ? `<div class="row">${S.accounts.map((a, idx) => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}" ${idx === 0 ? "checked" : ""}>${esc(a.label || a.platform || "Social")} · ${esc(a.name)}</label>`).join("")}</div>
+          <div class="two"><label class="f">Privacy<select id="post_privacy"><option value="private" selected>Private (safe)</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label>
+            <label class="f">Schedule time (optional)<input id="post_publish_at" type="datetime-local"></label></div>
+          <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Schedule / Queue</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
         <div class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)">
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
@@ -2411,14 +2426,23 @@ document.addEventListener("click", async e => {
     }
     if (a === "remake") {
       const body = {}; $$("#clipdlg [data-f]").forEach(i => body[i.dataset.f] = i.type === "number" ? Number(i.value) : i.value);
-      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
+      await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Saved clip edits", "ok"); return tick();
     }
     if (a === "postnow" || a === "postqueue") {
       const accs = $$("#clipdlg [data-pacc]:checked").map(i => i.value);
       if (!accs.length) return toast("Tick at least one account first.", "bad");
-      if (a === "postnow" && !await ask("Post now?", `This clip goes to ${accs.length} account${accs.length > 1 ? "s" : ""} straight away.`, "Post now")) return;
-      await send("/api/posts", {job:D.jid, clip:D.cid, accounts:accs, now:a === "postnow"});
-      toast(a === "postnow" ? "Posting now" : "Added to the queue", "ok"); return tick();
+      const title = $('#clipdlg [data-f="title"]')?.value?.trim() || "";
+      const description = $('#clipdlg [data-f="description"]')?.value?.trim() || "";
+      const privacy = $("#post_privacy")?.value || "private";
+      const publish_at = $("#post_publish_at")?.value || "";
+      if (a === "postnow" && !await ask("Post now?", `This clip goes to ${accs.length} account${accs.length > 1 ? "s" : ""} (${privacy}) straight away.`, "Post now")) return;
+      const res = await send("/api/posts", {job:D.jid, clip:D.cid, accounts:accs, now:a === "postnow", title, description, privacy, publish_at});
+      if (accs.includes("yt_main") && res && res.youtube_ready === false) {
+        toast("Queued in dry-run mode — add YouTube OAuth keys in .env or Settings → Connected apps to upload live.", "ok");
+      } else {
+        toast(a === "postnow" ? "Posting now" : "Scheduled in publishing queue", "ok");
+      }
+      return tick();
     }
   } catch (err) { b.disabled = false; toast(err.message, "bad"); }
 });
