@@ -113,10 +113,10 @@ def setup_colab_environment(
 
     # 4. System dependencies (Linux / Colab)
     if sys.platform.startswith("linux"):
-        print("📦 Verifying system packages (ffmpeg, fonts)...")
+        print("📦 Verifying system packages (ffmpeg, fonts, zstd)...")
         try:
             subprocess.run(
-                "apt-get update -qq && apt-get install -y -qq ffmpeg libsm6 libxext6 libgl1 fonts-freefont-ttf fonts-dejavu-core",
+                "apt-get update -qq && apt-get install -y -qq ffmpeg libsm6 libxext6 libgl1 fonts-freefont-ttf fonts-dejavu-core zstd curl",
                 shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except Exception:
@@ -125,36 +125,65 @@ def setup_colab_environment(
     # 5. Local Ollama Engine Setup on GPU
     ollama_ready = False
     if sys.platform.startswith("linux"):
-        ollama_bin = shutil.which("ollama")
-        if not ollama_bin and not os.path.exists("/usr/local/bin/ollama"):
+        ollama_bin = shutil.which("ollama") or (
+            "/usr/local/bin/ollama" if os.path.exists("/usr/local/bin/ollama") else
+            "/usr/bin/ollama" if os.path.exists("/usr/bin/ollama") else None
+        )
+
+        if not ollama_bin:
             print("🦙 Installing Ollama local inference engine...")
             try:
-                subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
+                # OLLAMA_NO_START=1 skips systemd service config (which fails in containers/Colab)
+                subprocess.run("OLLAMA_NO_START=1 curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
             except Exception as e:
-                print(f"⚠️ Ollama install failed ({e}). Virality heuristic engine will be used.")
+                print(f"⚠️ Primary Ollama install notice: {e}. Trying direct binary archive...")
+                try:
+                    subprocess.run("curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.zst | zstd -d | tar -xf - -C /usr", shell=True, check=True)
+                except Exception as ex2:
+                    print(f"⚠️ Direct Ollama binary extract notice: {ex2}")
 
-        # Start background server if not already running
-        try:
-            import httpx
-            with httpx.Client(timeout=2.0) as client:
-                res = client.get("http://127.0.0.1:11434/api/tags")
-                ollama_ready = (res.status_code == 200)
-        except Exception:
-            ollama_ready = False
+            # Re-check binary location
+            ollama_bin = shutil.which("ollama") or (
+                "/usr/local/bin/ollama" if os.path.exists("/usr/local/bin/ollama") else
+                "/usr/bin/ollama" if os.path.exists("/usr/bin/ollama") else None
+            )
 
-        if not ollama_ready:
-            print("🚀 Starting local Ollama server...")
-            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(3)
+        if ollama_bin:
+            # Check if server is already responding
+            try:
+                import httpx
+                with httpx.Client(timeout=1.5) as client:
+                    res = client.get("http://127.0.0.1:11434/api/tags")
+                    ollama_ready = (res.status_code == 200)
+            except Exception:
+                ollama_ready = False
 
-        # Pull model (stored persistently in Google Drive if mounted)
-        print(f"📦 Loading {model_name} onto NVIDIA GPU (from Drive cache if available)...")
-        try:
-            subprocess.run(["ollama", "pull", model_name], check=True)
-            ollama_ready = True
-            print(f"✅ Local model {model_name} is active on GPU with ZERO external API calls!")
-        except Exception as e:
-            print(f"⚠️ Could not pull {model_name} ({e}). Virality heuristic engine active as fallback.")
+            if not ollama_ready:
+                print(f"🚀 Starting local Ollama server ({ollama_bin})...")
+                subprocess.Popen([ollama_bin, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(30):
+                    try:
+                        import httpx
+                        with httpx.Client(timeout=1.0) as client:
+                            res = client.get("http://127.0.0.1:11434/api/tags")
+                            if res.status_code == 200:
+                                ollama_ready = True
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+
+            if ollama_ready:
+                print(f"📦 Loading {model_name} onto NVIDIA GPU (from Drive cache if available)...")
+                try:
+                    subprocess.run([ollama_bin, "pull", model_name], check=True)
+                    print(f"✅ Local model {model_name} is active on GPU with ZERO external API calls!")
+                except Exception as e:
+                    print(f"⚠️ Could not pull {model_name} ({e}). Virality heuristic engine active as fallback.")
+            else:
+                print("ℹ️ Ollama server starting in background. Heuristic Virality Engine available as fallback.")
+        else:
+            print("ℹ️ Local Ollama binary not found. PeakCut's heuristic Virality Engine active (zero API keys required).")
 
     # Render rich HTML status if in notebook
     try:
