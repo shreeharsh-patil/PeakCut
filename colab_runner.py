@@ -96,10 +96,13 @@ def setup_colab_environment(
             from google.colab import drive
             print("📁 Connecting Google Drive for persistent storage...")
             drive.mount("/content/drive")
+            drive_upload_dir = "/content/drive/MyDrive/PeakCut_Shorts/uploads"
             os.makedirs(drive_model_dir, exist_ok=True)
             os.makedirs(drive_output_dir, exist_ok=True)
+            os.makedirs(drive_upload_dir, exist_ok=True)
             os.environ["OLLAMA_MODELS"] = drive_model_dir
             os.environ["OUTPUT_DIR"] = drive_output_dir
+            os.environ["UPLOAD_DIR"] = drive_upload_dir
             drive_mounted = True
             print(f"✅ Google Drive connected! Models: {drive_model_dir} | Output: {drive_output_dir}")
         except Exception as e:

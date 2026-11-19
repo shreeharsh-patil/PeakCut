@@ -35,8 +35,30 @@ import layout_ranges
 load_dotenv()
 
 # Constants
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "output"
+def _resolve_app_output_dir() -> str:
+    explicit = os.environ.get("OUTPUT_DIR")
+    if explicit:
+        os.makedirs(explicit, exist_ok=True)
+        return explicit
+    if os.path.exists("/content/drive/MyDrive"):
+        p = "/content/drive/MyDrive/PeakCut_Shorts"
+        os.makedirs(p, exist_ok=True)
+        return p
+    return "output"
+
+def _resolve_app_upload_dir() -> str:
+    explicit = os.environ.get("UPLOAD_DIR")
+    if explicit:
+        os.makedirs(explicit, exist_ok=True)
+        return explicit
+    if os.path.exists("/content/drive/MyDrive"):
+        p = "/content/drive/MyDrive/PeakCut_Shorts/uploads"
+        os.makedirs(p, exist_ok=True)
+        return p
+    return "uploads"
+
+UPLOAD_DIR = _resolve_app_upload_dir()
+OUTPUT_DIR = _resolve_app_output_dir()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -4931,6 +4953,8 @@ class DirectYouTubeUploadRequest(BaseModel):
     privacy_status: Optional[str] = None
     privacyStatus: Optional[str] = None
     privacy: Optional[str] = None
+    publish_at: Optional[str] = None
+    delay_hours: Optional[float] = None
     access_token: Optional[str] = None
 
 @app.post("/api/youtube/upload")
@@ -4986,12 +5010,18 @@ async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Req
             ),
         )
 
+    publish_at = req.publish_at
+    if req.delay_hours and req.delay_hours > 0:
+        from datetime import datetime, timedelta, timezone
+        publish_at = (datetime.now(timezone.utc) + timedelta(hours=req.delay_hours)).isoformat()
+
     try:
         res = upload_youtube_short(
             video_path=file_path,
             title=clip_title or "Short Video",
             description=clip_desc,
             privacy_status=confirmed_privacy,
+            publish_at=publish_at,
             access_token=token,
         )
         return {
@@ -5001,6 +5031,7 @@ async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Req
             "url": res["url"],
             "privacy": res["privacy"],
             "title": res["title"],
+            "publish_at": res.get("publish_at"),
         }
     except (YouTubeAuthError, YouTubeUploadError) as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -47,7 +47,19 @@ DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 WEB_DIR = Path("web")
 BRAND_DIR = WEB_DIR / "brand"
-OUTPUT_DIR = Path("output")
+def _resolve_bridge_output_dir() -> Path:
+    explicit = os.environ.get("OUTPUT_DIR")
+    if explicit:
+        p = Path(explicit)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    if os.path.exists("/content/drive/MyDrive"):
+        p = Path("/content/drive/MyDrive/PeakCut_Shorts")
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return Path("output")
+
+OUTPUT_DIR = _resolve_bridge_output_dir()
 
 _BOOT_TIME = time.time()
 _STATE_VERSION = 1
