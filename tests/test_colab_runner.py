@@ -147,3 +147,76 @@ def test_publish_clip_pure_python(tmp_path):
         assert mock_up.called
         assert mock_up.call_args[1]["privacy_status"] == "unlisted"
         assert mock_up.call_args[1]["publish_at"] is not None
+
+
+def test_peakcut_bridge_ai_status_in_local_mode(monkeypatch):
+    import app as app_module
+    import httpx
+    import asyncio
+
+    monkeypatch.setenv("FORCE_LOCAL_ONLY", "1")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_MODEL", "gemma2:2b")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
+
+    async def _test():
+        transport = httpx.ASGITransport(app=app_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. /api/status must show AI ready without external keys
+            r_stat = await client.get("/api/status")
+            assert r_stat.status_code == 200
+            data_stat = r_stat.json()
+            assert data_stat["ai"]["ready"] is True
+            assert data_stat["ai"]["configured"] is True
+            assert data_stat["ai"]["provider"] == "ollama"
+            assert data_stat["ai"]["model"] == "gemma2:2b"
+
+            # 2. /api/sync must also report ready
+            r_sync = await client.get("/api/sync")
+            assert r_sync.status_code == 200
+            data_sync = r_sync.json()
+            assert data_sync["ai"]["ready"] is True
+            assert data_sync["ai"]["configured"] is True
+            assert data_sync["ai"]["provider"] == "ollama"
+
+            # 3. /api/ai must report ready
+            r_ai = await client.get("/api/ai")
+            assert r_ai.status_code == 200
+            data_ai = r_ai.json()
+            assert data_ai["ready"] is True
+            assert data_ai["provider"] == "ollama"
+
+    asyncio.run(_test())
+
+
+def test_infer_job_stage_and_progress_dynamic():
+    import peakcut_bridge
+
+    # Downloading stage
+    stage, prog = peakcut_bridge._infer_job_stage_and_progress(["📥 Downloading video from YouTube..."])
+    assert "Downloading" in stage
+    assert prog == 0.15
+
+    # Transcription stage
+    stage, prog = peakcut_bridge._infer_job_stage_and_progress(["🎙️  Transcribing video..."])
+    assert "Transcribing" in stage
+    assert prog == 0.35
+
+    # AI clip detection
+    stage, prog = peakcut_bridge._infer_job_stage_and_progress(["get_viral_clips: scoring windows with local model"])
+    assert "viral hooks" in stage or "Gemma" in stage
+    assert prog == 0.50
+
+    # Rendering with ready clips and suppressing YOLO warnings
+    logs = [
+        "🔥 Found 3 clips!",
+        "🎬 Processing Clip 1: 0.0s - 30.0s",
+        "Update Settings with 'yolo settings key=value' 65%",
+        "CLIP_READY 0 clip_1.mp4"
+    ]
+    stage, prog = peakcut_bridge._infer_job_stage_and_progress(logs, ready_files={0: "clip_1.mp4"}, clips_count=3)
+    assert "Rendering" in stage
+    assert "1/3 ready" in stage
+    assert "yolo" not in stage.lower()
+    assert prog > 0.65

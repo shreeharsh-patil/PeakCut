@@ -2405,7 +2405,7 @@ def process_video_pipeline(
                 if os.path.exists(clip_temp_path):
                     os.remove(clip_temp_path)
 
-        clip_workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
+        clip_workers = max(int(os.environ.get("CLIP_WORKERS", "4")), 1)
         shorts = clips_data['shorts']
         with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
             futures = {pool.submit(_process_one_clip, i, clip): i for i, clip in enumerate(shorts)}

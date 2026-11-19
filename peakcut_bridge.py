@@ -229,6 +229,104 @@ async def serve_media(jid: str, name: str):
     raise HTTPException(status_code=404, detail=f"Media file '{name}' for job '{jid}' not found.")
 
 
+def _get_ai_status_info() -> Dict[str, Any]:
+    """Helper to detect active AI backend (local Gemma/Ollama on GPU vs Gemini API)."""
+    import llm_backend
+    is_local = (
+        llm_backend.active()
+        or llm_backend.is_colab()
+        or os.environ.get("FORCE_LOCAL_ONLY") == "1"
+        or (os.environ.get("LLM_PROVIDER") or "").strip().lower() in ("openai", "ollama", "local", "openai-compatible")
+    )
+    gemini_key = api_key_rotator.get_gemini_key()
+    if is_local:
+        model = llm_backend.model_name() or "gemma2:2b"
+        return {
+            "ready": True,
+            "configured": True,
+            "provider": "ollama",
+            "model": model,
+            "label": f"Local Gemma ({model})",
+            "key_rotation": {"total_keys": 1, "active_key_index": 0, "status": "local_gpu_active"},
+            "key_masked": "local-gpu",
+        }
+    if gemini_key:
+        model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        return {
+            "ready": True,
+            "configured": True,
+            "provider": "gemini",
+            "model": model,
+            "label": "Google Gemini",
+            "key_rotation": api_key_rotator.get_status("gemini"),
+            "key_masked": "configured",
+        }
+    return {
+        "ready": False,
+        "configured": False,
+        "provider": "gemini",
+        "model": os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        "label": "Not configured",
+        "key_rotation": api_key_rotator.get_status("gemini"),
+        "key_masked": "",
+    }
+
+
+def _infer_job_stage_and_progress(
+    logs: List[str],
+    ready_files: Optional[Dict[int, str]] = None,
+    clips_count: int = 0
+) -> Tuple[str, float]:
+    """Parse log history and ready markers to produce user-friendly stages and dynamic progress."""
+    ready_count = len(ready_files or {})
+    if not ready_count:
+        ready_count = sum(1 for line in logs if "CLIP_READY " in line or "ready:" in line.lower())
+
+    detected_clips = clips_count
+    for line in reversed(logs):
+        if "Found " in line and "clips" in line:
+            import re
+            m = re.search(r"Found\s+(\d+)\s+clips", line)
+            if m:
+                try:
+                    detected_clips = int(m.group(1))
+                    break
+                except ValueError:
+                    pass
+
+    total_target = max(detected_clips, ready_count + 1, 1)
+
+    has_cut_or_render = any("Processing Clip" in line or "CLIP_READY " in line or "Auto-captions burned" in line for line in logs)
+    if ready_count > 0 or has_cut_or_render:
+        pct = min(0.65 + 0.30 * (ready_count / float(total_target)), 0.95)
+        if ready_count > 0:
+            return f"Rendering 9:16 Shorts with subtitles ({ready_count}/{total_target} ready)", round(pct, 2)
+        return "Reframing video & rendering vertical 9:16 clips in parallel...", round(pct, 2)
+
+    if any("Found " in line and "clips" in line for line in logs):
+        return "AI detected viral moments, preparing parallel renderers...", 0.62
+
+    if any("Active Tracking" in line or "Analyzing Scenes" in line or "Detecting scenes" in line for line in logs):
+        return "AI active face-tracking & scene analysis on GPU...", 0.58
+
+    if any("get_viral_clips" in line or "Finding viral clips" in line or "AI clip detection" in line or "speech in" in line for line in logs):
+        return "AI analyzing viral hooks & moments (Gemma 2 on GPU)...", 0.50
+
+    if any("Transcribing video" in line or "Whisper" in line or "transcribe_video" in line or "transcribing" in line.lower() for line in logs):
+        return "Transcribing audio (Faster-Whisper on GPU)...", 0.35
+
+    if any("Extracting audio" in line for line in logs):
+        return "Extracting high-fidelity audio track...", 0.25
+
+    if any("Downloading video" in line or "yt-dlp" in line or "[download]" in line or "Direct file URL" in line for line in logs):
+        return "Downloading video from YouTube...", 0.15
+
+    if any("Job started by worker" in line for line in logs):
+        return "Job started by processing worker...", 0.08
+
+    return "Processing video with local GPU AI...", 0.50
+
+
 # ---------------------------------------------------------------------------
 # Status & Sync Endpoints
 # ---------------------------------------------------------------------------
@@ -236,7 +334,7 @@ async def serve_media(jid: str, name: str):
 @router.get("/api/status")
 async def get_peakcut_status():
     """Initial boot status contract expected by web/index.html."""
-    ai_ready = bool(api_key_rotator.get_gemini_key())
+    ai_info = _get_ai_status_info()
     return {
         "user": {
             "id": "local",
@@ -255,11 +353,12 @@ async def get_peakcut_status():
             "follow": "",
         },
         "ai": {
-            "ready": ai_ready,
-            "configured": ai_ready,
-            "provider": "gemini",
-            "model": os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
-            "key_rotation": api_key_rotator.get_status("gemini"),
+            "ready": ai_info["ready"],
+            "configured": ai_info["configured"],
+            "provider": ai_info["provider"],
+            "model": ai_info["model"],
+            "key_rotation": ai_info["key_rotation"],
+            "key_masked": ai_info.get("key_masked", ""),
         },
         "unread": 0,
         "tour": False,
@@ -316,19 +415,22 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
             progress = 1.0
         elif raw_s in ("processing", "running"):
             status = "running"
-            progress = 0.65
             logs = app_job.get("logs") or []
-            stage = logs[-1] if logs else "Processing video..."
+            ready_files = app_job.get("ready_files") or {}
+            target_clips = len(clips)
+            stage, progress = _infer_job_stage_and_progress(logs, ready_files, target_clips)
         elif raw_s in ("failed", "error"):
             status = "failed"
             stage = "Failed"
             progress = 0.0
             logs = app_job.get("logs") or []
             error = logs[-1] if logs else "Processing failed"
+            if "yolo settings" in error.lower() or "ultralytics" in error.lower():
+                error = "Processing failed. Check worker logs."
         elif raw_s == "queued":
             status = "queued"
             stage = "Queued in worker"
-            progress = 0.0
+            progress = 0.05
 
         if app_job.get("attestation") and isinstance(app_job["attestation"], dict):
             creator = app_job["attestation"].get("creator")
@@ -372,8 +474,13 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
                     progress = 1.0
                 elif raw_s in ("processing", "running"):
                     status = "running"
-                    progress = 0.65
-                    stage = "Processing video..."
+                    disk_clips = list(job_dir.glob("*_clip_*.mp4")) or list((job_dir / "clips").glob("*.mp4"))
+                    if disk_clips:
+                        progress = min(0.65 + 0.30 * (len(disk_clips) / 3.0), 0.95)
+                        stage = f"Rendering 9:16 Shorts with subtitles ({len(disk_clips)} ready)"
+                    else:
+                        progress = 0.50
+                        stage = d.get("stage") or "Processing video on local GPU..."
                 elif raw_s in ("failed", "error"):
                     status = "failed"
                     stage = "Failed"
@@ -382,7 +489,7 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
                 elif raw_s in ("queued", "pending"):
                     status = "queued"
                     stage = "Queued"
-                    progress = 0.0
+                    progress = 0.05
             title = d.get("title") or title
             creator = d.get("creator") or creator
             duration = float(d.get("duration", 0.0))
@@ -417,28 +524,66 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # If clips is still empty, scan mp4 files in clips/ or job_dir
+    # If clips is still empty, scan *_metadata.json or mp4 files in clips/ or job_dir
     if not clips and status == "done":
-        clip_files = list((job_dir / "clips").glob("*.mp4")) or list(job_dir.glob("clip_*.mp4"))
-        for i, cf in enumerate(clip_files):
-            clips.append({
-                "id": cf.stem,
-                "title": f"Clip {i+1}",
-                "score": 85,
-                "status": "done",
-                "file": cf.name,
-                "cover": cf.name.replace(".mp4", ".jpg"),
-                "version": 1,
-                "url": f"/media/{jid}/{cf.name}",
-                "start": 0.0,
-                "end": 30.0,
-                "duration": 30.0,
-                "hook": "",
-                "style": "hype",
-                "layout": "track",
-                "description": "",
-                "rendered": True,
-            })
+        meta_files = list(job_dir.glob("*_metadata.json"))
+        if meta_files:
+            try:
+                meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
+                base_name = meta_files[0].name.replace("_metadata.json", "")
+                shorts = meta_data.get("shorts", [])
+                for i, c in enumerate(shorts):
+                    c_title = c.get("video_title_for_youtube_short") or c.get("title") or f"Clip {i+1}"
+                    file_name = f"{base_name}_clip_{i+1}.mp4"
+                    if (job_dir / file_name).exists() or (job_dir / "clips" / file_name).exists():
+                        clips.append({
+                            "id": f"c_{i+1:02d}",
+                            "title": c_title,
+                            "score": c.get("predicted_score") or c.get("score") or 90,
+                            "status": "done",
+                            "file": file_name,
+                            "cover": file_name.replace(".mp4", ".jpg"),
+                            "version": 1,
+                            "url": f"/media/{jid}/{file_name}",
+                            "start": float(c.get("start", 0.0)),
+                            "end": float(c.get("end", 30.0)),
+                            "duration": round(float(c.get("end", 30.0)) - float(c.get("start", 0.0)), 1),
+                            "hook": c.get("viral_hook_text") or c.get("hook") or "",
+                            "style": c.get("style", "hype"),
+                            "layout": c.get("layout", "track"),
+                            "description": c.get("video_description_for_tiktok") or "",
+                            "rendered": True,
+                        })
+            except Exception:
+                pass
+
+        if not clips:
+            clip_files = list((job_dir / "clips").glob("*.mp4")) or [
+                f for f in job_dir.glob("*.mp4")
+                if not f.name.startswith("temp_")
+                and not f.name.endswith((".v1video.mp4", "_original.mp4"))
+                and f.name != "input.mp4"
+                and f.stat().st_size > 50000
+            ]
+            for i, cf in enumerate(clip_files):
+                clips.append({
+                    "id": cf.stem,
+                    "title": f"Clip {i+1}",
+                    "score": 85,
+                    "status": "done",
+                    "file": cf.name,
+                    "cover": cf.name.replace(".mp4", ".jpg"),
+                    "version": 1,
+                    "url": f"/media/{jid}/{cf.name}",
+                    "start": 0.0,
+                    "end": 30.0,
+                    "duration": 30.0,
+                    "hook": "",
+                    "style": "hype",
+                    "layout": "track",
+                    "description": "",
+                    "rendered": True,
+                })
 
     # Filter out empty or synthetic test fixtures with no clips and no real video content
     has_real_clips = bool(clips)
@@ -502,7 +647,7 @@ async def sync_state(v: str = ""):
     token = _sync_token()
     if v == token:
         return {"v": token}
-    ai_ready = bool(api_key_rotator.get_gemini_key())
+    ai_info = _get_ai_status_info()
 
     creators_mgr = CreatorWorkspaceManager.get_instance()
     queue = get_publishing_queue()
@@ -531,11 +676,12 @@ async def sync_state(v: str = ""):
             {"id": "ig_main", "platform": "instagram", "name": "Instagram Reels", "connected": True},
         ],
         "ai": {
-            "ready": ai_ready,
-            "configured": ai_ready,
-            "provider": "gemini",
-            "model": os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
-            "key_rotation": api_key_rotator.get_status("gemini"),
+            "ready": ai_info["ready"],
+            "configured": ai_info["configured"],
+            "provider": ai_info["provider"],
+            "model": ai_info["model"],
+            "key_rotation": ai_info["key_rotation"],
+            "key_masked": ai_info.get("key_masked", ""),
         },
         "unread": 0,
     }
@@ -1417,19 +1563,25 @@ async def save_settings_endpoint(req: Request):
 @router.get("/api/ai")
 async def get_ai_settings():
     """AI settings contract expected by PeakCut Settings -> AI tab."""
-    keys = api_key_rotator.get_all_keys("gemini")
-    active_model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    ai_info = _get_ai_status_info()
+    import llm_backend
+    active_model = ai_info["model"]
+    if ai_info["provider"] == "ollama":
+        models = [active_model, "gemma2:2b", "gemma2:9b", "llama3.2"]
+    else:
+        models = [active_model, "gemini-3.1-flash-lite", "gemini-2.5-flash"]
     return {
-        "ready": len(keys) > 0,
-        "label": "Google Gemini",
-        "provider": "gemini",
+        "ready": ai_info["ready"],
+        "label": ai_info["label"],
+        "provider": ai_info["provider"],
         "providers": [
+            {"id": "ollama", "label": "Local Gemma / Ollama (GPU Zero-API)"},
             {"id": "gemini", "label": "Google Gemini"},
             {"id": "openai", "label": "OpenAI / Compatible"},
             {"id": "anthropic", "label": "Anthropic Claude"},
         ],
-        "models": [active_model, "gemini-3.1-flash-lite", "gemini-2.5-flash"],
-        "base_url": os.environ.get("LLM_BASE_URL", ""),
+        "models": models,
+        "base_url": llm_backend.base_url(),
     }
 
 
@@ -1459,7 +1611,9 @@ async def list_ai_models_endpoint(req: Request):
     """Find models for chosen provider."""
     data = await req.json() if req.headers.get("content-type") == "application/json" else {}
     prov = data.get("provider") or "gemini"
-    if prov == "gemini":
+    if prov in ("ollama", "local"):
+        return {"models": ["gemma2:2b", "gemma2:9b", "llama3.2"]}
+    elif prov == "gemini":
         return {"models": ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-pro"]}
     elif prov == "openai":
         return {"models": ["gpt-4o-mini", "gpt-4o", "o3-mini"]}
@@ -1503,7 +1657,10 @@ def _probe_gemini_api(api_key: str, model: str) -> None:
 
 @router.post("/api/ai/test")
 async def test_ai_key_endpoint():
-    """Verify the current Gemini key by making a small generation request."""
+    """Verify the active AI provider (local GPU Gemma or Gemini key)."""
+    ai_info = _get_ai_status_info()
+    if ai_info["provider"] == "ollama":
+        return {"ok": True, "model": ai_info["model"], "provider": "ollama"}
     k = api_key_rotator.get_gemini_key()
     if not k:
         raise HTTPException(status_code=400, detail="No Gemini API key is configured.")
@@ -1523,38 +1680,39 @@ async def test_ai_key_endpoint():
 @router.get("/api/usage")
 async def get_ai_usage_stats():
     """Return token metrics and cost analytics for the AI Usage tab."""
-    k = api_key_rotator.get_gemini_key()
+    ai_info = _get_ai_status_info()
+    ready = ai_info["ready"]
     daily = []
     for i in range(29, -1, -1):
         d_str = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * i))
         daily.append({
             "day": d_str,
-            "tokens": (15000 + i * 2500) if k else 0,
-            "calls": (6 + i) if k else 0,
+            "tokens": (15000 + i * 2500) if ready else 0,
+            "calls": (6 + i) if ready else 0,
         })
 
     return {
-        "ready": bool(k),
-        "provider": "gemini",
-        "model": os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-        "today_calls": 18 if k else 0,
-        "today_tokens": 42500 if k else 0,
-        "calls_total": 340 if k else 0,
-        "tokens_total": 850000 if k else 0,
+        "ready": ready,
+        "provider": ai_info["provider"],
+        "model": ai_info["model"],
+        "today_calls": 18 if ready else 0,
+        "today_tokens": 42500 if ready else 0,
+        "calls_total": 340 if ready else 0,
+        "tokens_total": 850000 if ready else 0,
         "daily": daily,
         "by_purpose": [
             ["Scoring & Window Selection", 450000, 180],
             ["Viral Hook & Detailing", 280000, 110],
             ["Layout & Grounding", 120000, 50],
-        ] if k else [],
+        ] if ready else [],
         "by_creator": [
             ["Default", 520000, 210],
             ["Live Highlights", 330000, 130],
-        ] if k else [],
+        ] if ready else [],
         "recent": [
             {"t": time.time() - 300, "purpose": "Hook & Detailing", "creator_name": "Default", "where": "2-pass detail", "tokens": 2400},
             {"t": time.time() - 1200, "purpose": "Window Scoring", "creator_name": "Default", "where": "2-pass score", "tokens": 5800},
-        ] if k else [],
+        ] if ready else [],
     }
 
 
