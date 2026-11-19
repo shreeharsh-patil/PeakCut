@@ -882,20 +882,14 @@ def download_youtube_video(url, output_dir="."):
         hd_args = None
     fallback_args = {
         'youtube': {
-            'player_client': ['android_vr', 'ios', 'tv', 'web'],
+            'player_client': ['android', 'android_vr', 'ios', 'web'],
         }
     }
 
-    # Cap at 720p ONLY when the bytes actually go through the PER-GB paid proxy
-    # — that cap exists to control bandwidth cost, and the direct attempt and
-    # the flat-rate static proxies have none.
-    #
-    # This is per-attempt on purpose. Deciding it once from `_proxy` capped the
-    # DIRECT attempt too, so with DIRECT_FIRST=1 (which serves most downloads)
-    # every YouTube source arrived at 720p and, since the reframe inherits the
-    # source height, 80% of delivered clips came out 406x720 (audited 25-jul-2026).
+    # Cap at 720p when requested via VIDEO_QUALITY=720 OR when bytes go through a PER-GB paid proxy.
+    _req_quality = int(os.environ.get("VIDEO_QUALITY", "0") or "0")
     def _hd_fmt_for(capped):
-        if capped:
+        if capped or (0 < _req_quality <= 720):
             return ('bestvideo[vcodec^=avc1][height<=720][ext=mp4]+bestaudio[ext=m4a]/'
                     'bestvideo[vcodec^=avc1][height<=720]+bestaudio/'
                     'best[height<=720][ext=mp4]/best[height<=720]/best')
@@ -905,12 +899,11 @@ def download_youtube_video(url, output_dir="."):
     fallback_fmt = 'best[ext=mp4]/best'
 
     def _base_opts(extractor_args, proxy):
-        return {
+        opts = {
             'quiet': False, 'verbose': True, 'no_warnings': False,
             'cookiefile': cookies_path if cookies_path else None,
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
             'nocheckcertificate': True, 'cachedir': False,
-            'extractor_args': extractor_args,
             'http_headers': {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -918,6 +911,9 @@ def download_youtube_video(url, output_dir="."):
                 ),
             },
         }
+        if extractor_args:
+            opts['extractor_args'] = extractor_args
+        return opts
 
     # Wire bytes actually pulled through the (paid) proxy, summed across
     # fragments/streams. Reported to app.py via the PROXY_BYTES= line below.
@@ -937,7 +933,8 @@ def download_youtube_video(url, output_dir="."):
     def _attempt(extractor_args, fmt, proxy):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
-        with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy)) as ydl:
+        info_opts = {**_base_opts(extractor_args, proxy), 'format': fmt}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
         expected = os.path.join(output_dir, f'{sanitized}.mp4')
@@ -1001,6 +998,60 @@ def download_youtube_video(url, output_dir="."):
                 else:
                     err = res.stderr.decode('utf-8', errors='ignore') if res.stderr else "unknown error"
                     print(f"⚠️ FFmpeg stream capture warning ({err[:150]}), falling back to yt-dlp...")
+
+        # Smart Range Slicing: honour explicit RANGE_START / RANGE_END, OR automatically
+        # slice ultra-long VODs (>40 min, e.g. 10-hour streams) to a fast 20-min window
+        # so Colab/local disks never fill up with 15+ GB downloads.
+        vid_dur = float(info.get("duration") or 0.0)
+        env_r_start = os.environ.get("RANGE_START", "").strip()
+        env_r_end = os.environ.get("RANGE_END", "").strip()
+        max_vod_sec = int(os.environ.get("MAX_VOD_DOWNLOAD_SECONDS", "1200"))
+        slice_start = None
+        slice_dur = None
+
+        if not is_live and (env_r_start or env_r_end):
+            s_val = max(0.0, float(env_r_start)) if env_r_start else 0.0
+            e_val = float(env_r_end) if env_r_end else (vid_dur if vid_dur > s_val else s_val + max(max_vod_sec, 1200))
+            if e_val > s_val + 5:
+                slice_start = s_val
+                slice_dur = e_val - s_val
+        elif not is_live and max_vod_sec > 0 and vid_dur > max(2400.0, max_vod_sec * 1.5):
+            # Auto-slice multi-hour VODs: prefer peak YouTube heatmap moment if available,
+            # else start at 10m (past typical "Starting Soon" screen)
+            hm = info.get("heatmap") or []
+            if hm:
+                peak = max(hm, key=lambda x: x.get("value", 0))
+                slice_start = max(0.0, float(peak.get("start_time", 600.0)) - max_vod_sec * 0.25)
+            else:
+                slice_start = min(600.0, max(0.0, vid_dur - max_vod_sec))
+            slice_dur = min(float(max_vod_sec), max(60.0, vid_dur - slice_start))
+            print(
+                f"⚡ Long VOD detected ({vid_dur/3600:.1f}h) — smart-slicing "
+                f"{int(slice_start)}s–{int(slice_start + slice_dur)}s ({int(slice_dur/60)} min) "
+                f"to keep download fast and under disk limits."
+            )
+
+        if slice_start is not None and slice_dur is not None and slice_dur > 0:
+            reqs = info.get("requested_formats") or ([info] if info.get("url") else [])
+            stream_items = [rf for rf in reqs if isinstance(rf, dict) and rf.get("url")]
+            if stream_items:
+                ff_cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+                for rf in stream_items:
+                    hdrs = rf.get("http_headers") or info.get("http_headers") or {}
+                    ua = hdrs.get("User-Agent")
+                    if ua:
+                        ff_cmd.extend(["-user_agent", ua])
+                    ff_cmd.extend(["-ss", str(slice_start), "-t", str(slice_dur), "-i", rf["url"]])
+                if len(stream_items) >= 2:
+                    ff_cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
+                ff_cmd.extend(["-c", "copy", "-movflags", "+faststart", expected])
+                res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if res.returncode == 0 and os.path.exists(expected) and os.path.getsize(expected) > 50000:
+                    mb = os.path.getsize(expected) / (1024 * 1024)
+                    print(f"✅ Smart VOD slice captured: {os.path.basename(expected)} ({mb:.1f} MB)")
+                    return sanitized
+                err = res.stderr.decode("utf-8", errors="ignore") if res.stderr else "unknown error"
+                raise RuntimeError(f"FFmpeg slice download failed ({err[:180]})")
 
         dl_opts = {
             **_base_opts(extractor_args, proxy),

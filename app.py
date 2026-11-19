@@ -2697,11 +2697,22 @@ def start_job_process_background(
         env["CLIP_TARGET_MIN"] = str(opts["max_clips"])
         env["CLIP_TARGET_MAX"] = str(opts["max_clips"])
         cmd.extend(["--target-clips", str(opts["max_clips"])])
+    if opts.get("quality"):
+        env["VIDEO_QUALITY"] = str(opts["quality"])
+    if opts.get("range_start") is not None:
+        env["RANGE_START"] = str(opts["range_start"])
+    if opts.get("range_end") is not None:
+        env["RANGE_END"] = str(opts["range_end"])
 
     if url:
         from security_utils import normalize_media_url
         url = normalize_media_url(url)
-        cmd.extend(["-u", url, "--keep-original"])
+        is_colab_env = os.environ.get("IS_COLAB") == "1" or os.path.exists("/content/drive")
+        if is_colab_env:
+            # Never bloat Google Drive with multi-GB raw source downloads
+            cmd.extend(["-u", url])
+        else:
+            cmd.extend(["-u", url, "--keep-original"])
     elif file_path and os.path.exists(file_path):
         cmd.extend(["-i", file_path])
     else:
