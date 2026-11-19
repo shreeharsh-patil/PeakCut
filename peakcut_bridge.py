@@ -116,8 +116,9 @@ def _extract_youtube_id(url: str) -> Optional[str]:
     if not url:
         return None
     m = re.search(
-        r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
+        r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|video/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
         url,
+        flags=re.IGNORECASE,
     )
     if m:
         return m.group(1)
@@ -125,28 +126,91 @@ def _extract_youtube_id(url: str) -> Optional[str]:
     return bare.group(1) if bare else None
 
 
+def _is_youtube_homepage_or_invalid(url: str) -> bool:
+    """Return True if a YouTube URL points to the homepage/empty watch page with no video/channel target."""
+    from urllib.parse import urlparse
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if not host.endswith(("youtube.com", "youtu.be")):
+        return False
+    if _extract_youtube_id(url):
+        return False
+    path = (parsed.path or "").strip("/").lower()
+    if not path or path in ("watch", "shorts", "live", "feed", "feed/subscriptions", "results"):
+        return True
+    return False
+
+
+def _resolve_youtube_special_id(url: str, timeout: float = 5.0) -> Optional[str]:
+    """Extract a real 11-char YouTube videoId from /@handle/live or /clip/... pages."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read(512_000).decode("utf-8", errors="ignore")
+        for pat in (
+            r'<link\s+rel="canonical"\s+href="https://www\.youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})"',
+            r'"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"',
+        ):
+            m = re.search(pat, html)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_youtube_oembed(video_id: str, timeout: float = 4.0) -> Dict[str, Any]:
-    """Fast, bot-proof YouTube metadata lookup via public oEmbed API."""
+    """Fast, bot-proof YouTube metadata lookup (YouTube oEmbed -> NoEmbed -> Watch meta tags)."""
+    import html as _html
     import urllib.parse
     import urllib.request
 
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(watch_url, safe='')}&format=json"
-    req = urllib.request.Request(
-        oembed_url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-    )
+    default_thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+    # 1. Try YouTube official oEmbed, then NoEmbed (third-party proxy — never blocked on Colab/GCP IPs)
+    for endpoint in (
+        f"https://www.youtube.com/oembed?url={urllib.parse.quote(watch_url, safe='')}&format=json",
+        f"https://noembed.com/embed?url={urllib.parse.quote(watch_url, safe='')}",
+    ):
+        try:
+            req = urllib.request.Request(endpoint, headers=ua)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    title = (data.get("title") or "").strip()
+                    if title and title.lower() not in ("youtube", "video", "error"):
+                        return {
+                            "title": _html.unescape(title),
+                            "uploader": _html.unescape((data.get("author_name") or "").strip()),
+                            "thumb": (data.get("thumbnail_url") or default_thumb).strip(),
+                        }
+        except Exception as exc:
+            logger.debug(f"oEmbed lookup notice ({endpoint[:32]}): {exc}")
+
+    # 2. Fallback: scrape watch page meta tags directly
     try:
+        req = urllib.request.Request(watch_url, headers=ua)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                return {
-                    "title": (data.get("title") or "").strip(),
-                    "uploader": (data.get("author_name") or "").strip(),
-                    "thumb": (data.get("thumbnail_url") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg").strip(),
-                }
-    except Exception as exc:
-        logger.debug(f"YouTube oEmbed lookup notice for {video_id}: {exc}")
+            page = resp.read(256_000).decode("utf-8", errors="ignore")
+        tm = re.search(r'<meta\s+(?:property="og:title"|name="title")\s+content="([^"]+)"', page)
+        im = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', page)
+        am = re.search(r'<link\s+itemprop="name"\s+content="([^"]+)"', page)
+        title = _html.unescape(tm.group(1)).strip() if tm else ""
+        if title and title.lower() not in ("youtube", "video"):
+            return {
+                "title": title,
+                "uploader": _html.unescape(am.group(1)).strip() if am else "YouTube",
+                "thumb": (im.group(1).strip() if im else default_thumb),
+            }
+    except Exception:
+        pass
+
     return {}
 
 
@@ -183,7 +247,7 @@ def _looks_like_raw_url_title(title: str) -> bool:
         return True
     return (
         t.startswith(("watch?v=", "http://", "https://", "shorts/", "live/"))
-        or t in ("new video job", "video", "video link")
+        or t in ("new video job", "video", "video link", "youtube", "home", "watch")
     )
 
 
@@ -338,7 +402,11 @@ async def serve_peakcut_app(rest: str = ""):
     index_file = WEB_DIR / "index.html"
     if not index_file.exists():
         raise HTTPException(status_code=404, detail="PeakCut Web UI index.html not found.")
-    return FileResponse(index_file, media_type="text/html")
+    return FileResponse(
+        index_file,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @router.get("/landing")
@@ -1187,13 +1255,28 @@ async def preview_channel(url: str):
 
 @router.get("/api/preview")
 async def preview_video_endpoint(url: str):
-    """Fast, non-blocking video metadata & thumbnail detection (oEmbed + yt-dlp)."""
+    """Fast, non-blocking video metadata & thumbnail detection (oEmbed + NoEmbed + yt-dlp)."""
     u = url.strip()
     if not u:
         raise HTTPException(status_code=400, detail="Missing video URL.")
     from security_utils import normalize_media_url
     u = normalize_media_url(u)
+
+    if _is_youtube_homepage_or_invalid(u):
+        raise HTTPException(
+            status_code=400,
+            detail="That's the YouTube homepage — paste a specific YouTube video, Shorts, or Live link.",
+        )
+
     yt_id = _extract_youtube_id(u)
+    if not yt_id and ("youtube.com/" in u.lower() or "youtu.be/" in u.lower()):
+        # Resolve /@channel/live or /clip/... into its real 11-char videoId
+        try:
+            yt_id = await asyncio.wait_for(asyncio.to_thread(_resolve_youtube_special_id, u, 4.0), timeout=4.5)
+            if yt_id and "/clip/" not in u.lower():
+                u = f"https://www.youtube.com/watch?v={yt_id}"
+        except Exception:
+            yt_id = None
 
     def _yt_dlp_lookup(target_url: str) -> Dict[str, Any]:
         import yt_dlp
@@ -1211,8 +1294,11 @@ async def preview_video_endpoint(url: str):
                 return {}
             thumbs = info.get("thumbnails") or []
             thumb = info.get("thumbnail") or (thumbs[-1].get("url") if thumbs and isinstance(thumbs[-1], dict) else "")
+            raw_title = (info.get("title") or "").strip()
+            if _looks_like_raw_url_title(raw_title):
+                raw_title = ""
             return {
-                "title": (info.get("title") or "").strip(),
+                "title": raw_title,
                 "uploader": (info.get("uploader") or info.get("channel") or info.get("creator") or "").strip(),
                 "duration": float(info.get("duration") or 0.0),
                 "is_live": bool(info.get("is_live") or info.get("live_status") == "is_live"),
@@ -1223,7 +1309,7 @@ async def preview_video_endpoint(url: str):
     ytdlp_info: Dict[str, Any] = {}
 
     if yt_id:
-        # Run bot-proof YouTube oEmbed + yt-dlp concurrently with strict timeouts
+        # Run bot-proof oEmbed/NoEmbed + yt-dlp concurrently with strict timeouts
         oembed_task = asyncio.create_task(asyncio.to_thread(_fetch_youtube_oembed, yt_id, 4.0))
         ytdlp_task = asyncio.create_task(asyncio.to_thread(_yt_dlp_lookup, u))
         try:
@@ -1264,19 +1350,22 @@ async def preview_video_endpoint(url: str):
     except Exception as e:
         logger.warning(f"yt-dlp preview lookup failed for {u}: {e}")
 
-    # Fallback to channel profile or clean URL-derived label
+    # Fallback to channel profile or clean URL-derived label (never return generic "YouTube")
     try:
         prof = await asyncio.wait_for(asyncio.to_thread(fetch_channel_profile, u), timeout=4.0)
     except Exception:
         prof = {}
-    fallback_title = prof.get("name") or _clean_media_title(u.split("?")[0].rstrip("/").split("/")[-1]) or "Video Link"
+    prof_name = (prof.get("name") or "").strip()
+    if _looks_like_raw_url_title(prof_name):
+        prof_name = ""
+    fallback_title = prof_name or _clean_media_title(u.split("?")[0].rstrip("/").split("/")[-1]) or "Video Link"
     return {
         "url": u,
         "title": fallback_title,
-        "uploader": prof.get("name") or "Video Link",
+        "uploader": prof_name or "Online Video",
         "duration": 0.0,
         "is_live": bool(prof.get("is_live", False)),
-        "thumb": prof.get("pic", ""),
+        "thumb": prof.get("avatar_url") or prof.get("pic") or "",
     }
 
 
@@ -1474,6 +1563,11 @@ async def create_job_endpoint(req: Request):
     url = normalize_media_url(raw_url)
     if not url:
         raise HTTPException(status_code=400, detail="Missing or invalid video URL.")
+    if _is_youtube_homepage_or_invalid(url):
+        raise HTTPException(
+            status_code=400,
+            detail="That's the YouTube homepage — paste a specific YouTube video, Shorts, or Live link.",
+        )
 
     options = body.get("options") or {}
     creator = body.get("creator")

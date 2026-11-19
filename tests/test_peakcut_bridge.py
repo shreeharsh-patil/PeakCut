@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 
 import app as app_module
+import peakcut_bridge
 
 
 def _call(method: str, path: str, json_body: dict = None, params: dict = None):
@@ -86,12 +87,12 @@ def test_peakcut_sync_endpoint():
     assert "jobs" in data
     assert "creators" in data
     assert data["ai"]["ready"] == data["ai"]["configured"]
-    token = data["v"]
 
-    # Repeated sync with same token should be lightweight unchanged token
-    resp2 = _call("GET", "/api/sync", params={"v": token})
+    # Repeated sync with current token should be lightweight unchanged response
+    current_token = peakcut_bridge._sync_token()
+    resp2 = _call("GET", "/api/sync", params={"v": current_token})
     assert resp2.status_code == 200
-    assert resp2.json() == {"v": token}
+    assert resp2.json() == {"v": current_token}
 
 
 def test_peakcut_overview_and_load_endpoints():

@@ -41,30 +41,40 @@ def normalize_media_url(raw_url: str) -> str:
     if not s:
         return ""
 
+    # Extract embedded http(s) URL if user pasted share text ("Watch this https://youtu.be/...")
+    embedded = re.search(r"https?://[^\s\"'<>]+", s, flags=re.IGNORECASE)
+    if embedded:
+        s = embedded.group(0)
+
     # Check for bare YouTube video ID (11 chars), possibly with query params (?si=... etc)
     # e.g. BgeNDG5jD60?si=zSjxkinw2zPaaAPH or BgeNDG5jD60
     bare_match = re.match(r"^([a-zA-Z0-9_-]{11})(?:\?.*)?$", s)
     if bare_match:
         return f"https://www.youtube.com/watch?v={bare_match.group(1)}"
 
-    # Check for watch?v=... or /watch?v=... or shorts/... without domain
+    # Check for watch?v=... or /watch?v=... or shorts/... or live/... without domain
     if s.startswith("/watch?v="):
         s = "https://www.youtube.com" + s
     elif s.startswith("watch?v="):
         s = "https://www.youtube.com/" + s
-    elif s.startswith(("/shorts/", "shorts/")):
+    elif s.startswith(("/shorts/", "shorts/", "/live/", "live/", "/embed/", "embed/")):
         s = "https://www.youtube.com/" + s.lstrip("/")
 
     # If scheme is missing (e.g. youtube.com/watch?v=... or youtu.be/...)
     if not s.startswith(("http://", "https://")):
-        if any(s.startswith(prefix) for prefix in (
-            "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-            "twitch.tv", "www.twitch.tv", "kick.com", "www.kick.com"
+        if any(s.lower().startswith(prefix) for prefix in (
+            "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "studio.youtube.com", "youtu.be",
+            "twitch.tv", "www.twitch.tv", "kick.com", "www.kick.com",
+            "tiktok.com", "www.tiktok.com", "instagram.com", "www.instagram.com",
         )):
             s = "https://" + s
 
-    # Canonicalize any youtu.be, /shorts/, /live/, /embed/, /v/
-    yt_match = re.search(r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})", s)
+    # Canonicalize any youtu.be, /shorts/, /live/, /embed/, /v/, studio.youtube.com/video/ID
+    yt_match = re.search(
+        r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|video/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
+        s,
+        flags=re.IGNORECASE,
+    )
     if yt_match:
         return f"https://www.youtube.com/watch?v={yt_match.group(1)}"
 

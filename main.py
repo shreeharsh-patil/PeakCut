@@ -830,10 +830,11 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
+    import tempfile as _tempfile
+    cookies_path = os.path.join(_tempfile.gettempdir(), 'peakcut_cookies.txt')
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
+        print("🍪 Found YOUTUBE_COOKIES env var, creating temporary cookies file...")
         try:
             with open(cookies_path, 'w', encoding="utf-8") as f:
                 f.write(cookies_env)
@@ -881,8 +882,7 @@ def download_youtube_video(url, output_dir="."):
         hd_args = None
     fallback_args = {
         'youtube': {
-            'player_client': ['tv_embed', 'android', 'mweb', 'web'],
-            'player_skip': ['webpage', 'configs'],
+            'player_client': ['android_vr', 'ios', 'tv', 'web'],
         }
     }
 
@@ -1031,6 +1031,10 @@ def download_youtube_video(url, output_dir="."):
         for label, capped, proxy in plan_download_attempts(
             _direct_first, _statics, _proxy, bool(hd_args), youtube=is_youtube_url(url))
     ]
+    # On direct / Google Colab (no proxies or PO-token server), also try default yt-dlp
+    # client selection first for full 1080p/720p format availability before fallback clients.
+    if is_youtube_url(url) and not _proxy and not _statics and not hd_args:
+        attempts.insert(0, ('direct-default', None, _hd_fmt_for(False), None))
     if not is_youtube_url(url):
         print("🌐 Direct file URL: downloading from the server's own IP (no proxy).")
 
