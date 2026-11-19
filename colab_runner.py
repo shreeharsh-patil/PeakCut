@@ -62,6 +62,7 @@ def setup_colab_environment(
     os.environ["LLM_BASE_URL"] = "http://127.0.0.1:11434/v1"
     os.environ["LLM_MODEL"] = model_name
     os.environ["WHISPER_MODEL"] = whisper_model
+    os.environ["YOLO_VERBOSE"] = "False"
 
     for key in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "OPENAI_API_KEY", "OPENAI_API_KEYS"]:
         os.environ.pop(key, None)

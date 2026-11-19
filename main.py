@@ -25,6 +25,10 @@ try:
 except Exception:
     open_video, SceneManager, ContentDetector = None, None, None
 
+import os
+os.environ.setdefault("YOLO_VERBOSE", "False")
+os.environ.setdefault("ULTRALYTICS_SETTINGS", "false")
+
 try:
     from ultralytics import YOLO
 except Exception:
