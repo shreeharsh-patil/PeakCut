@@ -894,7 +894,18 @@ def download_youtube_video(url, output_dir="."):
     }
 
     # Cap at 720p when requested via VIDEO_QUALITY=720 OR when bytes go through a PER-GB paid proxy.
-    _req_quality = int(os.environ.get("VIDEO_QUALITY", "0") or "0")
+    def _parse_video_quality(raw) -> int:
+        s = str(raw or "").strip().lower().rstrip("p")
+        if not s:
+            return 0
+        if s.isdigit():
+            return int(s)
+        if s in ("low", "fast", "standard", "sd", "medium"):
+            return 720
+        if s in ("high", "hd", "fhd", "best", "max", "ultra"):
+            return 1080
+        return 0
+    _req_quality = _parse_video_quality(os.environ.get("VIDEO_QUALITY", "0"))
     def _hd_fmt_for(capped):
         if capped or (0 < _req_quality <= 720):
             return ('bestvideo[vcodec^=avc1][height<=720][ext=mp4]+bestaudio[ext=m4a]/'
