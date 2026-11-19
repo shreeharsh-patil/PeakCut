@@ -457,6 +457,17 @@ publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 
+# Strong references to background asyncio tasks so Python 3.12+ GC never collects active workers/jobs.
+_background_tasks: set = set()
+
+
+def _spawn_task(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 def _enqueue_job(job_id: str, priority: int = 2):
     job_queue.put_nowait((priority, next(_job_seq), job_id))
 
@@ -1175,7 +1186,7 @@ async def process_queue(worker_id: int = 1):
             _touch_manifest(job_id)
 
             # Process in background task to not block the worker loop
-            asyncio.create_task(run_job_wrapper(job_id))
+            _spawn_task(run_job_wrapper(job_id))
             
         except Exception as e:
             print(f"❌ [Worker #{worker_id}] Queue dispatch error: {e}")
@@ -1670,8 +1681,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_resume_scan())
     # Start multiple parallel job queue workers and cleanup
     num_workers = max(1, int(os.environ.get("NUM_QUEUE_WORKERS", str(MAX_CONCURRENT_JOBS))))
-    worker_tasks = [asyncio.create_task(process_queue(worker_id=i + 1)) for i in range(num_workers)]
-    cleanup_task = asyncio.create_task(cleanup_jobs())
+    worker_tasks = [_spawn_task(process_queue(worker_id=i + 1)) for i in range(num_workers)]
+    cleanup_task = _spawn_task(cleanup_jobs())
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
         # Account erasure lives in cloud/, which can't import app.py; hand it the
