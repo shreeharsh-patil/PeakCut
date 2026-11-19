@@ -2011,7 +2011,14 @@ async def run_job(job_id, job_data):
                  _sync_job_status_disk(job_id, output_dir, "failed", error="No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
-            err_msg = _scrub_secrets(f"Process failed with exit code {returncode}")
+            # Surface the actual root cause from pipeline logs (e.g. yt-dlp bot check, missing audio, etc.)
+            recent_logs = jobs[job_id].get('logs') or []
+            root_cause = next(
+                (line for line in reversed(recent_logs)
+                 if any(tok in line.lower() for tok in ("error", "failed", "❌", "sign in", "bot", "private", "unavailable", "traceback"))),
+                None,
+            )
+            err_msg = _scrub_secrets(root_cause or f"Process failed with exit code {returncode}")
             jobs[job_id]['logs'].append(err_msg)
             _sync_job_status_disk(job_id, output_dir, "failed", error=err_msg)
             
@@ -2733,6 +2740,15 @@ def start_job_process_background(
     _notify_peakcut_state()
     print(f"🚀 [PeakCut Studio] Job {job_id} successfully enqueued into processing pipeline!")
     return job_id
+
+
+# Bind live app.py runtime directly into peakcut_bridge so bridge routes never miss
+# the running job queue even when launched via `python app.py` (__main__).
+_peakcut_bridge.bind_app_runtime(
+    jobs_dict=jobs,
+    start_job_fn=start_job_process_background,
+    output_dir=OUTPUT_DIR,
+)
 
 def _job_view_from_disk(job_id):
     """What the disk says about a job this instance does not hold in memory.

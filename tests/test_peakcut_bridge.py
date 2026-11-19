@@ -262,3 +262,85 @@ def test_peakcut_sync_never_freezes_on_active_job():
         app_module.jobs.pop(jid, None)
         import shutil
         shutil.rmtree(pb.OUTPUT_DIR / jid, ignore_errors=True)
+
+
+def test_peakcut_failed_job_never_vanishes_and_can_retry():
+    import shutil
+    import peakcut_bridge as pb
+
+    jid = None
+    try:
+        r = _call(
+            "POST",
+            "/api/jobs",
+            json_body={
+                "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "title": "Test Video Title",
+                "options": {"max_clips": 2},
+            },
+        )
+        assert r.status_code == 200
+        created = r.json()
+        jid = created["id"]
+        assert created["title"] == "Test Video Title"
+        assert created["status"] == "queued"
+        assert "dQw4w9WgXcQ" in created["thumb_url"]
+
+        # Simulate pipeline failure before any MP4 exists (e.g. yt-dlp bot block)
+        app_module.jobs[jid]["status"] = "failed"
+        app_module.jobs[jid]["logs"].append("yt-dlp error: Sign in to confirm you are not a bot")
+        app_module._sync_job_status_disk(
+            jid, str(pb.OUTPUT_DIR / jid), "failed", error="yt-dlp error: Sign in to confirm you are not a bot"
+        )
+
+        # Failed job MUST still appear in /api/sync with its error (never vanish!)
+        sync_jobs = _call("GET", "/api/sync").json()["jobs"]
+        found = next((j for j in sync_jobs if j["id"] == jid), None)
+        assert found is not None
+        assert found["status"] == "failed"
+        assert "bot" in (found.get("error") or "").lower()
+
+        # Retry endpoint should transition it back to queued
+        retry_resp = _call("POST", f"/api/jobs/{jid}/retry")
+        assert retry_resp.status_code == 200
+        assert retry_resp.json()["status"] == "queued"
+    finally:
+        if jid:
+            app_module.jobs.pop(jid, None)
+            shutil.rmtree(pb.OUTPUT_DIR / jid, ignore_errors=True)
+
+
+def test_peakcut_preview_uses_oembed_even_when_ytdlp_fails(monkeypatch):
+    import peakcut_bridge as pb
+
+    monkeypatch.setattr(
+        pb,
+        "_fetch_youtube_oembed",
+        lambda vid, timeout=4.0: {
+            "title": "Exact OEmbed Video Title",
+            "uploader": "Real Creator Channel",
+            "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        },
+    )
+
+    # Simulate yt-dlp failing with a bot block
+    import yt_dlp
+    class _BrokenYDL:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, *args, **kwargs):
+            raise RuntimeError("Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _BrokenYDL)
+
+    r = _call("GET", "/api/preview", params={"url": "https://youtu.be/irNhWMG560k?si=test123"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["title"] == "Exact OEmbed Video Title"
+    assert body["uploader"] == "Real Creator Channel"
+    assert body["video_id"] == "irNhWMG560k"
+    assert "irNhWMG560k" in body["thumb"]

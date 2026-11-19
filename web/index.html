@@ -1441,22 +1441,38 @@ const att = () => DRAFTS[draftKey()] ||= {files: [], links: [], note: null, busy
 const VIDEO_EXT = /\.(mp4|mov|mkv|webm|m4v|ts|flv)$/i;
 const fmtLen = s => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
 const fmtSize = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(b / 1e6)) + " MB";
+const extractYtId = u => {
+  const m = String(u || "").match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|shorts\/|live\/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})/i);
+  if (m) return m[1];
+  const bare = String(u || "").trim().match(/^([a-zA-Z0-9_-]{11})(?:\?.*)?$/);
+  return bare ? bare[1] : null;
+};
 const normalizeUrl = u => {
   u = (u || "").trim();
+  if (!u) return "";
+  // Extract embedded URL if pasted from mobile Share sheet ("Check out ... https://youtu.be/...")
+  const embedded = u.match(/https?:\/\/[^\s"'<>]+/i);
+  if (embedded) u = embedded[0];
   if (/^[a-zA-Z0-9_-]{11}(?:\?.*)?$/.test(u)) return "https://www.youtube.com/watch?v=" + u.split("?")[0];
   if (/^\/?watch\?v=[a-zA-Z0-9_-]{11}/i.test(u)) return "https://www.youtube.com/" + u.replace(/^\//, "");
-  if (/^\/?shorts\/[a-zA-Z0-9_-]{11}/i.test(u)) return "https://www.youtube.com/" + u.replace(/^\//, "");
-  if (!/^https?:\/\//i.test(u) && /^([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com)/i.test(u)) return "https://" + u;
+  if (/^\/?(shorts|live|embed)\/[a-zA-Z0-9_-]{11}/i.test(u)) return "https://www.youtube.com/" + u.replace(/^\//, "");
+  if (!/^https?:\/\//i.test(u) && /^([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com|tiktok\.com|instagram\.com|vimeo\.com|x\.com|twitter\.com)/i.test(u)) return "https://" + u;
+  const ytId = extractYtId(u);
+  if (ytId && /youtu(\.be|be\.com)/i.test(u)) return "https://www.youtube.com/watch?v=" + ytId;
   return u;
 };
-const isChannel = u => /^(https?:\/\/)?(www\.)?(twitch\.tv|kick\.com)\/[A-Za-z0-9_]+\/?$/.test(normalizeUrl(u)) || /youtube\.com\/(@[^/]+|channel\/[^/]+)\/?(live|videos|streams)?\/?$/.test(normalizeUrl(u));
+const isChannel = u => {
+  const n = normalizeUrl(u);
+  if (/youtube\.com\/@[^/]+\/live\/?$/i.test(n) || /youtube\.com\/channel\/[^/]+\/live\/?$/i.test(n)) return false;
+  return /^(https?:\/\/)?(www\.)?(twitch\.tv|kick\.com)\/[A-Za-z0-9_]+\/?$/i.test(n) || /youtube\.com\/(@[^/]+|channel\/[^/]+)\/?(videos|streams)?\/?$/i.test(n);
+};
 const looksLink = u => {
   const n = normalizeUrl(u);
-  return /^https?:\/\/([\w-]+\.)*(youtube\.com|youtu\.be|twitch\.tv|kick\.com)\//i.test(n);
+  return /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(n);
 };
 const fullLink = u => {
   const n = normalizeUrl(u);
-  return /[?&]v=[\w-]{11}\b|youtu\.be\/[\w-]{11}\b|\/(shorts|live|embed)\/[\w-]{11}\b|twitch\.tv\/videos\/\d{6,}|clips\.twitch\.tv\/\w|twitch\.tv\/\w+\/clip\/\w|kick\.com\/[\w-]+\/(videos?|clips?)\/[\w-]{6,}/i.test(n);
+  return /[?&]v=[\w-]{11}\b|youtu\.be\/[\w-]{11}\b|\/(shorts|live|embed)\/[\w-]{11}\b|youtube\.com\/@[^/]+\/live|twitch\.tv\/videos\/\d{6,}|clips\.twitch\.tv\/\w|twitch\.tv\/\w+\/clip\/\w|kick\.com\/[\w-]+\/(videos?|clips?)\/[\w-]{6,}/i.test(n);
 };
 const batchMax = () => S.status.max_batch || 5;
 const batchUsed = A => A.files.length + A.links.filter(l => l.state !== "bad").length;
@@ -1536,13 +1552,29 @@ async function lookUp(u) {
 }
 function takeLink(A, u, input) {
   u = normalizeUrl(u);
+  if (!looksLink(u)) { A.note = "Paste a valid video link (YouTube, Twitch, Kick, TikTok, Instagram, etc.)."; return drawAtt(); }
   if (A.links.some(l => l.url === u && l.state !== "bad")) { A.note = null; if (input) input.value = ""; return drawAtt(); }
   if (batchUsed(A) >= batchMax()) { A.note = `You can send up to ${batchMax()} videos at a time. Remove one first.`; return drawAtt(); }
   const l = {id: newId(), url: u, state: "wait"};
   A.links.push(l); A.note = null;
   if (input) input.value = "";            // the box is free for the next link straight away
   drawAtt();
-  lookUp(u).then(info => { l.state = "ok"; l.info = info; }, e => { l.state = "bad"; l.msg = e.message; }).then(() => {
+  lookUp(u).then(info => {
+    l.state = "ok";
+    l.info = info || {};
+    if (info?.url) l.url = info.url;
+  }, () => {
+    // Preview lookup failed (e.g. network hiccup or non-oEmbed site): still allow clipping!
+    const ytId = extractYtId(u);
+    l.state = "ok";
+    l.info = {
+      title: ytId ? `YouTube Video (${ytId})` : (u.split("?")[0].split("/").filter(Boolean).pop() || "Video Link"),
+      uploader: ytId ? "YouTube" : "Video link",
+      duration: 0,
+      is_live: false,
+      thumb: ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : "",
+    };
+  }).then(() => {
     drawAtt();
     if (A.queued && !A.links.some(x => x.state === "wait")) {
       A.queued = false;
@@ -1606,8 +1638,9 @@ async function sendBig(f, who) {
   };
   try {
     await Promise.all([worker(), worker()]);
-    await send(`/api/upload/${s.id}/finish`, {});
+    const created = await send(`/api/upload/${s.id}/finish`, {});
     f.pct = 100; drawAtt();
+    return created;
   } catch (e) {
     next = s.parts;                                   // stop the other sender
     api(`/api/upload/${s.id}`, {method: "DELETE"}).catch(() => {});
@@ -1623,7 +1656,10 @@ function sendFile(f, who) {
     x.upload.onprogress = e => { if (e.lengthComputable) { f.pct = Math.round(e.loaded / e.total * 100); drawAtt(); } };
     x.onload = () => {
       if (x.status === 401) { location.href = "/login"; return; }
-      if (x.status >= 200 && x.status < 300) return ok();
+      if (x.status >= 200 && x.status < 300) {
+        let j = null; try { j = JSON.parse(x.responseText); } catch {}
+        return ok(j);
+      }
       let d = "Upload failed"; try { d = JSON.parse(x.responseText).detail || d; } catch {}
       fail(new Error(typeof d === "string" ? d : "Upload failed"));
     };
@@ -1639,27 +1675,40 @@ async function makeClips() {
   if (typed && looksLink(raw) && !isChannel(typed)) { clearTimeout(linkTimer); takeLink(A, typed, $("#url")); }
   if (A.links.some(l => l.state === "wait")) {   // still looking a link up: start as soon as it is found
     A.queued = true; drawAtt();
-    toast("Finding the video first. Clipping starts as soon as it's found.");
+    toast("Detecting video… clipping will start automatically.");
     return;
   }
   if (!canGo(A)) {
-    toast(A.note || "Paste a YouTube, Twitch or Kick video link, or add a video file first.", "bad");
+    toast(A.note || "Paste a video link, or upload a video file first.", "bad");
     $("#url")?.focus();
     return;
   }
   A.busy = true; drawAtt();
   let started = 0, failed = 0;
+  const createdJobs = [];
   const who = targetCreator(), opts = jobOptions();
   for (const l of A.links.filter(x => x.state === "ok")) {
     l.sending = true; drawAtt();
     const info = l.info || {};
-    try { await send("/api/jobs", {url: l.url, options: opts, creator: who, title: info.title || "", uploader: info.uploader || "", duration: info.duration || 0, thumb: info.thumb || ""}); l.state = "done"; started++; }
+    try {
+      const created = await send("/api/jobs", {
+        url: l.url, options: opts, creator: who,
+        title: info.title || "", uploader: info.uploader || "",
+        duration: info.duration || 0, thumb: info.thumb || ""
+      });
+      if (created && created.id) createdJobs.push(created);
+      l.state = "done"; started++;
+    }
     catch (e) { l.state = "bad"; l.msg = e.message; failed++; }
     l.sending = false; drawAtt();
   }
   for (const f of A.files) {
     f.state = "up"; f.pct = 0; drawAtt();
-    try { await sendFile(f, who); f.state = "done"; started++; }
+    try {
+      const created = await sendFile(f, who);
+      if (created && created.id) createdJobs.push(created);
+      f.state = "done"; started++;
+    }
     catch (e) { f.state = "error"; f.err = e.message; failed++; }
     drawAtt();
   }
@@ -1667,8 +1716,14 @@ async function makeClips() {
   A.files = A.files.filter(f => { if (f.state === "done") { URL.revokeObjectURL(f.src); return false; } return true; });
   A.busy = false; drawAtt();
   if (started) {
+    // Insert newly created jobs immediately so they appear instantly and never vanish on view switch
+    for (const cj of createdJobs) {
+      S.jobs = [cj, ...S.jobs.filter(x => x.id !== cj.id)];
+    }
     toast(`${started === 1 ? "Your video is" : started + " videos are"} being clipped now.`, "ok");
-    if (!failed && S.view === "overview") go(who ? "c:" + who : "library"); else tick();
+    if (!failed && S.view === "overview") go(who ? "c:" + who : "library");
+    else render();
+    tick();
   } else if (failed) toast("Nothing was started. The reason is shown on the video.", "bad");
 }
 
@@ -1738,15 +1793,16 @@ function jobHtml(j) {
   const who = !creatorId() && j.creator ? S.creators.find(c => c.id === j.creator)?.name : "";
   const meta = [who, j.uploader, j.duration ? fmt(j.duration) + " long" : "", j.clips.length ? j.clips.length + (j.clips.length === 1 ? " clip" : " clips") : "",
                 j.took ? "made in " + fmt(j.took) : "", j.kind === "live" ? "recording, " + j.stage.toLowerCase() : ""].filter(Boolean).map(esc).join(" · ");
-  const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : j.thumb_url ? `<img src="${esc(j.thumb_url)}" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
+  const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy"${j.thumb_url ? ` onerror="this.onerror=null;this.src='${esc(j.thumb_url)}'"` : ""}>` : j.thumb_url ? `<img src="${esc(j.thumb_url)}" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
       <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
+        ${j.status === "failed" ? `<button class="btn sm" data-act="retryjob" data-j="${j.id}">Retry</button>` : ""}
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
         <button class="btn sm icon ghost" data-act="deljob" data-j="${j.id}" title="Delete" aria-label="Delete this video and its clips">${ic("trash")}</button>
         <label class="selck" title="Select this video and its clips"><input type="checkbox" data-sel="j:${j.id}" ${sel().has("j:" + j.id) ? "checked" : ""} aria-label="Select this video"></label>`}</div></div>
     ${busy ? `<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><p class="sub">${esc(j.stage)} · ${Math.round(j.progress * 100)}%</p>` : ""}
     ${j.status === "done" && !j.clips.length ? `<p class="sub">${esc(j.stage)}</p>` : ""}
-    ${j.error ? `<div class="err">${esc(j.error)}<button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
+    ${j.error ? `<div class="err">${esc(j.error)} <button class="rep" data-act="retryjob" data-j="${j.id}">Retry</button><button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
     ${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 /* ---- selecting several videos and clips: delete or download them together */
@@ -2354,6 +2410,11 @@ document.addEventListener("click", async e => {
     if (a === "deljob") {
       if (!await ask("Delete this video?", "The video and all of its clips are permanently deleted. This cannot be undone.", "Delete", true)) return;
       await api(`/api/jobs/${d.j}`, {method:"DELETE"}); toast("Deleted"); return tick();
+    }
+    if (a === "retryjob") {
+      const updated = await api(`/api/jobs/${d.j}/retry`, {method:"POST"});
+      if (updated?.id) S.jobs = [updated, ...S.jobs.filter(x => x.id !== updated.id)];
+      render(); toast("Retrying video…", "ok"); return tick();
     }
     if (a === "chadd") {
       const k = d.p, v = $("#chan_" + k)?.value.trim();

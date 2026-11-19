@@ -64,6 +64,91 @@ OUTPUT_DIR = _resolve_bridge_output_dir()
 _BOOT_TIME = time.time()
 _STATE_VERSION = 1
 
+# Direct reference to the live app.py runtime (prevents double-import bugs when
+# launched via `python app.py` where app lives in sys.modules['__main__']).
+_APP_RUNTIME: Dict[str, Any] = {"jobs": None, "start_job": None}
+
+
+def bind_app_runtime(jobs_dict: Optional[Dict[str, Any]] = None, start_job_fn: Any = None, output_dir: Optional[str | Path] = None) -> None:
+    """Bind the live FastAPI app.py jobs dictionary and background launcher."""
+    global OUTPUT_DIR, _UPLOAD_ROOT
+    if jobs_dict is not None:
+        _APP_RUNTIME["jobs"] = jobs_dict
+    if start_job_fn is not None:
+        _APP_RUNTIME["start_job"] = start_job_fn
+    if output_dir:
+        p = Path(output_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR = p
+        _UPLOAD_ROOT = OUTPUT_DIR / "uploads"
+        _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _get_app_jobs() -> Dict[str, Any]:
+    if isinstance(_APP_RUNTIME.get("jobs"), dict):
+        return _APP_RUNTIME["jobs"]
+    import sys
+    for mod_name in ("app", "__main__"):
+        mod = sys.modules.get(mod_name)
+        if mod and hasattr(mod, "jobs") and isinstance(mod.jobs, dict):
+            _APP_RUNTIME["jobs"] = mod.jobs
+            return mod.jobs
+    return {}
+
+
+def _get_start_job_fn():
+    if callable(_APP_RUNTIME.get("start_job")):
+        return _APP_RUNTIME["start_job"]
+    import sys
+    for mod_name in ("app", "__main__"):
+        mod = sys.modules.get(mod_name)
+        if mod and hasattr(mod, "start_job_process_background"):
+            _APP_RUNTIME["start_job"] = mod.start_job_process_background
+            return mod.start_job_process_background
+    import app as app_module
+    fn = getattr(app_module, "start_job_process_background", None)
+    if callable(fn):
+        _APP_RUNTIME["start_job"] = fn
+    return fn
+
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(
+        r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
+        url,
+    )
+    if m:
+        return m.group(1)
+    bare = re.match(r"^([a-zA-Z0-9_-]{11})(?:\?.*)?$", url.strip())
+    return bare.group(1) if bare else None
+
+
+def _fetch_youtube_oembed(video_id: str, timeout: float = 4.0) -> Dict[str, Any]:
+    """Fast, bot-proof YouTube metadata lookup via public oEmbed API."""
+    import urllib.parse
+    import urllib.request
+
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(watch_url, safe='')}&format=json"
+    req = urllib.request.Request(
+        oembed_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                return {
+                    "title": (data.get("title") or "").strip(),
+                    "uploader": (data.get("author_name") or "").strip(),
+                    "thumb": (data.get("thumbnail_url") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg").strip(),
+                }
+    except Exception as exc:
+        logger.debug(f"YouTube oEmbed lookup notice for {video_id}: {exc}")
+    return {}
+
 
 def _bump_version() -> None:
     global _STATE_VERSION
@@ -581,11 +666,9 @@ def _build_accounts_public() -> List[Dict[str, Any]]:
 def _has_active_jobs() -> bool:
     """Return True if any in-memory or live job is currently running/queued."""
     try:
-        import sys
-        app_mod = sys.modules.get("app")
-        if app_mod and hasattr(app_mod, "jobs"):
-            if any(j.get("status") in ("queued", "processing", "running") for j in app_mod.jobs.values()):
-                return True
+        app_jobs = _get_app_jobs()
+        if any(j.get("status") in ("queued", "processing", "running") for j in app_jobs.values()):
+            return True
     except Exception:
         pass
     try:
@@ -644,14 +727,7 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
             status_disk = {}
 
     # Check in-memory app.jobs for live state
-    app_job = None
-    try:
-        import sys
-        app_mod = sys.modules.get("app")
-        if app_mod and hasattr(app_mod, "jobs"):
-            app_job = app_mod.jobs.get(jid)
-    except Exception:
-        pass
+    app_job = _get_app_jobs().get(jid)
 
     def _normalize_clip(i: int, c: Dict[str, Any], default_file: str = "") -> Dict[str, Any]:
         cid = c.get("id") or f"c_{i+1:02d}"
@@ -821,17 +897,25 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # Filter out empty or synthetic test fixtures with no clips and no real video content
+    # Keep real jobs visible even while queued, running, or failed (so errors are shown instead of vanishing!)
     has_real_clips = bool(clips)
     has_real_video = any(
         f.is_file() and f.stat().st_size > 50000
         for f in (list(job_dir.glob("*.mp4")) + list((job_dir / "clips").glob("*.mp4")))
     )
-    is_active_job = bool(app_job and app_job.get("status") in ("processing", "running", "queued"))
-    if not has_real_clips and not has_real_video and not is_active_job:
+    disk_status = str(status_disk.get("status") or "").lower()
+    is_visible_state = bool(
+        (app_job and app_job.get("status") in ("processing", "running", "queued", "failed", "error"))
+        or disk_status in ("processing", "running", "queued", "pending", "failed", "error")
+    )
+    if not has_real_clips and not has_real_video and not is_visible_state:
         return None
 
-    has_local_thumb = (job_dir / "thumb.jpg").exists() or (job_dir / "thumbnail.jpg").exists() or bool(clips)
+    has_local_thumb = (job_dir / "thumb.jpg").exists() or (job_dir / "thumbnail.jpg").exists()
+    if not thumb_url:
+        yt_id = _extract_youtube_id(str(status_disk.get("url") or ""))
+        if yt_id:
+            thumb_url = f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
     clean_title = _clean_media_title(title) if title.startswith("source_") else title
     if _looks_like_raw_url_title(clean_title) and meta_files:
         clean_title = _clean_media_title(meta_files[0].name.replace("_metadata.json", ""))
@@ -871,17 +955,14 @@ def _list_all_jobs_public() -> List[Dict[str, Any]]:
 
     # Include in-memory jobs not yet persisted to disk
     try:
-        import sys
-        app_mod = sys.modules.get("app")
-        if app_mod and hasattr(app_mod, "jobs"):
-            for jid in app_mod.jobs.keys():
-                if jid not in seen:
-                    j_dir = OUTPUT_DIR / jid
-                    j_dir.mkdir(parents=True, exist_ok=True)
-                    job_data = _format_job_public(j_dir)
-                    if job_data:
-                        jobs.append(job_data)
-                        seen.add(jid)
+        for jid in list(_get_app_jobs().keys()):
+            if jid not in seen:
+                j_dir = OUTPUT_DIR / jid
+                j_dir.mkdir(parents=True, exist_ok=True)
+                job_data = _format_job_public(j_dir)
+                if job_data:
+                    jobs.append(job_data)
+                    seen.add(jid)
     except Exception:
         pass
 
@@ -1106,46 +1187,95 @@ async def preview_channel(url: str):
 
 @router.get("/api/preview")
 async def preview_video_endpoint(url: str):
-    """Fetch video metadata and thumbnail for link preview card."""
+    """Fast, non-blocking video metadata & thumbnail detection (oEmbed + yt-dlp)."""
     u = url.strip()
     if not u:
         raise HTTPException(status_code=400, detail="Missing video URL.")
     from security_utils import normalize_media_url
     u = normalize_media_url(u)
+    yt_id = _extract_youtube_id(u)
 
-    try:
+    def _yt_dlp_lookup(target_url: str) -> Dict[str, Any]:
         import yt_dlp
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            "extract_flat": True,
+            "extract_flat": "in_playlist",
+            "socket_timeout": 6,
+            "retries": 1,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(u, download=False)
-            if info:
-                title = info.get("title") or "Video"
-                uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Online Video"
-                duration = float(info.get("duration") or 0.0)
-                is_live = bool(info.get("is_live") or info.get("live_status") == "is_live")
-                thumb = info.get("thumbnail") or (info.get("thumbnails")[-1]["url"] if info.get("thumbnails") else "")
-                return {
-                    "title": title,
-                    "uploader": uploader,
-                    "duration": duration,
-                    "is_live": is_live,
-                    "thumb": thumb,
-                }
-    except Exception as e:
-        logger.warning(f"yt-dlp preview lookup failed: {e}")
+            info = ydl.extract_info(target_url, download=False)
+            if not info:
+                return {}
+            thumbs = info.get("thumbnails") or []
+            thumb = info.get("thumbnail") or (thumbs[-1].get("url") if thumbs and isinstance(thumbs[-1], dict) else "")
+            return {
+                "title": (info.get("title") or "").strip(),
+                "uploader": (info.get("uploader") or info.get("channel") or info.get("creator") or "").strip(),
+                "duration": float(info.get("duration") or 0.0),
+                "is_live": bool(info.get("is_live") or info.get("live_status") == "is_live"),
+                "thumb": (thumb or "").strip(),
+            }
 
-    # Fallback to channel profile
-    prof = fetch_channel_profile(u)
+    oembed_info: Dict[str, Any] = {}
+    ytdlp_info: Dict[str, Any] = {}
+
+    if yt_id:
+        # Run bot-proof YouTube oEmbed + yt-dlp concurrently with strict timeouts
+        oembed_task = asyncio.create_task(asyncio.to_thread(_fetch_youtube_oembed, yt_id, 4.0))
+        ytdlp_task = asyncio.create_task(asyncio.to_thread(_yt_dlp_lookup, u))
+        try:
+            oembed_info = await asyncio.wait_for(oembed_task, timeout=4.5)
+        except Exception:
+            oembed_info = {}
+        try:
+            ytdlp_info = await asyncio.wait_for(ytdlp_task, timeout=6.0)
+        except Exception as e:
+            logger.warning(f"yt-dlp preview lookup notice for {yt_id}: {e}")
+            ytdlp_info = {}
+
+        title = ytdlp_info.get("title") or oembed_info.get("title") or f"YouTube Video ({yt_id})"
+        uploader = ytdlp_info.get("uploader") or oembed_info.get("uploader") or "YouTube"
+        thumb = ytdlp_info.get("thumb") or oembed_info.get("thumb") or f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
+        return {
+            "url": u,
+            "video_id": yt_id,
+            "title": title,
+            "uploader": uploader,
+            "duration": float(ytdlp_info.get("duration") or 0.0),
+            "is_live": bool(ytdlp_info.get("is_live", False)),
+            "thumb": thumb,
+        }
+
+    # Non-YouTube links (Twitch, Kick, Instagram, TikTok, Vimeo, direct MP4, etc.)
+    try:
+        ytdlp_info = await asyncio.wait_for(asyncio.to_thread(_yt_dlp_lookup, u), timeout=8.0)
+        if ytdlp_info and ytdlp_info.get("title"):
+            return {
+                "url": u,
+                "title": ytdlp_info["title"],
+                "uploader": ytdlp_info.get("uploader") or "Online Video",
+                "duration": float(ytdlp_info.get("duration") or 0.0),
+                "is_live": bool(ytdlp_info.get("is_live", False)),
+                "thumb": ytdlp_info.get("thumb") or "",
+            }
+    except Exception as e:
+        logger.warning(f"yt-dlp preview lookup failed for {u}: {e}")
+
+    # Fallback to channel profile or clean URL-derived label
+    try:
+        prof = await asyncio.wait_for(asyncio.to_thread(fetch_channel_profile, u), timeout=4.0)
+    except Exception:
+        prof = {}
+    fallback_title = prof.get("name") or _clean_media_title(u.split("?")[0].rstrip("/").split("/")[-1]) or "Video Link"
     return {
-        "title": prof.get("name") or "Video Link",
-        "uploader": prof.get("name") or "Creator",
+        "url": u,
+        "title": fallback_title,
+        "uploader": prof.get("name") or "Video Link",
         "duration": 0.0,
-        "is_live": prof.get("is_live", False),
+        "is_live": bool(prof.get("is_live", False)),
         "thumb": prof.get("pic", ""),
     }
 
@@ -1355,12 +1485,24 @@ async def create_job_endpoint(req: Request):
     except (TypeError, ValueError):
         duration = 0.0
 
+    yt_id = _extract_youtube_id(url)
+    if yt_id and (not video_title or _looks_like_raw_url_title(video_title) or not thumb_url):
+        try:
+            oembed = await asyncio.wait_for(asyncio.to_thread(_fetch_youtube_oembed, yt_id, 3.0), timeout=3.5)
+        except Exception:
+            oembed = {}
+        if oembed.get("title") and (not video_title or _looks_like_raw_url_title(video_title)):
+            video_title = oembed["title"]
+        if oembed.get("uploader") and not uploader:
+            uploader = oembed["uploader"]
+        if not thumb_url:
+            thumb_url = oembed.get("thumb") or f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
+
     if not video_title or _looks_like_raw_url_title(video_title):
-        yt_match = re.search(r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})", url)
-        if yt_match:
-            video_title = f"YouTube Video ({yt_match.group(1)})"
+        if yt_id:
+            video_title = f"YouTube Video ({yt_id})"
         else:
-            video_title = url.split("/")[-1][:60] or "New Video Job"
+            video_title = _clean_media_title(url.split("?")[0].rstrip("/").split("/")[-1]) or "New Video Job"
 
     jid = str(uuid.uuid4())
     job_dir = OUTPUT_DIR / jid
@@ -1382,23 +1524,65 @@ async def create_job_endpoint(req: Request):
     (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
     _bump_version()
 
-    # Trigger process in background if app has process worker or async task
+    # Trigger processing in the live app.py runtime — never silently swallow failures
     try:
-        import sys
-        app_module = sys.modules.get("app")
-        if not app_module:
-            import app as app_module
-        if hasattr(app_module, "start_job_process_background"):
-            app_module.start_job_process_background(
-                job_id=jid,
-                url=url,
-                options=options,
-                creator=creator,
-                title=video_title,
-            )
+        start_fn = _get_start_job_fn()
+        if not callable(start_fn):
+            raise RuntimeError("Job worker runtime is not initialized.")
+        start_fn(
+            job_id=jid,
+            url=url,
+            options=options,
+            creator=creator,
+            title=video_title,
+        )
     except Exception as e:
-        logger.warning(f"Background job trigger notice: {e}")
+        logger.error(f"Failed to enqueue job {jid}: {e}")
+        status_data["status"] = "failed"
+        status_data["error"] = f"Could not start job: {e}"
+        (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
+        _bump_version()
+        raise HTTPException(status_code=500, detail=f"Could not start clipping job: {e}")
 
+    return _format_job_public(job_dir)
+
+
+@router.post("/api/jobs/{jid}/retry")
+async def retry_job_endpoint(jid: str):
+    """Retry a failed or stuck video job using its saved URL/file and options."""
+    job_dir = OUTPUT_DIR / jid
+    status_file = job_dir / "status.json"
+    if not status_file.exists():
+        raise HTTPException(status_code=404, detail="Video job not found.")
+
+    data = json.loads(status_file.read_text(encoding="utf-8"))
+    url = data.get("url")
+    options = data.get("options") or {}
+    creator = data.get("creator")
+    title = data.get("title") or "Video Job"
+
+    file_path = None
+    if not url:
+        src_files = list(job_dir.glob("source_*"))
+        if src_files:
+            file_path = str(src_files[0])
+
+    data["status"] = "queued"
+    data["error"] = None
+    status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _bump_version()
+
+    start_fn = _get_start_job_fn()
+    if not callable(start_fn):
+        raise HTTPException(status_code=500, detail="Job worker runtime is not initialized.")
+    start_fn(
+        job_id=jid,
+        url=url,
+        options=options,
+        creator=creator,
+        file_path=file_path,
+        title=title,
+    )
     return _format_job_public(job_dir)
 
 
@@ -1622,12 +1806,9 @@ async def upload_direct_file(
     _bump_version()
 
     try:
-        import sys
-        app_module = sys.modules.get("app")
-        if not app_module:
-            import app as app_module
-        if hasattr(app_module, "start_job_process_background"):
-            app_module.start_job_process_background(
+        start_fn = _get_start_job_fn()
+        if callable(start_fn):
+            start_fn(
                 job_id=jid,
                 url=None,
                 options=opts,
@@ -1636,7 +1817,12 @@ async def upload_direct_file(
                 title=clean_title,
             )
     except Exception as e:
-        logger.warning(f"Background upload job trigger notice: {e}")
+        logger.error(f"Failed to enqueue upload job {jid}: {e}")
+        status_data["status"] = "failed"
+        status_data["error"] = f"Could not start job: {e}"
+        (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
+        _bump_version()
+        raise HTTPException(status_code=500, detail=f"Could not start upload job: {e}")
 
     return _format_job_public(job_dir)
 
@@ -1725,12 +1911,9 @@ async def upload_finish_endpoint(upid: str):
     _bump_version()
 
     try:
-        import sys
-        app_module = sys.modules.get("app")
-        if not app_module:
-            import app as app_module
-        if hasattr(app_module, "start_job_process_background"):
-            app_module.start_job_process_background(
+        start_fn = _get_start_job_fn()
+        if callable(start_fn):
+            start_fn(
                 job_id=jid,
                 url=None,
                 options=meta.get("options") or {},
@@ -1739,7 +1922,12 @@ async def upload_finish_endpoint(upid: str):
                 title=clean_title,
             )
     except Exception as e:
-        logger.warning(f"Background upload finish job trigger notice: {e}")
+        logger.error(f"Failed to enqueue chunked upload job {jid}: {e}")
+        status_data["status"] = "failed"
+        status_data["error"] = f"Could not start job: {e}"
+        (job_dir / "status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
+        _bump_version()
+        raise HTTPException(status_code=500, detail=f"Could not start upload job: {e}")
 
     return _format_job_public(job_dir)
 
