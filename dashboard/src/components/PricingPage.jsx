@@ -220,22 +220,22 @@ export default function PricingPage({ onRequireLogin }) {
           </div>
 
           <div className="divide-y divide-rule border-b border-rule">
-            {HOSTED_VS_SELF.map(({ icon: Icon, label, hosted, self }) => (
-              <div key={label} className="py-4 grid gap-2 md:grid-cols-[9rem_1fr_1fr] md:gap-x-6 md:items-start">
+            {HOSTED_VS_SELF.map((item) => (
+              <div key={item.label} className="py-4 grid gap-2 md:grid-cols-[9rem_1fr_1fr] md:gap-x-6 md:items-start">
                 <div className="flex items-center gap-2 text-ink2">
-                  <Icon size={15} className="text-muted shrink-0" />
-                  <span className="text-sm font-medium">{label}</span>
+                  {React.createElement(item.icon, { size: 15, className: 'text-muted shrink-0' })}
+                  <span className="text-sm font-medium">{item.label}</span>
                 </div>
                 <div>
                   <span className="eyebrow block mb-1 md:hidden">Hosted on this site</span>
                   <p className="text-sm text-ink2 leading-relaxed">
                     <Check size={14} className="text-ok inline-block mr-1.5 -mt-0.5" />
-                    {hosted}
+                    {item.hosted}
                   </p>
                 </div>
                 <div>
                   <span className="eyebrow block mb-1 mt-2 md:hidden">Self-hosted</span>
-                  <p className="text-sm text-muted leading-relaxed">{self}</p>
+                  <p className="text-sm text-muted leading-relaxed">{item.self}</p>
                 </div>
               </div>
             ))}

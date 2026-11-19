@@ -94,7 +94,7 @@ class PublishingQueue:
 
     def _save(self) -> None:
         with self.lock:
-            tmp = self.queue_file.with_suffix(".tmp")
+            tmp = self.queue_file.with_name(f"{self.queue_file.name}.{secrets.token_hex(4)}.tmp")
             data = [p.to_dict() for p in self._posts]
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp.replace(self.queue_file)
@@ -123,6 +123,15 @@ class PublishingQueue:
             if account_times:
                 last_time = max(account_times)
                 t = max(start_search, last_time + (self.post_gap_minutes * 60.0))
+
+                # If last_time's day has reached or exceeded the daily cap,
+                # any subsequent post on or after that day rolls over to 9:00 AM the next day.
+                last_day_str = self._day_string(last_time)
+                posts_on_last_day = sum(1 for p in active_posts if self._day_string(p.posted_at or p.due_at) == last_day_str)
+                if posts_on_last_day >= self.daily_cap:
+                    lt_last = time.localtime(last_time + 86400)
+                    next_morning = dt.datetime(lt_last.tm_year, lt_last.tm_mon, lt_last.tm_mday, 9, 0, 0)
+                    t = max(t, next_morning.timestamp())
             else:
                 t = start_search
 
@@ -171,6 +180,14 @@ class PublishingQueue:
             due_at = time.time() if schedule_now else self.calculate_next_slot(account_id, platform, requested_time)
             post_id = f"post_{secrets.token_hex(6)}"
 
+            meta = dict(metadata or {})
+            if "privacy" not in meta and "privacy_status" not in meta:
+                safe_priv = os.environ.get("DEFAULT_PRIVACY", os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")).lower().strip()
+                if safe_priv not in ("unlisted", "private"):
+                    safe_priv = "unlisted"
+                meta["privacy"] = safe_priv
+                meta["privacy_status"] = safe_priv
+
             item = PostItem(
                 id=post_id,
                 job_id=job_id,
@@ -182,7 +199,7 @@ class PublishingQueue:
                 description=description,
                 video_path=video_path,
                 due_at=due_at,
-                metadata=metadata or {},
+                metadata=meta,
             )
             self._posts.append(item)
             self._save()
@@ -201,13 +218,15 @@ class PublishingQueue:
                 if p.status == "scheduled" and p.due_at <= now and (p.next_retry_at <= now or p.tries == 0)
             ]
 
-    def mark_posting(self, post_id: str) -> None:
+    def mark_posting(self, post_id: str) -> bool:
         with self.lock:
             p = self.get_post(post_id)
-            if p:
+            if p and p.status == "scheduled":
                 p.status = "posting"
                 p.tries += 1
                 self._save()
+                return True
+            return False
 
     def mark_success(self, post_id: str, remote_url: str = "", remote_id: str = "") -> None:
         with self.lock:
@@ -230,7 +249,7 @@ class PublishingQueue:
             p.error_message = error_msg
             if p.tries < p.max_tries:
                 # Exponential backoff
-                backoff = min(BASE_RETRY_DELAY_SEC * (2 ** (p.tries - 1)), MAX_RETRY_DELAY_SEC)
+                backoff = min(BASE_RETRY_DELAY_SEC * (2 ** max(0, p.tries - 1)), MAX_RETRY_DELAY_SEC)
                 if is_rate_limit:
                     backoff = max(backoff, 300)  # At least 5 mins on 429
                 p.status = "scheduled"
@@ -312,22 +331,28 @@ class QueueWorker:
             self.stop_event.wait(self.poll_interval_sec)
 
     def _dispatch_post(self, post: PostItem) -> None:
+        if not self.queue.mark_posting(post.id):
+            logger.info(f"Skipping dispatch of post {post.id} (no longer in scheduled state)")
+            return
+
         dispatcher = self.queue.post_dispatchers.get(post.platform)
         if not dispatcher:
             # Fallback mock/simulated dispatch if no custom dispatcher registered
-            self.queue.mark_posting(post.id)
             logger.info(f"Simulating publish of post {post.id} ({post.platform}): {post.title}")
             time.sleep(1)
             self.queue.mark_success(post.id, remote_url=f"https://{post.platform}.com/share/{post.id}")
             return
 
-        self.queue.mark_posting(post.id)
         try:
             result = dispatcher(post)
+            if not isinstance(result, dict):
+                result = {}
+            remote_url = result.get("url") or result.get("remote_url") or ""
+            remote_id = result.get("id") or result.get("remote_id") or ""
             self.queue.mark_success(
                 post.id,
-                remote_url=result.get("url", ""),
-                remote_id=result.get("id", ""),
+                remote_url=remote_url,
+                remote_id=remote_id,
             )
         except Exception as e:
             err_str = str(e)
@@ -354,6 +379,11 @@ def get_publishing_queue() -> PublishingQueue:
     global _GLOBAL_QUEUE, _GLOBAL_WORKER
     if _GLOBAL_QUEUE is None:
         _GLOBAL_QUEUE = PublishingQueue()
+        try:
+            from youtube_uploader import register_youtube_dispatcher
+            register_youtube_dispatcher(_GLOBAL_QUEUE)
+        except Exception as e:
+            logger.warning(f"Could not auto-register YouTube dispatcher: {e}")
         _GLOBAL_WORKER = QueueWorker(_GLOBAL_QUEUE)
         _GLOBAL_WORKER.start()
     return _GLOBAL_QUEUE

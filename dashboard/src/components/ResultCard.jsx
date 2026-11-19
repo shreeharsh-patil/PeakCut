@@ -176,6 +176,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     });
     const [postTitle, setPostTitle] = useState("");
     const [postDescription, setPostDescription] = useState("");
+    const [youtubePrivacy, setYoutubePrivacy] = useState("unlisted");
     const [isScheduling, setIsScheduling] = useState(false);
     const [scheduleDate, setScheduleDate] = useState("");
 
@@ -680,7 +681,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 user_id: uploadUserId,
                 platforms: selectedPlatforms,
                 title: postTitle,
-                description: postDescription
+                description: postDescription,
+                privacy_status: youtubePrivacy,
+                privacy: youtubePrivacy
             };
 
             if (isScheduling && scheduleDate) {
@@ -1104,6 +1107,28 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                             })}
                         />
                     </div>
+
+                    {/* YouTube Privacy Selector */}
+                    {platforms.youtube && (
+                        <div>
+                            <div className="flex items-center justify-between mb-1.5">
+                                <label className="eyebrow">YOUTUBE PRIVACY</label>
+                                <span className="text-xs text-muted">
+                                    {youtubePrivacy === 'unlisted' ? 'anyone with link can view' : youtubePrivacy === 'private' ? 'only you can view' : 'visible to everyone'}
+                                </span>
+                            </div>
+                            <SegmentedControl
+                                columns={3}
+                                options={[
+                                    { value: 'unlisted', label: 'unlisted' },
+                                    { value: 'private', label: 'private' },
+                                    { value: 'public', label: 'public' },
+                                ]}
+                                value={youtubePrivacy}
+                                onChange={setYoutubePrivacy}
+                            />
+                        </div>
+                    )}
 
                     {postResult && (
                         <div className={postResult.success ? 'badge-ok' : 'badge-danger'}>

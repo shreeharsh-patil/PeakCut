@@ -13,6 +13,7 @@ Bridges OpenShorts backend into the PeakCut reactive studio UI:
 from __future__ import annotations
 
 import io
+import asyncio
 import json
 import logging
 import mimetypes
@@ -42,6 +43,7 @@ from system_telemetry import SystemTelemetry
 logger = logging.getLogger("openshorts.peakcut_bridge")
 
 router = APIRouter(tags=["PeakCut UI & Bridge"])
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 WEB_DIR = Path("web")
 BRAND_DIR = WEB_DIR / "brand"
@@ -180,7 +182,7 @@ async def serve_media(jid: str, name: str):
             return FileResponse(p, media_type=mime or "application/octet-stream")
 
     # If it is an image request and the corresponding .mp4 exists, extract 1 poster frame
-    if name.lower().endswith((".jpg", ".jpeg", ".png")):
+    if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
         base = name.rsplit(".", 1)[0]
         for vid_name in (f"{base}.mp4", f"{base}.mov", f"{base}.webm"):
             vid_p = OUTPUT_DIR / jid / vid_name
@@ -198,6 +200,20 @@ async def serve_media(jid: str, name: str):
                 except Exception:
                     pass
 
+        # Return a stylish fallback SVG placeholder thumbnail so the browser never 404s
+        svg_placeholder = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="360" height="640" viewBox="0 0 360 640">'
+            '<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+            '<stop offset="0%" stop-color="#18181b"/><stop offset="100%" stop-color="#27272a"/>'
+            '</linearGradient></defs>'
+            '<rect width="360" height="640" fill="url(#g)"/>'
+            '<circle cx="180" cy="320" r="40" fill="#3f3f46" opacity="0.8"/>'
+            '<polygon points="172,308 196,320 172,332" fill="#f4f4f5"/>'
+            '<text x="180" y="380" text-anchor="middle" fill="#71717a" font-family="sans-serif" font-size="13">Short Preview</text>'
+            '</svg>'
+        )
+        return Response(content=svg_placeholder, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=60"})
+
     raise HTTPException(status_code=404, detail=f"Media file '{name}' for job '{jid}' not found.")
 
 
@@ -208,6 +224,7 @@ async def serve_media(jid: str, name: str):
 @router.get("/api/status")
 async def get_peakcut_status():
     """Initial boot status contract expected by web/index.html."""
+    ai_ready = bool(api_key_rotator.get_gemini_key())
     return {
         "user": {
             "id": "local",
@@ -226,7 +243,8 @@ async def get_peakcut_status():
             "follow": "",
         },
         "ai": {
-            "configured": bool(api_key_rotator.get_gemini_key()),
+            "ready": ai_ready,
+            "configured": ai_ready,
             "provider": "gemini",
             "model": os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
             "key_rotation": api_key_rotator.get_status("gemini"),
@@ -410,6 +428,16 @@ def _format_job_public(job_dir: Path) -> Optional[Dict[str, Any]]:
                 "rendered": True,
             })
 
+    # Filter out empty or synthetic test fixtures with no clips and no real video content
+    has_real_clips = bool(clips)
+    has_real_video = any(
+        f.is_file() and f.stat().st_size > 50000 
+        for f in (list(job_dir.glob("*.mp4")) + list((job_dir / "clips").glob("*.mp4")))
+    )
+    is_active_job = bool(app_job and app_job.get("status") in ("processing", "running", "queued"))
+    if not has_real_clips and not has_real_video and not is_active_job:
+        return None
+
     return {
         "id": jid,
         "title": title,
@@ -462,6 +490,7 @@ async def sync_state(v: str = ""):
     token = _sync_token()
     if v == token:
         return {"v": token}
+    ai_ready = bool(api_key_rotator.get_gemini_key())
 
     creators_mgr = CreatorWorkspaceManager.get_instance()
     queue = get_publishing_queue()
@@ -490,7 +519,8 @@ async def sync_state(v: str = ""):
             {"id": "ig_main", "platform": "instagram", "name": "Instagram Reels", "connected": True},
         ],
         "ai": {
-            "configured": bool(api_key_rotator.get_gemini_key()),
+            "ready": ai_ready,
+            "configured": ai_ready,
             "provider": "gemini",
             "model": os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
             "key_rotation": api_key_rotator.get_status("gemini"),
@@ -1376,7 +1406,7 @@ async def save_settings_endpoint(req: Request):
 async def get_ai_settings():
     """AI settings contract expected by PeakCut Settings -> AI tab."""
     keys = api_key_rotator.get_all_keys("gemini")
-    active_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    active_model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     return {
         "ready": len(keys) > 0,
         "label": "Google Gemini",
@@ -1386,7 +1416,7 @@ async def get_ai_settings():
             {"id": "openai", "label": "OpenAI / Compatible"},
             {"id": "anthropic", "label": "Anthropic Claude"},
         ],
-        "models": [active_model, "gemini-3.1-flash-lite", "gemini-1.5-pro"],
+        "models": [active_model, "gemini-3.1-flash-lite", "gemini-2.5-flash"],
         "base_url": os.environ.get("LLM_BASE_URL", ""),
     }
 
@@ -1442,13 +1472,40 @@ async def list_models_compat():
     }
 
 
+def _probe_gemini_api(api_key: str, model: str) -> None:
+    """Make a minimal Gemini text-generation request and close the client."""
+    from google.genai import types
+
+    client = api_key_rotator.create_gemini_client(api_key)
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents="Reply with exactly OK.",
+            config=types.GenerateContentConfig(max_output_tokens=64, temperature=0),
+        )
+        if not (response.text or "").strip():
+            raise RuntimeError("Gemini returned an empty response.")
+    finally:
+        client.close()
+
+
 @router.post("/api/ai/test")
 async def test_ai_key_endpoint():
-    """Validate current AI key and model."""
+    """Verify the current Gemini key by making a small generation request."""
     k = api_key_rotator.get_gemini_key()
     if not k:
         raise HTTPException(status_code=400, detail="No Gemini API key is configured.")
-    return {"ok": True, "model": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")}
+    model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    try:
+        await asyncio.to_thread(_probe_gemini_api, k, model)
+    except Exception as exc:
+        provider_status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        status_text = f" (provider status {provider_status})" if provider_status else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API test failed{status_text}. Check key access, model access, and network connectivity.",
+        ) from exc
+    return {"ok": True, "model": model}
 
 
 @router.get("/api/usage")
@@ -1467,7 +1524,7 @@ async def get_ai_usage_stats():
     return {
         "ready": bool(k),
         "provider": "gemini",
-        "model": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        "model": os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
         "today_calls": 18 if k else 0,
         "today_tokens": 42500 if k else 0,
         "calls_total": 340 if k else 0,

@@ -594,6 +594,10 @@ def _recover_jobs_from_disk():
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
+        # Skip synthetic test fixtures with no real video content
+        mp4_files = glob.glob(os.path.join(job_path, "*.mp4"))
+        if not mp4_files or all(os.path.getsize(f) < 50000 for f in mp4_files):
+            continue
         try:
             with open(json_files[0], 'r') as f:
                 data = json.load(f)
@@ -1984,6 +1988,13 @@ async def health_ready():
 
 @app.get("/api/config")
 async def get_config():
+    upload_post_key = os.environ.get("UPLOAD_POST_API_KEY", "").strip()
+    upload_post_configured = bool(upload_post_key)
+    is_mock = upload_post_key.lower() in ("mock", "test", "sandbox") or os.environ.get("UPLOAD_POST_MOCK") == "1"
+    from youtube_uploader import is_youtube_auth_configured
+    yt_configured = is_youtube_auth_configured()
+    default_privacy = os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")
+
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
@@ -1992,6 +2003,10 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        "uploadPostConfigured": upload_post_configured,
+        "uploadPostMock": is_mock,
+        "youtubeUploadConfigured": yt_configured or upload_post_configured,
+        "defaultPrivacy": default_privacy,
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -2622,6 +2637,10 @@ def start_job_process_background(
                     cmd.extend(["-i", os.path.join(UPLOAD_DIR, f)])
                     break
 
+    if "-i" not in cmd[3:] and "-u" not in cmd[3:]:
+        print(f"⚠️ [PeakCut Studio] Job {job_id} cannot be started: no media source (URL or file) found.")
+        raise ValueError(f"Job {job_id} requires a valid URL or input file.")
+
     cmd.extend(["-o", job_output_dir])
 
     api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or "http://127.0.0.1:8000"
@@ -2820,6 +2839,14 @@ async def get_source_video(job_id: str, request: Request,
     return FileResponse(source_path, media_type="video/mp4")
 
 
+def _safe_remove_file(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 @app.get("/api/jobs/{job_id}/download-all")
 async def download_all_clips(job_id: str, request: Request):
     """Bundle the current version of every clip of a job into one ZIP."""
@@ -2832,8 +2859,11 @@ async def download_all_clips(job_id: str, request: Request):
     if not json_files:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    with open(json_files[0], 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read job metadata: {e}")
 
     # The metadata file on disk never carries video_url — the pipeline doesn't
     # write it, it's injected into the in-memory job record. So prefer the live
@@ -2872,7 +2902,7 @@ async def download_all_clips(job_id: str, request: Request):
         zip_path,
         media_type="application/zip",
         filename=f"openshorts_clips_{job_id[:8]}.zip",
-        background=BackgroundTask(os.remove, zip_path),
+        background=BackgroundTask(_safe_remove_file, zip_path),
     )
 
 
@@ -3239,15 +3269,18 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
 
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     transcript = data.get('transcript')
     if not transcript:
         raise HTTPException(status_code=400, detail="Transcript not found in metadata")
 
     clips = data.get('shorts', [])
-    if clip_index >= len(clips):
+    if clip_index < 0 or clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
 
     clip_data = clips[clip_index]
@@ -3333,8 +3366,11 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
     if clip_index < 0 or clip_index >= len(clips):
@@ -3458,8 +3494,11 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
     if req.clip_index < 0 or req.clip_index >= len(clips):
@@ -3656,8 +3695,11 @@ async def get_clip_scenes(job_id: str, clip_index: int, request: Request):
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
     if clip_index < 0 or clip_index >= len(clips):
@@ -3845,8 +3887,11 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
     if req.clip_index < 0 or req.clip_index >= len(clips):
@@ -4124,8 +4169,11 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
         
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
         
     transcript = data.get('transcript')
     if not transcript:
@@ -4333,8 +4381,11 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
     clips = data.get('shorts', [])
     if req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -4397,8 +4448,11 @@ async def add_hook(req: HookRequest, request: Request):
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
         
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
         
     clips = data.get('shorts', [])
     if req.clip_index >= len(clips):
@@ -4549,8 +4603,11 @@ async def translate_clip(
     if not json_files:
         raise HTTPException(status_code=404, detail="Metadata not found")
 
-    with open(json_files[0], 'r') as f:
-        data = json.load(f)
+    try:
+        with open(json_files[0], 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
     if req.clip_index >= len(clips):
@@ -4623,6 +4680,17 @@ async def translate_clip(
         "new_video_url": f"/videos/{req.job_id}/{output_filename}"
     }
 
+def resolve_youtube_privacy(*candidates: Optional[str]) -> str:
+    """Resolve confirmed YouTube privacy setting, defaulting to 'private' unless explicitly requested."""
+    for c in candidates:
+        if c and str(c).strip().lower() in ("public", "unlisted", "private"):
+            return str(c).strip().lower()
+    default_priv = os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "private").strip().lower()
+    if default_priv in ("public", "unlisted", "private"):
+        return default_priv
+    return "private"
+
+
 class SocialPostRequest(BaseModel):
     job_id: str
     clip_index: int
@@ -4634,6 +4702,10 @@ class SocialPostRequest(BaseModel):
     description: Optional[str] = None
     scheduled_date: Optional[str] = None # ISO-8601 string
     timezone: Optional[str] = "UTC"
+    privacy_status: Optional[str] = None # "private", "unlisted", "public"
+    privacyStatus: Optional[str] = None
+    privacy: Optional[str] = None
+    access_token: Optional[str] = None # Direct YouTube token override
 
 import httpx
 
@@ -4643,12 +4715,44 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    confirmed_privacy = resolve_youtube_privacy(req.privacy_status, req.privacyStatus, req.privacy)
+    is_only_youtube = (req.platforms == ["youtube"])
+
     # Resolve the Upload-Post key + profile. For managed users the server key is
     # used and their own profile is forced (body api_key / user_id are ignored).
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
+
+    from youtube_uploader import (
+        is_youtube_auth_configured,
+        upload_youtube_short,
+        YouTubeAuthError,
+        YouTubeUploadError,
+    )
+    direct_yt_token = req.access_token or request.headers.get("X-YouTube-Access-Token")
+    direct_yt_ready = is_youtube_auth_configured(access_token=direct_yt_token)
+
     if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, req.user_id)
+        if is_only_youtube:
+            if not direct_yt_ready:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "YouTube upload is not ready. Missing credentials: configure direct YouTube OAuth "
+                        "(set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN, or YOUTUBE_ACCESS_TOKEN in environment) "
+                        "or configure Upload-Post (set UPLOAD_POST_API_KEY in environment or pass X-Upload-Post-Key header with profile)."
+                    ),
+                )
+            post_user = None
+        else:
+            missing_platforms = [p for p in req.platforms if p != "youtube"]
+            if missing_platforms:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Upload-Post API key is required to post to {', '.join(missing_platforms)}. Missing Upload-Post API key.",
+                )
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+    else:
+        post_user = resolve_post_profile(forced_profile, req.user_id or os.environ.get("UPLOAD_POST_PROFILE"))
 
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
@@ -4656,30 +4760,74 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         raise HTTPException(status_code=400, detail="Job result not available")
 
     try:
+        if req.clip_index < 0 or req.clip_index >= len(job['result']['clips']):
+            raise HTTPException(status_code=400, detail=f"Invalid clip index {req.clip_index}")
         clip = job['result']['clips'][req.clip_index]
-        # Video URL is relative /videos/..., we need absolute file path
-        # clip['video_url'] is like "/videos/{job_id}/{filename}"
-        # We constructed it as: f"/videos/{job_id}/{clip_filename}"
-        # And file is at f"{OUTPUT_DIR}/{job_id}/{clip_filename}"
-        
         filename = clip['video_url'].split('/')[-1]
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
         
         if not os.path.exists(file_path):
              raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
 
-        # Construct parameters for Upload-Post API
-        # Fallbacks
+        # Construct parameters
         final_title = req.title or clip.get('title', 'Viral Short')
         final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
-        
-        # Prepare form data
+        yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
+
+        # Fallback to direct YouTube uploader if Upload-Post key is not configured and only YouTube is selected
+        if is_only_youtube and direct_yt_ready and not upload_key:
+            if req.scheduled_date:
+                from publishing_queue import get_publishing_queue
+                import datetime as dt_module
+                try:
+                    clean_dt = req.scheduled_date.replace("Z", "+00:00")
+                    target_time = dt_module.datetime.fromisoformat(clean_dt).timestamp()
+                except Exception:
+                    target_time = None
+
+                queue = get_publishing_queue()
+                post_item = queue.enqueue(
+                    job_id=req.job_id,
+                    clip_id=str(req.clip_index),
+                    platform="youtube",
+                    account_id="direct_youtube",
+                    title=yt_title,
+                    description=final_description,
+                    video_path=file_path,
+                    requested_time=target_time,
+                    metadata={"privacy": confirmed_privacy, "privacy_status": confirmed_privacy},
+                )
+                return {
+                    "success": True,
+                    "method": "queued_direct_youtube",
+                    "post_id": post_item.id,
+                    "scheduled_at": post_item.due_at,
+                    "privacy": confirmed_privacy,
+                    "title": yt_title,
+                }
+            else:
+                res = upload_youtube_short(
+                    video_path=file_path,
+                    title=yt_title,
+                    description=final_description,
+                    privacy_status=confirmed_privacy,
+                    access_token=direct_yt_token,
+                )
+                return {
+                    "success": True,
+                    "method": "direct_youtube",
+                    "id": res["id"],
+                    "url": res["url"],
+                    "privacy": res["privacy"],
+                    "title": res["title"],
+                }
+
+        # Prepare Upload-Post form data
         url = "https://api.upload-post.com/api/upload"
         headers = {
             "Authorization": f"Apikey {upload_key}"
         }
 
-        # Prepare data as dict (httpx handles lists for multiple values)
         data_payload = {
             "user": post_user,
             "title": final_title,
@@ -4703,14 +4851,24 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
              data_payload["media_type"] = "REELS"
 
         if "youtube" in req.platforms:
-             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
              data_payload["youtube_title"] = yt_title
              data_payload["youtube_description"] = final_description
-             data_payload["privacyStatus"] = "public"
+             data_payload["privacyStatus"] = confirmed_privacy
+
+        # Check if Upload-Post is in test / mock mode
+        if upload_key and (upload_key.lower() in ("mock", "test", "sandbox") or os.environ.get("UPLOAD_POST_MOCK") == "1"):
+            print(f"📡 [Mock/Test Mode] Simulated Upload-Post publish for {req.platforms} with privacy={confirmed_privacy}")
+            return {
+                "status": "success",
+                "test_mode": True,
+                "message": f"Simulated Upload-Post upload completed successfully with privacy={confirmed_privacy}",
+                "privacyStatus": confirmed_privacy,
+                "platforms": req.platforms,
+                "id": "mock_up_test_123",
+                "url": "https://upload-post.com/test",
+            }
 
         # Send File
-        # httpx AsyncClient requires async file reading or bytes. 
-        # Since we have MAX_FILE_SIZE_MB, reading into memory is safe-ish.
         with open(file_path, "rb") as f:
             file_content = f.read()
             
@@ -4718,20 +4876,140 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             "video": (filename, file_content, "video/mp4")
         }
 
-        # Switch to synchronous Client to avoid "sync request with AsyncClient" error with multipart/files
         with httpx.Client(timeout=120.0) as client:
-            print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
+            print(f"📡 Sending to Upload-Post for platforms: {req.platforms} (privacy={confirmed_privacy})")
             response = client.post(url, headers=headers, data=data_payload, files=files)
             
-        if response.status_code not in [200, 201, 202]: # Added 201
+        if response.status_code not in [200, 201, 202]:
              print(f"❌ Upload-Post Error: {response.text}")
              raise HTTPException(status_code=response.status_code, detail=f"Vendor API Error: {response.text}")
 
         return response.json()
 
+    except HTTPException:
+        raise
+    except (YouTubeAuthError, YouTubeUploadError) as e:
+        raise HTTPException(status_code=400, detail=f"YouTube Upload Failed: {e}")
     except Exception as e:
         print(f"❌ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/youtube/readiness")
+@app.get("/api/social/readiness")
+async def get_social_readiness(request: Request):
+    """Check readiness of YouTube and social publishing backends."""
+    from youtube_uploader import get_youtube_readiness_status
+    upload_key, _ = await resolve_upload_post(request)
+    direct_status = get_youtube_readiness_status()
+    default_privacy = direct_status["default_privacy"]
+
+    direct_ready = direct_status["ready"]
+    upload_post_ready = bool(upload_key)
+
+    return {
+        "youtube_ready": direct_ready or upload_post_ready,
+        "direct_youtube": direct_status,
+        "upload_post": {
+            "ready": upload_post_ready,
+            "has_key": upload_post_ready,
+        },
+        "default_privacy": default_privacy,
+        "supported_privacy_options": ["private", "unlisted", "public"],
+        "setup_help": {
+            "direct_youtube": (
+                "Set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN (or YOUTUBE_ACCESS_TOKEN) "
+                "in your environment or .env file to enable direct YouTube upload."
+            ),
+            "upload_post": (
+                "Set UPLOAD_POST_API_KEY in your environment or provide X-Upload-Post-Key header."
+            ),
+        },
+    }
+
+class DirectYouTubeUploadRequest(BaseModel):
+    job_id: Optional[str] = None
+    clip_index: Optional[int] = None
+    video_path: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    privacy_status: Optional[str] = None
+    privacyStatus: Optional[str] = None
+    privacy: Optional[str] = None
+    access_token: Optional[str] = None
+
+@app.post("/api/youtube/upload")
+async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Request):
+    """Directly upload a video file or processed clip to YouTube Shorts."""
+    from youtube_uploader import (
+        upload_youtube_short,
+        is_youtube_auth_configured,
+        YouTubeAuthError,
+        YouTubeUploadError,
+    )
+    
+    file_path = None
+    clip_title = req.title
+    clip_desc = req.description or ""
+
+    if req.job_id:
+        await _ensure_job_files(req.job_id, request)
+        if req.job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = jobs[req.job_id]
+        await _assert_job_owner(request, job)
+        if 'result' not in job or 'clips' not in job['result']:
+            raise HTTPException(status_code=400, detail="Job result not available")
+        idx = req.clip_index or 0
+        if idx < 0 or idx >= len(job['result']['clips']):
+            raise HTTPException(status_code=400, detail="Invalid clip index")
+        clip = job['result']['clips'][idx]
+        filename = clip['video_url'].split('/')[-1]
+        file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+        if not clip_title:
+            clip_title = clip.get('video_title_for_youtube_short') or clip.get('title') or "Viral Short"
+        if not clip_desc:
+            clip_desc = clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "#Shorts"
+    elif req.video_path:
+        file_path = req.video_path
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(OUTPUT_DIR, file_path)
+
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
+
+    confirmed_privacy = resolve_youtube_privacy(req.privacy_status, req.privacyStatus, req.privacy)
+    token = req.access_token or request.headers.get("X-YouTube-Access-Token") or os.environ.get("YOUTUBE_ACCESS_TOKEN", "").strip() or None
+
+    if not is_youtube_auth_configured(access_token=token):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "YouTube upload is not ready. Direct YouTube OAuth credentials are missing. "
+                "Provide YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN (or YOUTUBE_ACCESS_TOKEN) "
+                "in your environment or request."
+            ),
+        )
+
+    try:
+        res = upload_youtube_short(
+            video_path=file_path,
+            title=clip_title or "Short Video",
+            description=clip_desc,
+            privacy_status=confirmed_privacy,
+            access_token=token,
+        )
+        return {
+            "success": True,
+            "method": "direct_youtube",
+            "id": res["id"],
+            "url": res["url"],
+            "privacy": res["privacy"],
+            "title": res["title"],
+        }
+    except (YouTubeAuthError, YouTubeUploadError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YouTube upload error: {e}")
 
 @app.get("/api/social/user")
 async def get_social_user(request: Request):
@@ -4743,6 +5021,16 @@ async def get_social_user(request: Request):
     api_key, forced_profile = await resolve_upload_post(request, None)
     if not api_key:
          raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
+
+    if api_key.lower() in ("mock", "test", "sandbox") or os.environ.get("UPLOAD_POST_MOCK") == "1":
+        return {
+            "profiles": [
+                {
+                    "username": os.environ.get("UPLOAD_POST_PROFILE", "default_profile"),
+                    "connected": ["youtube", "tiktok", "instagram"],
+                }
+            ]
+        }
 
     url = "https://api.upload-post.com/api/uploadposts/users"
     print(f"🔍 Fetching User ID from: {url}")
@@ -4839,8 +5127,11 @@ async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
 
 async def _upload_post_get(api_key: str, url: str, params: dict):
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(url, headers=headers, params=params)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(url, headers=headers, params=params)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Vendor API connection error: {e}")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Vendor API Error: {resp.text}")
     return resp.json()
@@ -5454,10 +5745,14 @@ async def thumbnail_publish(
     title: str = Form(...),
     description: str = Form(...),
     thumbnail_url: str = Form(...),
+    privacy_status: Optional[str] = Form(None),
+    privacyStatus: Optional[str] = Form(None),
+    privacy: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),   # BYOK; ignored for managed users
     user_id: Optional[str] = Form(None),   # BYOK profile; ignored for managed users
 ):
     """Kick off a background upload to YouTube via Upload-Post and return immediately."""
+    confirmed_privacy = resolve_youtube_privacy(privacy_status, privacyStatus, privacy)
     if session_id not in thumbnail_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -5505,7 +5800,7 @@ async def thumbnail_publish(
                 "async_upload": "true",
                 "youtube_title": title,
                 "youtube_description": description,
-                "privacyStatus": "public",
+                "privacyStatus": confirmed_privacy,
             }
             video_filename = os.path.basename(video_path)
             thumb_filename = os.path.basename(thumb_path)
@@ -5778,18 +6073,54 @@ class SaaSPostRequest(BaseModel):
     description: Optional[str] = None
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
+    privacy_status: Optional[str] = None
+    privacyStatus: Optional[str] = None
+    privacy: Optional[str] = None
+    access_token: Optional[str] = None
 
 
 @app.post("/api/saasshorts/post")
 async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
-    """Post an AI Shorts video to social media via Upload-Post."""
+    """Post an AI Shorts video to social media via Upload-Post or direct YouTube."""
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    confirmed_privacy = resolve_youtube_privacy(req.privacy_status, req.privacyStatus, req.privacy)
+    is_only_youtube = (req.platforms == ["youtube"])
+
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
+
+    from youtube_uploader import (
+        is_youtube_auth_configured,
+        upload_youtube_short,
+        YouTubeAuthError,
+        YouTubeUploadError,
+    )
+    direct_yt_token = req.access_token or request.headers.get("X-YouTube-Access-Token")
+    direct_yt_ready = is_youtube_auth_configured(access_token=direct_yt_token)
+
     if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, req.user_id)
+        if is_only_youtube:
+            if not direct_yt_ready:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "YouTube upload is not ready. Missing credentials: configure direct YouTube OAuth "
+                        "(set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and YOUTUBE_REFRESH_TOKEN, or YOUTUBE_ACCESS_TOKEN in environment) "
+                        "or configure Upload-Post (set UPLOAD_POST_API_KEY in environment or pass X-Upload-Post-Key header with profile)."
+                    ),
+                )
+            post_user = None
+        else:
+            missing_platforms = [p for p in req.platforms if p != "youtube"]
+            if missing_platforms:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Upload-Post API key is required to post to {', '.join(missing_platforms)}. Missing Upload-Post API key.",
+                )
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+    else:
+        post_user = resolve_post_profile(forced_profile, req.user_id or os.environ.get("UPLOAD_POST_PROFILE"))
 
     job = saas_jobs[req.job_id]
     await _assert_job_owner(request, job)
@@ -5811,6 +6142,53 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
         final_description = req.description or script.get("caption", "")
         if not final_description:
             final_description = script.get("full_narration", "Check this out!")
+
+        if is_only_youtube and direct_yt_ready and not upload_key:
+            if req.scheduled_date:
+                from publishing_queue import get_publishing_queue
+                import datetime as dt_module
+                try:
+                    clean_dt = req.scheduled_date.replace("Z", "+00:00")
+                    target_time = dt_module.datetime.fromisoformat(clean_dt).timestamp()
+                except Exception:
+                    target_time = None
+
+                queue = get_publishing_queue()
+                post_item = queue.enqueue(
+                    job_id=req.job_id,
+                    clip_id="saas_clip",
+                    platform="youtube",
+                    account_id="direct_youtube",
+                    title=final_title,
+                    description=final_description,
+                    video_path=file_path,
+                    requested_time=target_time,
+                    metadata={"privacy": confirmed_privacy, "privacy_status": confirmed_privacy},
+                )
+                return {
+                    "success": True,
+                    "method": "queued_direct_youtube",
+                    "post_id": post_item.id,
+                    "scheduled_at": post_item.due_at,
+                    "privacy": confirmed_privacy,
+                    "title": final_title,
+                }
+            else:
+                res = upload_youtube_short(
+                    video_path=file_path,
+                    title=final_title,
+                    description=final_description,
+                    privacy_status=confirmed_privacy,
+                    access_token=direct_yt_token,
+                )
+                return {
+                    "success": True,
+                    "method": "direct_youtube",
+                    "id": res["id"],
+                    "url": res["url"],
+                    "privacy": res["privacy"],
+                    "title": res["title"],
+                }
 
         url = "https://api.upload-post.com/api/upload"
         headers = {"Authorization": f"Apikey {upload_key}"}
@@ -5836,7 +6214,18 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
         if "youtube" in req.platforms:
             data_payload["youtube_title"] = final_title
             data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
+            data_payload["privacyStatus"] = confirmed_privacy
+
+        if upload_key and (upload_key.lower() in ("mock", "test", "sandbox") or os.environ.get("UPLOAD_POST_MOCK") == "1"):
+            return {
+                "status": "success",
+                "test_mode": True,
+                "message": f"Simulated Upload-Post upload completed successfully with privacy={confirmed_privacy}",
+                "privacyStatus": confirmed_privacy,
+                "platforms": req.platforms,
+                "id": "mock_saas_test_123",
+                "url": "https://upload-post.com/test",
+            }
 
         filename = os.path.basename(file_path)
         with open(file_path, "rb") as f:
@@ -6240,3 +6629,11 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+# Mount built dashboard frontend if available
+_frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard", "dist")
+if os.path.isdir(_frontend_dist) and os.path.isfile(os.path.join(_frontend_dist, "index.html")):
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+
+

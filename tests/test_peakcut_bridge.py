@@ -74,6 +74,7 @@ def test_peakcut_status_endpoint():
     assert "styles" in data
     assert "layouts" in data
     assert "ai" in data
+    assert data["ai"]["ready"] == data["ai"]["configured"]
 
 
 def test_peakcut_sync_endpoint():
@@ -84,6 +85,7 @@ def test_peakcut_sync_endpoint():
     assert "v" in data
     assert "jobs" in data
     assert "creators" in data
+    assert data["ai"]["ready"] == data["ai"]["configured"]
     token = data["v"]
 
     # Repeated sync with same token should be lightweight unchanged token

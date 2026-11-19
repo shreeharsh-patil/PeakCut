@@ -1,4 +1,5 @@
 """Tests for Multi-Platform Publishing Queue & Smart Scheduler (publishing_queue.py)."""
+import datetime as dt
 import time
 from pathlib import Path
 
@@ -49,7 +50,8 @@ def test_slot_spacing_and_daily_cap(tmp_path: Path):
     queue_file = tmp_path / "test_queue_slots.json"
     queue = PublishingQueue(queue_file=queue_file, post_gap_minutes=60, daily_cap=2)
 
-    now = time.time()
+    # Anchor now to 10:00 AM so p1 and p2 are guaranteed to fall on the same day regardless of execution time
+    now = (dt.datetime.now() + dt.timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0).timestamp()
 
     # Post 1
     p1 = queue.enqueue(

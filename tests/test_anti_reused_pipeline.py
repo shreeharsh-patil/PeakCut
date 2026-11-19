@@ -46,7 +46,7 @@ def get_or_create_test_clip(tmp_path: Path) -> str:
         pytest.skip("ffmpeg or test video fixture not available in environment")
 
 
-BGM_SAMPLE = "shorts-autopilot/clips_auto/assets/music_bed.mp3"
+BGM_SAMPLE = "assets/music_bed.mp3"
 
 
 def test_config_initialization():
@@ -206,7 +206,7 @@ def test_end_to_end_pipeline_execution(tmp_path):
 
     audio_cfg = AudioConfig(
         voiceover_provider=TTSProvider.SAPI,
-        voiceover_text="This clip breaks down the most interesting moments in this video with thorough analysis.",
+        voiceover_text="This clip breaks down the most interesting moments in this video with thorough analysis, detailed insights, deep examination, and comprehensive breakdown across the full runtime.",
         ducking_mode=AudioDuckingMode.SIDECHAIN_DUCK,
         bgm_path=BGM_SAMPLE if os.path.isfile(BGM_SAMPLE) else None
     )

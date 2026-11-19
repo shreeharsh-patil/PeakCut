@@ -119,7 +119,15 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 model = None
 if YOLO is not None:
     try:
-        model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+        yolo_path = os.environ.get("YOLO_MODEL_PATH")
+        if not yolo_path:
+            for cand in ["models/yolov8n.pt", "assets/yolov8n.pt", "yolov8n.pt"]:
+                if os.path.exists(cand):
+                    yolo_path = cand
+                    break
+            else:
+                yolo_path = "models/yolov8n.pt"
+        model = YOLO(yolo_path)
     except Exception as e:
         print(f"⚠️ YOLO model init notice: {e}")
 
@@ -157,6 +165,8 @@ class SmoothedCameraman:
         self.output_height = output_height
         self.video_width = video_width
         self.video_height = video_height
+        if not aspect_ratio or aspect_ratio <= 0:
+            aspect_ratio = ASPECT_RATIO
         self.aspect_ratio = aspect_ratio
 
         # Initial State
@@ -169,6 +179,10 @@ class SmoothedCameraman:
         if self.crop_width > video_width:
              self.crop_width = video_width
              self.crop_height = int(self.crop_width / aspect_ratio)
+
+        # Enforce even dimensions for encoder compatibility
+        self.crop_width = max(2, self.crop_width - (self.crop_width % 2))
+        self.crop_height = max(2, self.crop_height - (self.crop_height % 2))
              
         # Safe Zone: 20% of the video width
         # As long as the target is within this zone relative to current center, DO NOT MOVE.
@@ -289,14 +303,14 @@ class SmoothedCameraman:
         if self.current_center_x + half_crop > self.video_width:
             self.current_center_x = self.video_width - half_crop
             
-        x1 = int(self.current_center_x - half_crop)
-        x2 = int(self.current_center_x + half_crop)
+        x1 = int(round(self.current_center_x - half_crop))
+        x1 = max(0, min(x1, self.video_width - self.crop_width))
+        x2 = min(self.video_width, x1 + self.crop_width)
         
-        x1 = max(0, x1)
-        x2 = min(self.video_width, x2)
-        
-        y1 = 0
-        y2 = self.video_height
+        half_crop_y = self.crop_height / 2
+        y1 = int(round(self.video_height / 2.0 - half_crop_y))
+        y1 = max(0, min(y1, self.video_height - self.crop_height))
+        y2 = min(self.video_height, y1 + self.crop_height)
         
         return x1, y1, x2, y2
 
@@ -681,12 +695,31 @@ def detect_scenes(video_path):
 def get_video_resolution(video_path):
     probe = cv2.VideoCapture(video_path)
     try:
-        if not probe.isOpened():
-            raise IOError(f"cannot open video: {video_path}")
-        return (int(probe.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        if probe.isOpened():
+            w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if w > 0 and h > 0:
+                return w, h
     finally:
         probe.release()
+
+    # Fallback to ffprobe if cv2 failed or returned 0
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            str(video_path)
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and "x" in out.stdout:
+            parts = out.stdout.strip().split("x")
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+
+    raise IOError(f"cannot open video or determine resolution: {video_path}")
 
 
 # Byte budget for the sanitized video title used as the stem of every derived
@@ -906,6 +939,65 @@ def download_youtube_video(url, output_dir="."):
         expected = os.path.join(output_dir, f'{sanitized}.mp4')
         if os.path.exists(expected):
             os.remove(expected)
+
+        if info.get('live_status') == 'is_upcoming':
+            raise ValueError(f"YouTube Live stream '{info.get('title')}' is upcoming and has not started yet.")
+
+        is_live = bool(info.get('is_live') or info.get('live_status') == 'is_live')
+        if is_live:
+            live_sec = int(os.environ.get("LIVE_RECORD_SECONDS", "900"))
+            print(f"🔴 Active YouTube Live Stream detected: '{info.get('title')}'")
+            print(f"⏱️ Capturing {live_sec} seconds ({live_sec/60:.1f} mins) of live stream...")
+
+            # Extract playable stream manifest/URL (pairing video and audio if separate)
+            candidates = info.get("requested_formats")
+            stream_urls = []
+            if candidates:
+                stream_urls = [f.get("url") for f in candidates if isinstance(f, dict) and f.get("url")]
+            if not stream_urls and info.get("url"):
+                stream_urls = [info.get("url")]
+            if not stream_urls and info.get("formats"):
+                fmts = [f for f in info.get("formats", []) if isinstance(f, dict) and f.get("url")]
+                combined = [f for f in fmts if f.get("vcodec") != "none" and f.get("acodec") != "none"]
+                if combined:
+                    best = max(combined, key=lambda f: f.get("height") or 0)
+                    stream_urls = [best.get("url")]
+                else:
+                    videos = [f for f in fmts if f.get("vcodec") != "none"]
+                    audios = [f for f in fmts if f.get("acodec") != "none"]
+                    if videos:
+                        stream_urls.append(max(videos, key=lambda f: f.get("height") or 0).get("url"))
+                    if audios:
+                        stream_urls.append(max(audios, key=lambda f: f.get("abr") or 0).get("url"))
+                    if not stream_urls and fmts:
+                        stream_urls = [fmts[-1].get("url")]
+
+            if stream_urls:
+                ff_cmd = [
+                    "ffmpeg", "-y",
+                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
+                ]
+                for u in stream_urls:
+                    ff_cmd.extend(["-i", str(u)])
+                if len(stream_urls) > 1:
+                    ff_cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
+                else:
+                    ff_cmd.extend(["-map", "0:v:0", "-map", "0:a?"])
+                ff_cmd.extend([
+                    "-t", str(live_sec),
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    expected
+                ])
+                res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                if res.returncode == 0 and os.path.exists(expected) and os.path.getsize(expected) > 1000:
+                    print(f"✅ Live stream segment captured: {expected} ({os.path.getsize(expected)/(1024*1024):.1f} MB)")
+                    return sanitized
+                else:
+                    err = res.stderr.decode('utf-8', errors='ignore') if res.stderr else "unknown error"
+                    print(f"⚠️ FFmpeg stream capture warning ({err[:150]}), falling back to yt-dlp...")
+
         dl_opts = {
             **_base_opts(extractor_args, proxy),
             'format': fmt,
@@ -913,6 +1005,10 @@ def download_youtube_video(url, output_dir="."):
             'merge_output_format': 'mp4', 'overwrites': True,
             'progress_hooks': [_progress_hook],
         }
+        if is_live:
+            dl_opts['live_from_start'] = False
+            dl_opts['downloader'] = 'ffmpeg'
+            dl_opts['downloader_args'] = {'ffmpeg': ['-t', str(live_sec)]}
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([url])
         return sanitized
@@ -966,7 +1062,11 @@ def download_youtube_video(url, output_dir="."):
                                     "paid": proxy is not None and proxy == _proxy,
                                     "error": str(e)[:300]})
                 print(f"⚠️  Download attempt '{label}' failed: {str(e)[:200]}")
-                retryable = '403' in str(e) or 'Forbidden' in str(e)
+                err_str = str(e).lower()
+                retryable = any(k in err_str for k in [
+                    '403', 'forbidden', 'timeout', 'timed out', 'connection reset',
+                    '503', '429', 'remotedisconnected', 'broken pipe', 'connection refused'
+                ])
                 if not retryable or retry == 1:
                     break
                 time.sleep(3)
@@ -991,9 +1091,24 @@ Technical Details: {str(last_err)}
 
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if not os.path.exists(downloaded_file):
-        for f in os.listdir(output_dir):
-            if f.startswith(sanitized_title) and f.endswith('.mp4'):
-                downloaded_file = os.path.join(output_dir, f)
+        for ext in ('.mp4', '.mkv', '.webm', '.mov', '.ts'):
+            for f in os.listdir(output_dir):
+                if f.startswith(sanitized_title) and f.endswith(ext):
+                    candidate = os.path.join(output_dir, f)
+                    if ext == '.mp4':
+                        downloaded_file = candidate
+                    else:
+                        remuxed = os.path.join(output_dir, f'{sanitized_title}.mp4')
+                        remux_cmd = ['ffmpeg', '-y', '-i', candidate, '-c', 'copy', '-movflags', '+faststart', remuxed]
+                        r = subprocess.run(remux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        if r.returncode == 0 and os.path.exists(remuxed):
+                            try:
+                                os.remove(candidate)
+                            except OSError:
+                                pass
+                            downloaded_file = remuxed
+                    break
+            if os.path.exists(downloaded_file):
                 break
 
     # Paid bytes across EVERY attempt that used the per-GB proxy, failed ones
@@ -1088,28 +1203,35 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
             output_dir, f"autosubs_{generation_id}_{uuid.uuid4().hex[:8]}.ass")
         out_path = os.path.join(output_dir, f"subtitled_{generation_id}_{stem}")
 
-        if split_ranges is None:
-            import layout_ranges as _layouts
-            split_ranges = _layouts.split_ranges(_layouts.read(clip_path))
-        if not _subs.generate_ass(
-                transcript, clip_start, clip_end, ass_path,
-                split_ranges=split_ranges,
-                max_chars=style["max_chars"], max_duration=style["max_duration"],
+        try:
+            if split_ranges is None:
+                import layout_ranges as _layouts
+                split_ranges = _layouts.split_ranges(_layouts.read(clip_path))
+            if not _subs.generate_ass(
+                    transcript, clip_start, clip_end, ass_path,
+                    split_ranges=split_ranges,
+                    max_chars=style["max_chars"], max_duration=style["max_duration"],
+                    alignment=style["alignment"], fontsize=style["font_size"],
+                    font_name=style["font_name"], font_color=style["font_color"],
+                    border_color=style["border_color"], border_width=style["border_width"],
+                    highlight_color=style["highlight_color"], effect=style["effect"],
+                    base_opacity=style["base_opacity"], uppercase=style["uppercase"]):
+                print("   ℹ️ No words in range — clip ships without captions.")
+                return None
+
+            _subs.burn_subtitles(
+                clip_path, ass_path, out_path,
                 alignment=style["alignment"], fontsize=style["font_size"],
                 font_name=style["font_name"], font_color=style["font_color"],
-                border_color=style["border_color"], border_width=style["border_width"],
-                highlight_color=style["highlight_color"], effect=style["effect"],
-                base_opacity=style["base_opacity"], uppercase=style["uppercase"]):
-            print("   ℹ️ No words in range — clip ships without captions.")
-            return None
-
-        _subs.burn_subtitles(
-            clip_path, ass_path, out_path,
-            alignment=style["alignment"], fontsize=style["font_size"],
-            font_name=style["font_name"], font_color=style["font_color"],
-            border_color=style["border_color"], border_width=style["border_width"])
-        print(f"   💬 Captions burned: {os.path.basename(out_path)}")
-        return out_path
+                border_color=style["border_color"], border_width=style["border_width"])
+            print(f"   💬 Captions burned: {os.path.basename(out_path)}")
+            return out_path
+        finally:
+            if os.path.exists(ass_path):
+                try:
+                    os.remove(ass_path)
+                except OSError:
+                    pass
     except Exception as e:
         print(f"   ⚠️ Auto-captions failed ({type(e).__name__}: {e}) — "
               f"delivering the clip without them.")
@@ -2054,6 +2176,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Maximum duration for extracted clips in seconds.")
     parser.add_argument('--target-clips', '--max-clips', type=int, default=None, dest="target_clips",
                         help="Target number of clips to extract.")
+    parser.add_argument('--live-record-seconds', type=int, default=None,
+                        help="Duration in seconds to capture if URL is an active YouTube Live stream (default: 900s).")
     return parser
 
 
@@ -2063,6 +2187,8 @@ if __name__ == '__main__':
     if unknown:
         print(f"ℹ️ Note: Ignoring unrecognized CLI arguments: {unknown}")
 
+    if args.live_record_seconds:
+        os.environ["LIVE_RECORD_SECONDS"] = str(args.live_record_seconds)
     if args.clip_min_seconds:
         os.environ["CLIP_MIN_SECONDS"] = str(args.clip_min_seconds)
     if args.clip_max_seconds:
@@ -2152,16 +2278,24 @@ if __name__ == '__main__':
         # ends up in os.remove() on it further down and dies with EACCES.
         output_file = args.output
         if (not output_file or os.path.isdir(output_file)
-                or output_file.endswith(("/", os.sep))):
-            output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
+                or output_file.endswith(("/", os.sep))
+                or not os.path.splitext(output_file)[1]):
+            output_file = os.path.join(output_file or output_dir, f"{video_title}_vertical.mp4")
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         render_clip(input_video, output_file, output_format)
     else:
         # Get duration (needed by both the transcript and the vision path).
         cap = cv2.VideoCapture(input_video)
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
         cap.release()
+        if fps and fps > 0 and frame_count and frame_count > 0:
+            duration = frame_count / fps
+        else:
+            from smartcut import get_media_duration
+            duration = get_media_duration(input_video)
+            if not fps or fps <= 0 or (isinstance(fps, float) and np.isnan(fps)):
+                fps = 30.0
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).

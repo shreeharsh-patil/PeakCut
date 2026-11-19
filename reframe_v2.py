@@ -51,6 +51,9 @@ def delivery_size(orig_w, orig_h, aspect_ratio):
     ``DELIVERY_MIN_WIDTH`` if that crop is narrower. Both dimensions come back
     even (x264/NVENC reject odd ones).
     """
+    if not aspect_ratio or aspect_ratio <= 0:
+        aspect_ratio = 9 / 16
+
     out_h = orig_h
     out_w = int(out_h * aspect_ratio)
     if out_w > orig_w:
@@ -548,7 +551,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 graph = general_filtergraph(out_w, out_h,
                                             orig_w=orig_w, orig_h=orig_h)
             else:
-                seg_xs = [x if x is not None else 0 for x in xs[start_f:end_f]]
+                seg_xs = [x - (x % 2) if x is not None else 0 for x in xs[start_f:end_f]]
                 cmd_path = os.path.join(workdir, f"cmd_{idx:03d}.txt")
                 if beats:
                     zooms = punch_in.zoom_curve(len(seg_xs), fps, beats,
@@ -566,6 +569,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     # target, where y=0 threw away the bottom of the frame
                     # instead of trimming both ends.
                     crop_y = max(0, (orig_h - crop_h) // 2)
+                    crop_y -= crop_y % 2
                     init = f"w={crop_w}:h={crop_h}:x={seg_xs[0]}:y={crop_y}"
                 with open(cmd_path, "w") as f:
                     f.write("\n".join(lines) + "\n")

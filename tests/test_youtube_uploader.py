@@ -114,3 +114,49 @@ def test_register_youtube_dispatcher(tmp_path: Path):
         res = queue.post_dispatchers["youtube"](item)
         assert res["remote_id"] == "yt_123"
         assert res["remote_url"] == "https://youtube.com/shorts/yt_123"
+
+
+def test_upload_youtube_short_dry_run(tmp_path: Path):
+    dummy_video = tmp_path / "clip.mp4"
+    dummy_video.write_bytes(b"sample bytes")
+
+    res = upload_youtube_short(
+        video_path=dummy_video,
+        title="Simulated Short",
+        dry_run=True,
+    )
+    assert res["simulated"] is True
+    assert res["id"].startswith("sim_")
+    assert "https://youtube.com/shorts/" in res["url"]
+    assert "#Shorts" in res["title"]
+
+
+def test_upload_youtube_short_datetime_publish_at(tmp_path: Path):
+    import datetime
+    dummy_video = tmp_path / "clip.mp4"
+    dummy_video.write_bytes(b"sample bytes")
+
+    scheduled_dt = datetime.datetime(2026, 12, 1, 15, 30, tzinfo=datetime.timezone.utc)
+    res = upload_youtube_short(
+        video_path=dummy_video,
+        title="Future Short",
+        publish_at=scheduled_dt,
+        dry_run=True,
+    )
+    assert res["publish_at"] == "2026-12-01T15:30:00Z"
+    assert res["privacy"] == "private"
+
+
+def test_upload_youtube_short_network_offline(tmp_path: Path):
+    dummy_video = tmp_path / "clip.mp4"
+    dummy_video.write_bytes(b"sample bytes")
+
+    import urllib.error
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
+        with pytest.raises(YouTubeUploadError, match="offline or unreachable"):
+            upload_youtube_short(
+                video_path=dummy_video,
+                title="Offline Test",
+                access_token="valid_token",
+                dry_run=False,
+            )

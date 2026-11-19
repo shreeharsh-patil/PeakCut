@@ -56,6 +56,36 @@ class TestSuperchargedApi:
         assert resp.status_code == 200
         assert "sessions" in resp.json()
 
+        # 3. Get session status by path param and sub-path
+        with patch.object(LiveClipperManager, "get_session") as mock_get:
+            mock_sess = MagicMock()
+            mock_sess.get_status.return_value = {"session_id": "test_sess_api", "is_running": True}
+            mock_sess.lock = MagicMock()
+            mock_sess.total_samples = 32000
+            mock_event = MagicMock()
+            mock_event.clip_id = "clip_live_01"
+            mock_event.duration = 10.0
+            mock_sess.trigger_clip.return_value = mock_event
+            mock_get.return_value = mock_sess
+
+            resp_status1 = _call_api("GET", "/api/live/test_sess_api")
+            assert resp_status1.status_code == 200
+            assert resp_status1.json()["session_id"] == "test_sess_api"
+
+            resp_status2 = _call_api("GET", "/api/live/test_sess_api/status")
+            assert resp_status2.status_code == 200
+
+            # 4. Extract clip via path param
+            resp_clip = _call_api("POST", "/api/live/test_sess_api/clip", json_body={"start_sec": 0, "end_sec": 10})
+            assert resp_clip.status_code == 200
+            assert resp_clip.json()["clip_id"] == "clip_live_01"
+
+            # 5. Stop session by path param
+            with patch.object(LiveClipperManager, "stop_session", return_value=True):
+                resp_stop = _call_api("POST", "/api/live/test_sess_api/stop")
+                assert resp_stop.status_code == 200
+                assert resp_stop.json()["status"] == "stopped"
+
     def test_discover_routes(self):
         with patch("niche_discovery.NicheDiscoveryEngine.search_youtube_api") as mock_search:
             mock_search.return_value = [

@@ -83,6 +83,15 @@ class QueueEnqueueRequest(BaseModel):
     account_name: Optional[str] = None
     schedule_now: bool = False
     requested_time: Optional[float] = None
+    privacy: Optional[str] = "unlisted"
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class LivePathClipRequest(BaseModel):
+    start_sec: Optional[float] = None
+    end_sec: Optional[float] = None
+    seconds: Optional[float] = None
+    title: Optional[str] = None
 
 
 class QueuePostActionRequest(BaseModel):
@@ -129,6 +138,16 @@ async def stop_live_session(req: LiveStopRequest):
     return {"status": "stopped", "session_id": req.session_id}
 
 
+@router.post("/api/live/{session_id}/stop")
+async def stop_live_session_by_id(session_id: str):
+    """Stop an active live stream recording session by path parameter."""
+    manager = LiveClipperManager.get_instance()
+    success = manager.stop_session(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return {"status": "stopped", "session_id": session_id, "ok": True}
+
+
 @router.get("/api/live/sessions")
 async def list_live_sessions():
     """List all active and past live stream clipping sessions."""
@@ -136,6 +155,8 @@ async def list_live_sessions():
     return {"sessions": manager.list_sessions()}
 
 
+@router.get("/api/live/{session_id}")
+@router.get("/api/live/{session_id}/status")
 @router.get("/api/live/status/{session_id}")
 async def get_live_status(session_id: str):
     """Retrieve detailed real-time telemetry, buffer info, and extracted clips for a session."""
@@ -154,13 +175,48 @@ async def extract_live_clip(req: LiveClipRequest):
     if not session:
         raise HTTPException(status_code=404, detail=f"Session '{req.session_id}' not found")
 
+    start_sec = max(0.0, float(req.start_sec))
+    end_sec = float(req.end_sec)
+    if end_sec <= start_sec:
+        raise HTTPException(status_code=400, detail="end_sec must be strictly greater than start_sec")
+
     event = session.trigger_clip(
-        start_sec=req.start_sec,
-        end_sec=req.end_sec,
+        start_sec=start_sec,
+        end_sec=end_sec,
         trigger_type="manual",
-        title=req.title or f"Manual Clip @ {req.start_sec:.1f}s",
+        title=req.title or f"Manual Clip @ {start_sec:.1f}s",
     )
     return {"status": "extracting", "clip_id": event.clip_id, "duration": event.duration}
+
+
+@router.post("/api/live/{session_id}/clip")
+async def extract_live_clip_by_path(session_id: str, req: LivePathClipRequest):
+    """Extract a clip via path parameter session_id."""
+    manager = LiveClipperManager.get_instance()
+    session = manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+    if req.start_sec is not None and req.end_sec is not None:
+        start_sec = max(0.0, float(req.start_sec))
+        end_sec = float(req.end_sec)
+    else:
+        seconds = float(req.seconds or 30.0)
+        with session.lock:
+            current_sec = session.total_samples / 16000.0 if session.total_samples else 30.0
+        start_sec = max(0.0, current_sec - seconds)
+        end_sec = current_sec
+
+    if end_sec <= start_sec:
+        raise HTTPException(status_code=400, detail="end_sec must be strictly greater than start_sec")
+
+    event = session.trigger_clip(
+        start_sec=start_sec,
+        end_sec=end_sec,
+        trigger_type="manual",
+        title=req.title or f"Manual Clip ({int(end_sec - start_sec)}s)",
+    )
+    return {"status": "extracting", "clip_id": event.clip_id, "duration": event.duration, "ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +358,10 @@ async def poll_channels_now():
 async def enqueue_post(req: QueueEnqueueRequest):
     """Enqueue a finished clip for scheduled, spaced publication across platforms."""
     queue = get_publishing_queue()
+    meta = dict(req.metadata or {})
+    if req.privacy:
+        meta.setdefault("privacy", req.privacy)
+        meta.setdefault("privacy_status", req.privacy)
     item = queue.enqueue(
         job_id=req.job_id,
         clip_id=req.clip_id,
@@ -313,6 +373,7 @@ async def enqueue_post(req: QueueEnqueueRequest):
         account_name=req.account_name or req.account_id,
         schedule_now=req.schedule_now,
         requested_time=req.requested_time,
+        metadata=meta,
     )
     return {"status": "scheduled", "post": item.to_dict()}
 

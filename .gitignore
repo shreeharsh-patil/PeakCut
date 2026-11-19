@@ -1,11 +1,17 @@
-# Video files
+# Video & Audio files
 *.mp4
 *.webm
 *.mov
 *.mkv
+*.aac
+*.m4a
+*.wav
 
-# YOLO model
+# Machine Learning Models
 *.pt
+*.onnx
+models/*.pt
+models/*.onnx
 
 # Python virtual environment
 .venv/
@@ -20,6 +26,8 @@ uploads/
 downloads/
 videos/
 output/
+data/
+logs/
 
 # OS / IDE
 .DS_Store
@@ -51,5 +59,3 @@ skills-lock.json
 
 # Embedded repositories
 PeakCut/
-clippyme/
-shorts-autopilot/

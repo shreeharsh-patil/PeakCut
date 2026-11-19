@@ -81,8 +81,28 @@ def resolve_live_stream(url: str) -> Dict[str, Any]:
     if not is_live:
         raise NotLiveError(f"Channel/URL '{url}' is not currently broadcasting live.")
 
-    formats = info.get("requested_formats") or [info]
-    stream_urls = [f["url"] for f in formats if "url" in f]
+    formats = info.get("requested_formats")
+    stream_urls = []
+    if formats:
+        stream_urls = [f["url"] for f in formats if isinstance(f, dict) and "url" in f]
+    if not stream_urls and info.get("url"):
+        stream_urls = [info["url"]]
+    if not stream_urls and info.get("formats"):
+        fmts = [f for f in info.get("formats", []) if isinstance(f, dict) and f.get("url")]
+        combined = [f for f in fmts if f.get("vcodec") != "none" and f.get("acodec") != "none"]
+        if combined:
+            best = max(combined, key=lambda f: f.get("height") or 0)
+            stream_urls = [best["url"]]
+        else:
+            videos = [f for f in fmts if f.get("vcodec") != "none"]
+            audios = [f for f in fmts if f.get("acodec") != "none"]
+            if videos:
+                stream_urls.append(max(videos, key=lambda f: f.get("height") or 0)["url"])
+            if audios:
+                stream_urls.append(max(audios, key=lambda f: f.get("abr") or 0)["url"])
+            if not stream_urls and fmts:
+                stream_urls = [fmts[-1]["url"]]
+
     title = info.get("title") or "Live Stream"
     channel = info.get("uploader") or info.get("channel") or ""
 

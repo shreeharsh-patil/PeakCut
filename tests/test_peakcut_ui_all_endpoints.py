@@ -231,13 +231,16 @@ def test_ui_publishing_accounts_and_apps():
     asyncio.run(_test())
 
 
-def test_ui_ai_settings_usage_and_notifications():
+def test_ui_ai_settings_usage_and_notifications(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
     async def _test():
         async with _async_client() as client:
             # 1. AI Settings GET & PUT
             r_ai = await client.get("/api/ai")
             assert r_ai.status_code == 200
             assert "providers" in r_ai.json()
+            assert r_ai.json()["models"][0] == "gemini-3.1-flash-lite"
 
             r_put_ai = await client.put("/api/ai", json={"provider": "gemini", "key": "test_key_1, test_key_2", "models": "gemini-2.5-flash"})
             assert r_put_ai.status_code == 200
@@ -247,9 +250,18 @@ def test_ui_ai_settings_usage_and_notifications():
             assert r_models.status_code == 200
             assert len(r_models.json()["models"]) > 0
 
+            tested = []
+            monkeypatch.setattr(
+                app_module._peakcut_bridge,
+                "_probe_gemini_api",
+                lambda key, model: tested.append((key, model)),
+            )
             r_test_ai = await client.post("/api/ai/test")
             assert r_test_ai.status_code == 200
             assert r_test_ai.json()["ok"] is True
+            assert len(tested) == 1
+            assert tested[0][0] in {"test_key_1", "test_key_2"}
+            assert tested[0][1] == "gemini-2.5-flash"
 
             # 3. AI Usage analytics
             r_usage = await client.get("/api/usage")

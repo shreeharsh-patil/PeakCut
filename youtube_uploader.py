@@ -92,22 +92,73 @@ def get_authenticated_token() -> str:
     return refresh_access_token()
 
 
+def is_youtube_auth_configured(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> bool:
+    """Return True if sufficient credentials exist for direct YouTube upload."""
+    token = access_token or os.environ.get("YOUTUBE_ACCESS_TOKEN", "").strip()
+    if token:
+        return True
+    cid = client_id or os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
+    csec = client_secret or os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
+    rtoken = refresh_token or os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
+    return bool(cid and csec and rtoken)
+
+
+def get_youtube_readiness_status() -> Dict[str, Any]:
+    """Inspect environment and return direct YouTube upload readiness metadata."""
+    has_token = bool(os.environ.get("YOUTUBE_ACCESS_TOKEN", "").strip())
+    cid = bool(os.environ.get("YOUTUBE_CLIENT_ID", "").strip())
+    csec = bool(os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip())
+    rtoken = bool(os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip())
+    is_ready = has_token or (cid and csec and rtoken)
+    default_privacy = os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "private").lower().strip()
+    if default_privacy not in ("private", "unlisted", "public"):
+        default_privacy = "private"
+
+    return {
+        "ready": is_ready,
+        "direct_auth_ready": is_ready,
+        "has_access_token": has_token,
+        "has_client_id": cid,
+        "has_client_secret": csec,
+        "has_refresh_token": rtoken,
+        "default_privacy": default_privacy,
+    }
+
+
 def upload_youtube_short(
     video_path: str | Path,
     title: str,
     description: str = "",
     tags: Optional[List[str]] = None,
     category_id: str = "22",  # 22 = People & Blogs, 24 = Entertainment
-    privacy_status: str = "unlisted",  # 'public', 'unlisted', or 'private'
+    privacy_status: Optional[str] = None,  # 'public', 'unlisted', or 'private'
+    publish_at: Optional[Any] = None,  # ISO 8601 / RFC 3339 string or datetime for scheduled publishing
     access_token: Optional[str] = None,
+    dry_run: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Upload a video file as a YouTube Short using Google's resumable upload protocol."""
     path = Path(video_path)
     if not path.is_file():
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
-    token = access_token or get_authenticated_token()
-    file_size = path.stat().st_size
+    # Determine simulation / dry-run mode
+    if dry_run is None:
+        dry_run = (
+            os.environ.get("YOUTUBE_DRY_RUN", "0").lower() in ("1", "true", "yes")
+            or os.environ.get("CLIPMIND_DRY_RUN", "0").lower() in ("1", "true", "yes")
+        )
+
+    # Resolve confirmed privacy status safely
+    if not privacy_status:
+        privacy_status = os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")
+    privacy_status = str(privacy_status).strip().lower()
+    if privacy_status not in ("public", "unlisted", "private"):
+        privacy_status = "private"
 
     # Ensure #Shorts is present in title or description to trigger YouTube Shorts recognition
     if "#Shorts" not in title and "#shorts" not in title:
@@ -116,6 +167,56 @@ def upload_youtube_short(
     if "#Shorts" not in description and "#shorts" not in description:
         description = f"{description.strip()}\n\n#Shorts #Viral #PeakCut".strip()
 
+    # Normalize publish_at formatting
+    formatted_publish_at: Optional[str] = None
+    if publish_at:
+        import datetime
+        if isinstance(publish_at, (datetime.datetime, datetime.date)):
+            if isinstance(publish_at, datetime.datetime) and publish_at.tzinfo is None:
+                publish_at = publish_at.replace(tzinfo=datetime.timezone.utc)
+            formatted_publish_at = publish_at.isoformat()
+        else:
+            formatted_publish_at = str(publish_at).strip()
+
+        if formatted_publish_at:
+            formatted_publish_at = formatted_publish_at.replace("+00:00", "Z")
+            if not (
+                formatted_publish_at.endswith("Z")
+                or "+" in formatted_publish_at[10:]
+                or "-" in formatted_publish_at[10:]
+            ):
+                formatted_publish_at = f"{formatted_publish_at}Z"
+
+    if dry_run:
+        import uuid
+        sim_id = f"sim_{uuid.uuid4().hex[:11]}"
+        short_url = f"https://youtube.com/shorts/{sim_id}"
+        logger.info(
+            f"[SIMULATION] Uploaded YouTube Short: '{title}' -> {short_url} "
+            f"(scheduled={bool(formatted_publish_at)}, publishAt={formatted_publish_at})"
+        )
+        return {
+            "id": sim_id,
+            "url": short_url,
+            "title": title,
+            "privacy": "private" if formatted_publish_at else privacy_status,
+            "publish_at": formatted_publish_at,
+            "simulated": True,
+        }
+
+    token = access_token or get_authenticated_token()
+    file_size = path.stat().st_size
+
+    status_dict: Dict[str, Any] = {
+        "selfDeclaredMadeForKids": False,
+    }
+    if formatted_publish_at:
+        # YouTube requires scheduled videos to have status='private' alongside publishAt
+        status_dict["privacyStatus"] = "private"
+        status_dict["publishAt"] = formatted_publish_at
+    else:
+        status_dict["privacyStatus"] = privacy_status.lower()
+
     metadata = {
         "snippet": {
             "title": title[:100],  # YouTube title limit is 100 characters
@@ -123,10 +224,7 @@ def upload_youtube_short(
             "tags": tags or ["Shorts", "Viral", "PeakCut"],
             "categoryId": str(category_id),
         },
-        "status": {
-            "privacyStatus": privacy_status.lower(),
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status_dict,
     }
 
     # Step 1: Initialize Resumable Upload Session
@@ -153,6 +251,8 @@ def upload_youtube_short(
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="ignore")
         raise YouTubeUploadError(f"YouTube upload initialization failed ({e.code}): {err_body}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise YouTubeUploadError(f"YouTube upload connection failed (offline or unreachable): {e}") from e
 
     # Step 2: Stream video bytes to the resumable upload URL
     logger.info(f"Uploading {file_size} bytes to YouTube resumable session...")
@@ -181,30 +281,58 @@ def upload_youtube_short(
 
             short_url = f"https://youtube.com/shorts/{video_id}"
             logger.info(f"✅ Successfully uploaded YouTube Short: {short_url}")
+
+            # Record quota if ClipMind key rotator is present
+            try:
+                from clipmind.core.key_rotator import record_quota_usage
+                record_quota_usage("youtube", 1600)
+            except Exception:
+                pass
+
             return {
                 "id": video_id,
                 "url": short_url,
                 "title": title,
-                "privacy": privacy_status,
+                "privacy": "private" if formatted_publish_at else privacy_status,
+                "publish_at": formatted_publish_at,
                 "raw_response": resp_data,
             }
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="ignore")
         raise YouTubeUploadError(f"YouTube video upload stream failed ({e.code}): {err_body}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise YouTubeUploadError(f"YouTube video stream upload failed (offline or disconnected): {e}") from e
 
 
 def register_youtube_dispatcher(queue: Any) -> None:
     """Register YouTube upload handler with PeakCut's PublishingQueue."""
     def _dispatcher(post_item: Any) -> Dict[str, Any]:
+        privacy = "unlisted"
+        publish_at = None
+        dry_run = None
+        if hasattr(post_item, "metadata") and isinstance(post_item.metadata, dict):
+            privacy = post_item.metadata.get("privacy_status") or post_item.metadata.get("privacy") or os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")
+            publish_at = post_item.metadata.get("publish_at")
+            dry_run = post_item.metadata.get("dry_run")
+
+        if dry_run is None and not is_youtube_auth_configured():
+            logger.warning("No direct YouTube credentials configured; falling back to dry-run mode for PublishingQueue item.")
+            dry_run = True
+
         result = upload_youtube_short(
             video_path=post_item.video_path,
             title=post_item.title,
             description=post_item.description,
-            privacy_status=post_item.metadata.get("privacy", "unlisted"),
+            privacy_status=privacy,
+            publish_at=publish_at,
+            dry_run=dry_run,
         )
         return {
             "remote_id": result["id"],
             "remote_url": result["url"],
+            "privacy": result.get("privacy", privacy),
+            "publish_at": result.get("publish_at"),
+            "simulated": result.get("simulated", False),
         }
 
     queue.register_dispatcher("youtube", _dispatcher)
@@ -218,6 +346,8 @@ def main():
     parser.add_argument("-d", "--description", default="", help="Video description")
     parser.add_argument("-p", "--privacy", default="unlisted", choices=["public", "unlisted", "private"],
                         help="Video privacy status (default: unlisted)")
+    parser.add_argument("--publish-at", default=None,
+                        help="ISO 8601 / RFC 3339 timestamp for scheduled release (e.g. 2026-11-18T23:00:00Z)")
     args = parser.parse_args()
 
     try:
@@ -226,10 +356,13 @@ def main():
             title=args.title,
             description=args.description,
             privacy_status=args.privacy,
+            publish_at=args.publish_at,
         )
         print(f"🎉 YouTube Short Uploaded Successfully!")
         print(f"ID:  {res['id']}")
         print(f"URL: {res['url']}")
+        if res.get("publish_at"):
+            print(f"⏰ Scheduled for Release at: {res['publish_at']}")
     except Exception as e:
         print(f"❌ Error uploading video: {e}", file=sys.stderr)
         sys.exit(1)

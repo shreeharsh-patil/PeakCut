@@ -287,8 +287,9 @@ def _hex_to_ass_inline_color(hex_color, fallback="FFFFFF"):
 
 
 def _escape_ass_text(text):
-    """Neutralize characters that would start ASS override blocks."""
-    return str(text).replace('\\', '/').replace('{', '(').replace('}', ')')
+    """Neutralize characters that would break ASS formatting or start override blocks."""
+    cleaned = str(text or "").replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+    return cleaned.replace('\\', '/').replace('{', '(').replace('}', ')')
 
 
 def _dim_hex_color(hex_color, opacity, fallback="FFFFFF"):
@@ -413,13 +414,24 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
     events = []
     for block in blocks:
+        last_ev_end = None
         for i, word in enumerate(block):
             # Event runs until the next word starts (no flicker in gaps);
             # the last word holds until the block ends.
-            ev_start = block[0]['start'] if i == 0 else word['start']
-            ev_end = block[i + 1]['start'] if i < len(block) - 1 else block[-1]['end']
+            raw_start = block[0]['start'] if i == 0 else word['start']
+            raw_end = block[i + 1]['start'] if i < len(block) - 1 else block[-1]['end']
+
+            ev_start = max(raw_start, last_ev_end) if last_ev_end is not None else raw_start
+            ev_end = raw_end
             if ev_end <= ev_start:
-                continue
+                ev_end = max(ev_start + 0.08, float(word.get('end', ev_start + 0.08)))
+
+            last_ev_end = ev_end
+
+            is_seam = bool(seam_ranges and any(a <= ev_start < b for a, b in seam_ranges))
+            # On a split scene, {\r} would reset alignment back to style Default (bottom);
+            # appending \an5 restores the center seam anchor for following words.
+            reset_tag = "{\\r\\an5}" if is_seam else "{\\r}"
 
             parts = []
             for j, other in enumerate(block):
@@ -427,7 +439,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                 if uppercase:
                     text = text.upper()
                 if j == i:
-                    parts.append(f"{active_prefix}{text}{{\\r}}")
+                    parts.append(f"{active_prefix}{text}{reset_tag}")
                 else:
                     parts.append(text)
 
