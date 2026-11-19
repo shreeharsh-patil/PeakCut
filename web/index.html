@@ -902,7 +902,7 @@ const opts = (map, val) => Object.entries(map).map(([k, v]) => `<option value="$
 async function api(path, opt) {
   const r = await fetch(path, opt);
   if (r.status === 401) { location.href = "/login"; throw new Error("Please sign in."); }
-  if (!r.ok) { let d = r.statusText; try { d = (await r.json()).detail || d; } catch {} throw new Error(typeof d === "string" ? d : "Something went wrong"); }
+  if (!r.ok) { let d = r.statusText; try { d = (await r.json()).detail || d; } catch {} const err = new Error(typeof d === "string" ? d : "Something went wrong"); err.status = r.status; throw err; }
   return r.json();
 }
 const send = (path, body, method = "POST") => api(path, {method, headers:{"Content-Type":"application/json"}, body:JSON.stringify(body ?? {})});
@@ -1442,10 +1442,19 @@ const VIDEO_EXT = /\.(mp4|mov|mkv|webm|m4v|ts|flv)$/i;
 const fmtLen = s => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = String(s % 60).padStart(2, "0"); return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`; };
 const fmtSize = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(b / 1e6)) + " MB";
 const extractYtId = u => {
-  const m = String(u || "").match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|shorts\/|live\/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})/i);
+  const m = String(u || "").match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|shorts\/|live\/|video\/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})/i);
   if (m) return m[1];
   const bare = String(u || "").trim().match(/^([a-zA-Z0-9_-]{11})(?:\?.*)?$/);
   return bare ? bare[1] : null;
+};
+const isYouTubeHome = u => {
+  const n = normalizeUrl(u);
+  if (!/^https?:\/\/([\w-]+\.)*(youtube\.com|youtu\.be)\b/i.test(n)) return false;
+  if (extractYtId(n)) return false;
+  try {
+    const p = new URL(n).pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
+    return !p || ["watch", "shorts", "live", "feed", "feed/subscriptions", "results"].includes(p);
+  } catch { return false; }
 };
 const normalizeUrl = u => {
   u = (u || "").trim();
@@ -1552,6 +1561,7 @@ async function lookUp(u) {
 }
 function takeLink(A, u, input) {
   u = normalizeUrl(u);
+  if (isYouTubeHome(u)) { A.note = "That's the YouTube homepage — paste a specific video, Shorts, or Live link."; return drawAtt(); }
   if (!looksLink(u)) { A.note = "Paste a valid video link (YouTube, Twitch, Kick, TikTok, Instagram, etc.)."; return drawAtt(); }
   if (A.links.some(l => l.url === u && l.state !== "bad")) { A.note = null; if (input) input.value = ""; return drawAtt(); }
   if (batchUsed(A) >= batchMax()) { A.note = `You can send up to ${batchMax()} videos at a time. Remove one first.`; return drawAtt(); }
@@ -1563,8 +1573,14 @@ function takeLink(A, u, input) {
     l.state = "ok";
     l.info = info || {};
     if (info?.url) l.url = info.url;
-  }, () => {
-    // Preview lookup failed (e.g. network hiccup or non-oEmbed site): still allow clipping!
+  }, e => {
+    // 4xx means the URL itself is invalid (e.g. homepage) — surface the real reason
+    if (e && e.status >= 400 && e.status < 500) {
+      l.state = "bad";
+      l.msg = e.message || "Invalid video link.";
+      return;
+    }
+    // Network/5xx preview hiccup: still allow clipping with fallback metadata
     const ytId = extractYtId(u);
     l.state = "ok";
     l.info = {
@@ -1588,10 +1604,11 @@ function onLink(input) {
   const A = att(), raw = input.value.trim(), u = normalizeUrl(raw);
   if (!raw) { A.note = null; return drawAtt(); }
   if (isChannel(u)) { A.note = "That's a channel, not a video. To clip their live streams, add them as a creator and press Start recording."; return drawAtt(); }
-  if (!looksLink(raw)) { A.note = raw.length > 8 ? "Paste a YouTube, Twitch or Kick video link." : null; return drawAtt(); }
+  if (isYouTubeHome(u)) { A.note = "Paste a specific YouTube video, Shorts, or Live link (not the homepage)."; return drawAtt(); }
+  if (!looksLink(raw)) { A.note = raw.length > 8 ? "Paste a valid video link (YouTube, Twitch, Kick, TikTok, Instagram, etc.)." : null; return drawAtt(); }
   A.note = null; drawAtt();
   if (fullLink(raw)) return takeLink(A, u, input);
-  linkTimer = setTimeout(() => { if (input.value.trim() === raw) takeLink(A, u, input); }, 900);   // other link shapes: take it once typing stops
+  linkTimer = setTimeout(() => { if (input.value.trim() === raw && !isYouTubeHome(normalizeUrl(raw))) takeLink(A, u, input); }, 1100);
 }
 document.addEventListener("input", e => { if (e.target.id === "url") onLink(e.target);
   if (e.target.dataset?.ftitle) { const f = att().files.find(x => x.id === e.target.dataset.ftitle); if (f) f.title = e.target.value; }

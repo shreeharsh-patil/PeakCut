@@ -345,3 +345,13 @@ def test_peakcut_preview_uses_oembed_even_when_ytdlp_fails(monkeypatch):
     assert body["uploader"] == "Real Creator Channel"
     assert body["video_id"] == "irNhWMG560k"
     assert "irNhWMG560k" in body["thumb"]
+
+
+def test_peakcut_rejects_youtube_homepage_never_returns_generic_youtube():
+    r = _call("GET", "/api/preview", params={"url": "https://www.youtube.com/"})
+    assert r.status_code == 400
+    assert "homepage" in r.json()["detail"].lower()
+
+    r2 = _call("POST", "/api/jobs", json_body={"url": "https://www.youtube.com/watch"})
+    assert r2.status_code == 400
+    assert "homepage" in r2.json()["detail"].lower()
