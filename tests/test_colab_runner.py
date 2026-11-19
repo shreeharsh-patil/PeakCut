@@ -238,3 +238,64 @@ def test_normalize_media_url_variations():
         norm = normalize_media_url(raw)
         assert norm == "https://www.youtube.com/watch?v=irNhWMG560k", f"Failed for {raw}: got {norm}"
         assert assert_public_url(norm) == norm
+
+
+def test_core_modules_annotations_python312_compatible():
+    """Guard against Python 3.12 eager-annotation NameErrors hidden by Python 3.14 PEP 649."""
+    import importlib
+    import inspect
+    import typing
+
+    core_mods = [
+        "main",
+        "app",
+        "peakcut_bridge",
+        "colab_runner",
+        "llm_backend",
+        "ffmpeg_utils",
+        "security_utils",
+        "batch_runner",
+    ]
+    for mname in core_mods:
+        mod = importlib.import_module(mname)
+        for name, obj in inspect.getmembers(mod):
+            if getattr(obj, "__module__", None) != mname:
+                continue
+            if inspect.isfunction(obj):
+                # Accessing __annotations__ triggers PEP 649 evaluation on 3.14;
+                # get_type_hints evaluates stringified annotations from __future__.
+                _ = obj.__annotations__
+    hints = typing.get_type_hints(importlib.import_module("main").process_video_pipeline)
+    assert "output_dir" in hints
+    assert "target_clips" in hints
+
+
+def test_heuristic_transcript_clips_fallback_and_unicode():
+    """Verify heuristic fallback works when Ollama/LLM is unreachable, including Hindi/Unicode text."""
+    import main
+    import viral_brain
+
+    # Direct evaluate_viral_clip accepts optional duration
+    a1 = viral_brain.evaluate_viral_clip("Wait why did nobody tell you this secret? Because it works!", 28.0)
+    assert a1.overall_score > 0
+    assert a1.suggested_title
+
+    # Multilingual/Hindi titles must not be stripped to empty
+    a_hi = viral_brain.evaluate_viral_clip("क्या हाल है भाई लोग! आज GTA 6 खेलते हैं।", duration=25.0)
+    assert "क्या" in a_hi.suggested_title or "GTA" in a_hi.suggested_title
+
+    transcript = {
+        "segments": [
+            {"start": 0.0, "end": 10.0, "text": "Why does nobody talk about this crazy gaming moment?"},
+            {"start": 10.0, "end": 22.0, "text": "Watch what happens when we enter the secret room in GTA 6!"},
+            {"start": 22.0, "end": 35.0, "text": "Turns out the entire mission changes completely right here."},
+            {"start": 40.0, "end": 55.0, "text": "Stop doing this mistake in every match you play."},
+            {"start": 55.0, "end": 68.0, "text": "Here is the real reason why pros win 10x faster."},
+        ]
+    }
+    clips = main._heuristic_transcript_clips(transcript, video_duration=70.0, target_clips=2)
+    assert len(clips) == 2
+    for c in clips:
+        assert c["end"] > c["start"]
+        assert c["video_title_for_youtube_short"]
+        assert c["viral_hook_text"]

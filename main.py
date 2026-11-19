@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Patch PyAV 19+ compatibility with faster-whisper (metadata_errors argument removed in av>=19)
 try:
     import av
@@ -18,6 +20,7 @@ import sys
 import threading
 import unicodedata
 import uuid
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from scenedetect import open_video, SceneManager
@@ -55,8 +58,12 @@ try:
 except Exception:
     mp = None
 # import whisper (replaced by faster_whisper inside function)
-from google import genai
-from google.genai import types as genai_types
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
 
 import api_key_rotator
 import gemini_worker
@@ -1822,7 +1829,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, max_secs=60, target_clips=3):
+def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, max_secs=60, target_clips=None):
     """Heuristic clip generation when no LLM API key is configured."""
     try:
         import viral_brain
@@ -1836,6 +1843,9 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, 
     min_b, max_b = clip_duration_bounds()
     min_secs = max(5, int(min_b))
     max_secs = max(min_secs + 5, int(max_b))
+    if target_clips is None:
+        _, target_clips = clip_count_targets(video_duration)
+        target_clips = max(1, int(target_clips or 3))
 
     candidates = []
     for i, seg in enumerate(segments):
@@ -1852,7 +1862,7 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, 
             if dur >= min_secs:
                 full_text = " ".join(text_parts).strip()
                 if viral_brain:
-                    assessment = viral_brain.evaluate_viral_clip(full_text, dur)
+                    assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
                     candidates.append({
                         "start": round(start_t, 2),
                         "end": round(end_t, 2),
@@ -1892,7 +1902,7 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, 
         hook = "WATCH THIS! 🤯"
         title = full_text[:50] or "Highlight Moment"
         if viral_brain:
-            assessment = viral_brain.evaluate_viral_clip(full_text, dur)
+            assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
             hook = assessment.viral_hook_text
             title = assessment.suggested_title
         chosen.append({
