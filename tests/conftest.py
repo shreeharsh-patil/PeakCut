@@ -19,8 +19,8 @@ _TEST_TEMP_DIR = tempfile.mkdtemp(prefix="test_yt_isolated_")
 os.environ["CREATORS_DIR"] = os.path.join(_TEST_TEMP_DIR, "creators")
 os.environ["POSTS_QUEUE_PATH"] = os.path.join(_TEST_TEMP_DIR, "posts_queue.json")
 
-from creator_workspaces import CreatorWorkspaceManager
-from publishing_queue import reset_publishing_queue
+from engine.services.creator_workspaces import CreatorWorkspaceManager
+from engine.services.publishing_queue import reset_publishing_queue
 
 CreatorWorkspaceManager.reset_instance()
 reset_publishing_queue()
@@ -28,8 +28,18 @@ reset_publishing_queue()
 
 @pytest.fixture(autouse=True)
 def isolate_test_state():
-    """Ensure each test runs with isolated CreatorWorkspace and PublishingQueue."""
+    """Ensure each test runs with isolated CreatorWorkspace, PublishingQueue, and LLM cache."""
+    try:
+        import llm_backend
+        llm_backend.invalidate_health_cache()
+    except Exception:
+        pass
     yield
+    try:
+        import llm_backend
+        llm_backend.invalidate_health_cache()
+    except Exception:
+        pass
     # Clean up any creators or posts created during test in the isolated directory
     creators_dir = Path(os.environ["CREATORS_DIR"])
     if creators_dir.exists():

@@ -290,6 +290,8 @@ label.ck input{accent-color:var(--brand);margin:0}
 .composer-opts.open{grid-template-rows:1fr;opacity:1}
 .composer-opts>.og{min-height:0;overflow:hidden;padding:0 12px;transition:padding .32s ease}
 .composer-opts.open>.og{padding-bottom:12px}
+.opt-error{grid-column:1/-1;margin:0;padding:10px 12px;border:1px solid var(--bad);border-radius:8px;color:var(--bad);font-size:13px}
+.opt-error[hidden]{display:none}
 /* attachments: link preview and files */
 .att{display:grid;grid-template-rows:0fr;transition:grid-template-rows .3s ease}
 .att.has{grid-template-rows:1fr}
@@ -831,6 +833,7 @@ dialog[open]{animation:fadein .16s ease}
 <div class="pop menu" id="acctpop" role="menu" hidden></div>
 
 <script src="/assets/gradient-ascii.js"></script>
+<script src="/assets/peakcut-input-validation.js"></script>
 <script>
 /* ============================================================ helpers */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1369,6 +1372,7 @@ function drawAdd(variant) {
       <div class="ob"><div class="ot">Part of the video</div><div class="range">
         <label>From<input id="o_from" type="number" min="0" placeholder="start" aria-label="From minute">min</label>${ic("arrowr")}
         <label>To<input id="o_to" type="number" min="0" placeholder="end" aria-label="Up to minute">min</label></div></div>
+      <p id="optionError" class="opt-error" role="alert" hidden></p>
     </div></div></form>`;
   drawAtt();
 }
@@ -1523,7 +1527,7 @@ function drawAtt() {
     if (l.state === "bad") return `<div class="lp bad" data-row="${l.id}">${ic("warn")}<span><b>${esc(l.url)}</b>${esc(l.msg)}</span>
       ${A.busy ? "" : `<button type="button" class="rm" data-rm="link" data-id="${l.id}" aria-label="Remove link">${ic("x")}</button>`}</div>`;
     const i = l.info;
-    return rowHtml(A, {id: l.id, kind: "link", thumb: i.thumb ? `<img src="${i.thumb}" alt="">` : "", len: i.duration && !i.is_live ? fmtLen(i.duration) : "",
+    return rowHtml(A, {id: l.id, kind: "link", thumb: i.thumb ? `<img src="${esc(i.thumb)}" alt="">` : "", len: i.duration && !i.is_live ? fmtLen(i.duration) : "",
       title: i.title, sub: esc(i.uploader || "Video link"),
       side: l.sending ? `<span class="ok up">Sending</span>` : i.is_live ? `<span class="ok live"><i></i>Live now</span>` : `<span class="ok">${ic("check")}Ready</span>`});
   }).join("");
@@ -1624,9 +1628,9 @@ document.addEventListener("click", e => {
 
 // A big file goes in pieces (anything standing in front of the app refuses one huge request), two at a time,
 // and a piece that fails is simply sent again. The bar shows the whole file.
-async function sendBig(f, who) {
+async function sendBig(f, who, options) {
   const file = f.file;
-  const s = await send("/api/upload/start", {name: file.name, title: f.title || file.name, size: file.size, options: jobOptions(), creator: who});
+  const s = await send("/api/upload/start", {name: file.name, title: f.title || file.name, size: file.size, options, creator: who});
   const sent = new Array(s.parts).fill(0);
   const show = () => { f.pct = Math.min(99, Math.round(sent.reduce((a, b) => a + b, 0) / file.size * 100)); drawAtt(); };
   const put = i => new Promise((ok, fail) => {
@@ -1635,7 +1639,12 @@ async function sendBig(f, who) {
     x.setRequestHeader("Content-Type", "application/octet-stream");
     x.upload.onprogress = e => { sent[i] = e.loaded; show(); };
     x.onload = () => {
-      if (x.status === 401) { location.href = "/login"; return; }
+      if (x.status === 401) {
+        location.href = "/login";
+        const err = new Error("Please sign in.");
+        err.final = true;
+        return fail(err);
+      }
       if (x.status >= 200 && x.status < 300) { sent[i] = Math.min(s.part, file.size - i * s.part); show(); return ok(); }
       let d = "Upload failed"; try { d = JSON.parse(x.responseText).detail || d; } catch {}
       const err = new Error(typeof d === "string" ? d : "Upload failed"); err.final = x.status >= 400 && x.status < 500 && x.status !== 408 && x.status !== 429; fail(err);
@@ -1664,15 +1673,15 @@ async function sendBig(f, who) {
     throw e;
   }
 }
-function sendFile(f, who) {
-  if (S.status.upload_part_mb && f.file.size > S.status.upload_part_mb * 1048576) return sendBig(f, who);
+function sendFile(f, who, options) {
+  if (S.status.upload_part_mb && f.file.size > S.status.upload_part_mb * 1048576) return sendBig(f, who, options);
   return new Promise((ok, fail) => {
     const x = new XMLHttpRequest(), fd = new FormData();
-    fd.append("file", f.file); fd.append("title", f.title || f.file.name); fd.append("options", JSON.stringify(jobOptions())); fd.append("creator", who);
+    fd.append("file", f.file); fd.append("title", f.title || f.file.name); fd.append("options", JSON.stringify(options)); fd.append("creator", who);
     x.open("POST", "/api/upload");
     x.upload.onprogress = e => { if (e.lengthComputable) { f.pct = Math.round(e.loaded / e.total * 100); drawAtt(); } };
     x.onload = () => {
-      if (x.status === 401) { location.href = "/login"; return; }
+      if (x.status === 401) { location.href = "/login"; return fail(new Error("Please sign in.")); }
       if (x.status >= 200 && x.status < 300) {
         let j = null; try { j = JSON.parse(x.responseText); } catch {}
         return ok(j);
@@ -1687,6 +1696,23 @@ function sendFile(f, who) {
 async function makeClips() {
   const A = att();
   if (A.busy) return;
+  const optionError = window.PeakCutInputValidation.validateOptions({
+    minLength: $("#o_min")?.value,
+    maxLength: $("#o_maxlen")?.value,
+    startMinute: $("#o_from")?.value,
+    endMinute: $("#o_to")?.value,
+  });
+  const alert = $("#optionError");
+  if (alert) {
+    alert.textContent = optionError?.message || "";
+    alert.hidden = !optionError;
+  }
+  if (optionError) {
+    const optionsButton = $('[data-act="toggleopts"]');
+    if (optionsButton?.getAttribute("aria-expanded") === "false") optionsButton.click();
+    $("#" + optionError.field)?.focus();
+    return;
+  }
   const raw = $("#url")?.value.trim();
   const typed = normalizeUrl(raw);
   if (typed && looksLink(raw) && !isChannel(typed)) { clearTimeout(linkTimer); takeLink(A, typed, $("#url")); }
@@ -1713,7 +1739,8 @@ async function makeClips() {
         title: info.title || "", uploader: info.uploader || "",
         duration: info.duration || 0, thumb: info.thumb || ""
       });
-      if (created && created.id) createdJobs.push(created);
+      if (!created?.id) throw new Error("The server did not confirm that this video was queued.");
+      createdJobs.push(created);
       l.state = "done"; started++;
     }
     catch (e) { l.state = "bad"; l.msg = e.message; failed++; }
@@ -1722,8 +1749,9 @@ async function makeClips() {
   for (const f of A.files) {
     f.state = "up"; f.pct = 0; drawAtt();
     try {
-      const created = await sendFile(f, who);
-      if (created && created.id) createdJobs.push(created);
+      const created = await sendFile(f, who, opts);
+      if (!created?.id) throw new Error("The server did not confirm that this upload was queued.");
+      createdJobs.push(created);
       f.state = "done"; started++;
     }
     catch (e) { f.state = "error"; f.err = e.message; failed++; }
@@ -2459,10 +2487,15 @@ document.addEventListener("click", async e => {
     }
     if (a === "stoplive") {
       if (!await ask("Stop recording?", "Clips already made are kept. The rest of the buffer is cleared.", "Stop recording", true)) return;
+      const was = b.innerHTML;
+      b.disabled = true;
+      b.textContent = "Stopping…";
+      try { await api(`/api/live/${d.j}/stop`, {method:"POST"}); }
+      catch (err) { b.disabled = false; b.innerHTML = was; throw err; }
       const j = jobOf(d.j); if (j) { j.status = "done"; j.stage = "Stopped by you"; }
       S.creators.forEach(c => { if (c.live_job === d.j) c.live_job = null; }); render();
       toast("Recording stopped. Clips already made are kept.", "ok");
-      api(`/api/live/${d.j}/stop`, {method:"POST"}).catch(e => toast(e.message, "bad")).finally(tick); return;
+      return tick();
     }
     if (a === "clipnow") { await send(`/api/live/${d.j}/clip`, {seconds:Number(d.s)}); return toast(`Clipping the last ${d.s} seconds…`, "ok"); }
     if (a === "resendverify") {

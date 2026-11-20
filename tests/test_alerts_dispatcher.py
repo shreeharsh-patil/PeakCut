@@ -2,7 +2,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from alerts_dispatcher import AlertDispatcher
+from engine.services.alerts_dispatcher import AlertDispatcher
 
 
 def test_alert_dispatcher_settings(tmp_path: Path):

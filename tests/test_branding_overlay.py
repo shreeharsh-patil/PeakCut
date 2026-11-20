@@ -1,5 +1,5 @@
 """Tests for Branding & Logo Overlay (branding_overlay.py)."""
-from branding_overlay import build_overlay_filter
+from engine.editing.branding_overlay import build_overlay_filter
 
 
 def test_build_overlay_filter():

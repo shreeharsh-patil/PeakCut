@@ -7,8 +7,8 @@ import os
 
 import pytest
 
-import layout_ranges
-import subtitles
+from engine.layouts import layout_ranges
+from engine.editing import subtitles
 
 
 def _transcript(words):
@@ -110,7 +110,7 @@ class TestRemapAcrossCut:
 
     def test_fast_recut_carries_the_sidecar(self, tmp_path, monkeypatch):
         import shutil
-        import recut
+        from engine.editing import recut
         src = tmp_path / "canon.mp4"
         src.write_bytes(b"x")
         layout_ranges.write(str(src), [(0, 4, "SPLIT"), (4, 8, "TRACK")])

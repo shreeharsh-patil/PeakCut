@@ -1,5 +1,5 @@
 """Tests for subtitle word merging, SRT generation and style sanitizing."""
-from subtitles import (
+from engine.editing.subtitles import (
     merge_continuation_words,
     generate_srt,
     hex_to_ass_color,
@@ -107,13 +107,13 @@ class TestStyleSanitizing:
 
 
 class TestGenerateAss:
-    from subtitles import generate_ass  # noqa: F401 (import check)
+    from engine.editing.subtitles import generate_ass  # noqa: F401 (import check)
 
     def _transcript(self, words):
         return {"segments": [{"start": 0, "end": 99, "text": "", "words": words}]}
 
     def test_karaoke_events_highlight_each_word(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" Erst", 0.0, 0.3), _w(" mal", 0.3, 0.6), _w(" hier", 0.6, 0.9)]
         assert generate_ass(self._transcript(words), 0, 10, str(out),
@@ -126,7 +126,7 @@ class TestGenerateAss:
         assert "Style: Default,Verdana," in content
 
     def test_karaoke_merges_fragments_too(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" YouTube", 0.0, 0.5), _w("-Kanal.", 0.5, 0.9)]
         assert generate_ass(self._transcript(words), 0, 10, str(out)) is True
@@ -135,7 +135,7 @@ class TestGenerateAss:
         assert content.count("Dialogue:") == 1
 
     def test_invalid_highlight_falls_back(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" test", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out),
@@ -144,13 +144,13 @@ class TestGenerateAss:
         assert "\\c&H00D7FF&" in content  # falls back to gold #FFD700
 
     def test_empty_range_returns_false(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" spaet", 50.0, 50.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out)) is False
 
     def test_ass_injection_neutralized(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" {\\b1}evil", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out)) is True
@@ -158,7 +158,7 @@ class TestGenerateAss:
         assert "{\\b1}evil" not in content
 
     def test_glow_effect_tags(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" neon", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out),
@@ -168,7 +168,7 @@ class TestGenerateAss:
         assert "\\3c&H88FF00&" in content  # glow outline in highlight color
 
     def test_pop_effect_animates_scale(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" pop", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out), effect="pop") is True
@@ -179,7 +179,7 @@ class TestGenerateAss:
         assert "\\t(0,110,\\fscx108\\fscy108)" in content
 
     def test_uppercase_transform(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" hallo", 0.0, 0.5), _w(" welt", 0.5, 1.0)]
         assert generate_ass(self._transcript(words), 0, 10, str(out), uppercase=True) is True
@@ -188,7 +188,7 @@ class TestGenerateAss:
         assert "hallo" not in content.split("[Events]")[1]
 
     def test_base_opacity_dims_style_color(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" dim", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out),
@@ -201,7 +201,7 @@ class TestGenerateAss:
         assert "\\1a" not in content
 
     def test_full_opacity_keeps_color_unchanged(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         words = [_w(" voll", 0.0, 0.5)]
         assert generate_ass(self._transcript(words), 0, 10, str(out),
@@ -215,7 +215,7 @@ class TestBurnFilterFonts:
     it every UI font choice silently falls back to DejaVu (issue #57)."""
 
     def _captured_cmd(self, monkeypatch, tmp_path, srt_name):
-        import subtitles as m
+        from engine.editing import subtitles as m
         captured = {}
 
         class _Ok:
@@ -248,7 +248,7 @@ class TestAutoCaptionDefaults:
     """The caption look every clip now ships with (chosen 25-jul-2026)."""
 
     def test_style_is_complete(self):
-        from subtitles import AUTO_CAPTION_STYLE, generate_ass
+        from engine.editing.subtitles import AUTO_CAPTION_STYLE, generate_ass
         required = {"alignment", "font_name", "font_size", "font_color",
                     "highlight_color", "border_color", "border_width",
                     "effect", "base_opacity", "uppercase",
@@ -258,17 +258,17 @@ class TestAutoCaptionDefaults:
     def test_font_is_one_the_image_actually_ships(self):
         # libass falls back to DejaVu SILENTLY when the font is missing (#57),
         # so the default must be a family baked into the image.
-        from subtitles import AUTO_CAPTION_STYLE
+        from engine.editing.subtitles import AUTO_CAPTION_STYLE
         assert AUTO_CAPTION_STYLE["font_name"] in {
             "Anton", "Liberation Sans", "Liberation Serif", "DejaVu Sans"}
 
     def test_highlight_differs_from_body_text(self):
         # The whole point of the karaoke look: the active word must stand out.
-        from subtitles import AUTO_CAPTION_STYLE as s
+        from engine.editing.subtitles import AUTO_CAPTION_STYLE as s
         assert s["highlight_color"].lower() != s["font_color"].lower()
 
     def test_captions_clear_the_platform_ui(self, tmp_path):
-        from subtitles import SAFE_MARGIN_V, generate_ass
+        from engine.editing.subtitles import SAFE_MARGIN_V, generate_ass
         # PlayResY is 288, so the margin must be a meaningful share of it —
         # the old hardcoded 25 (8.7%) sat under TikTok's own bottom chrome.
         assert SAFE_MARGIN_V / 288 >= 0.12
@@ -280,7 +280,7 @@ class TestAutoCaptionDefaults:
         assert f",10,10,{SAFE_MARGIN_V},1" in style_line
 
     def test_margin_is_overridable(self, tmp_path):
-        from subtitles import generate_ass
+        from engine.editing.subtitles import generate_ass
         out = tmp_path / "subs.ass"
         assert generate_ass(self._t([_w(" hola", 0.0, 0.5)]), 0, 10, str(out),
                             margin_v=90) is True
@@ -324,9 +324,9 @@ class TestFilterQuoting:
         assert "uuid" in m.group(1), f"not unique per clip: {m.group(1)}"
 
     def test_colon_is_escaped(self):
-        from subtitles import _escape_ffmpeg_filter_value
+        from engine.editing.subtitles import _escape_ffmpeg_filter_value
         assert "\\:" in _escape_ffmpeg_filter_value("C:/out/subs.ass")
 
     def test_plain_path_untouched(self):
-        from subtitles import _escape_ffmpeg_filter_value
+        from engine.editing.subtitles import _escape_ffmpeg_filter_value
         assert _escape_ffmpeg_filter_value("/out/subs_0_123.ass") == "/out/subs_0_123.ass"

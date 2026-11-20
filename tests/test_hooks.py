@@ -4,7 +4,7 @@ import os
 
 from PIL import Image, ImageDraw, ImageFont
 
-from hooks import (
+from engine.editing.hooks import (
     HOOK_STYLES,
     _break_long_word,
     _emoji_scale,

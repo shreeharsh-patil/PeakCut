@@ -112,7 +112,7 @@ def test_policy_block_fails_fast_without_retrying():
             _Models.calls += 1
             return _BlockedResponse()
 
-    import gemini_worker
+    from engine.intelligence import gemini_worker
     with pytest.raises(gemini_worker.GeminiBlockedError) as exc:
         main._run_gemini_stage(_client(_Models()), "m", "prompt", object)
     assert _Models.calls == 1
@@ -120,7 +120,7 @@ def test_policy_block_fails_fast_without_retrying():
 
 
 def test_blocked_finish_reason_also_raises():
-    import gemini_worker
+    from engine.intelligence import gemini_worker
 
     class _Cand:
         class _FR:
@@ -137,7 +137,7 @@ def test_blocked_finish_reason_also_raises():
 
 
 def test_clean_response_is_not_flagged_as_blocked():
-    import gemini_worker
+    from engine.intelligence import gemini_worker
 
     class _Resp:
         prompt_feedback = None

@@ -352,7 +352,7 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     provider. Raises on HTTP errors, empty bodies and schema violations; the
     retry policy lives in the caller, same as for Gemini.
     """
-    import gemini_worker  # local import: keeps this module free of the google SDK
+    from engine.intelligence import gemini_worker  # local import: keeps this module free of the google SDK
 
     url = f"{base_url()}/chat/completions"
     model = model or model_name()

@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 app_module = pytest.importorskip("app")
-import recut  # noqa: E402
+from engine.editing import recut  # noqa: E402
 
 JOB_ID = "reframe-endpoint-test-job"
 
@@ -176,7 +176,7 @@ class TestApplyCropOverrides:
 
     @pytest.fixture(autouse=True)
     def _mod(self):
-        self.rf = pytest.importorskip("reframe_v2")
+        self.rf = pytest.importorskip("engine.layouts.reframe_v2")
 
     def test_single_crop_centres_the_window(self):
         xs = [None] * 100

@@ -6,9 +6,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import app as app_module
-import mcp_server
-from live_clipper import LiveClipperManager
-from niche_discovery import DiscoveredVideo
+from engine.studio import mcp_server
+from engine.discovery.live_clipper import LiveClipperManager
+from engine.discovery.niche_discovery import DiscoveredVideo
 
 
 def _post_mcp(payload):
@@ -87,7 +87,7 @@ class TestSuperchargedApi:
                 assert resp_stop.json()["status"] == "stopped"
 
     def test_discover_routes(self):
-        with patch("niche_discovery.NicheDiscoveryEngine.search_youtube_api") as mock_search:
+        with patch("engine.discovery.niche_discovery.NicheDiscoveryEngine.search_youtube_api") as mock_search:
             mock_search.return_value = [
                 DiscoveredVideo(
                     video_id="vid_101",

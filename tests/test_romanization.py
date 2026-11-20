@@ -1,5 +1,5 @@
 """Tests for Hindi and Urdu Romanization Engine (romanization.py)."""
-from romanization import has_hindi, needs_roman, romanize_words, to_roman
+from engine.services.romanization import has_hindi, needs_roman, romanize_words, to_roman
 
 
 def test_has_hindi_and_needs_roman():

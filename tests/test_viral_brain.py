@@ -1,5 +1,5 @@
 """Tests for Heuristic Viral Scoring & Hook Extraction (viral_brain.py)."""
-from viral_brain import evaluate_viral_clip, generate_viral_hook, score_hook_strength
+from engine.intelligence.viral_brain import evaluate_viral_clip, generate_viral_hook, score_hook_strength
 
 
 def test_score_hook_strength():

@@ -1,4 +1,4 @@
-from log_view import friendly_log_line, friendly_logs
+from engine.utils.log_view import friendly_log_line, friendly_logs
 
 # Raw lines captured from a real production job.
 RAW_JOB = [

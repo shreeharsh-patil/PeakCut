@@ -1,8 +1,8 @@
 """Tests for the ElevenLabs retry helper."""
 import pytest
 
-import translate
-from translate import _with_retry, _TransientHTTPError
+from engine.intelligence import translate
+from engine.intelligence.translate import _with_retry, _TransientHTTPError
 
 
 @pytest.fixture(autouse=True)

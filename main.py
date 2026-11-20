@@ -66,15 +66,15 @@ except Exception:
     genai = None
     genai_types = None
 
-import api_key_rotator
-import gemini_worker
-import hook_grounding
-import layout_picker
-import llm_backend
-from clip_selection import (build_transcript_windows, clip_count_targets,
+from engine.services import api_key_rotator
+from engine.intelligence import gemini_worker
+from engine.editing import hook_grounding
+from engine.layouts import layout_picker
+from engine.intelligence import llm_backend
+from engine.intelligence.clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, deduplicate_overlapping_clips,
                             snap_clip_to_words, trim_to_best)
-from ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
+from engine.editing.ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB, probe_media,
                           run_ffmpeg_with_fallback, validate_media_output)
 from dotenv import load_dotenv
@@ -716,7 +716,7 @@ def analyze_scenes_strategy(video_path, scenes):
     return strategies
 
 def detect_scenes(video_path):
-    import scene_detection
+    from engine.discovery import scene_detection
     return scene_detection.detect_scenes(video_path)
 
 def get_video_resolution(video_path):
@@ -790,7 +790,7 @@ def is_youtube_url(url):
     mp4, tmpfiles/catbox, an R2 link) has no IP ban to dodge and downloads
     5-10x faster from the server's own IP than through the ISP proxies."""
     try:
-        from security_utils import normalize_media_url
+        from engine.utils.security_utils import normalize_media_url
         url = normalize_media_url(url)
         from urllib.parse import urlparse
         host = (urlparse(url).hostname or "").lower()
@@ -901,14 +901,14 @@ def download_youtube_video(url, output_dir="."):
     post-download media validation.
     Returns the path to the downloaded video and the video title.
     """
-    from security_utils import assert_public_url, normalize_media_url
+    from engine.utils.security_utils import assert_public_url, normalize_media_url
     url = normalize_media_url(url)
     if not url:
         raise YouTubeDownloadError("Empty or invalid media URL.", reason_code="invalid_url")
     assert_public_url(url)
     # Throwaway hosts agents fall back to (tmpfiles.org) hand out short-lived
     # signed links; refresh through the host's page so yt-dlp gets the file.
-    import file_hosts
+    from engine.services import file_hosts
     url = file_hosts.resolve(url)
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
@@ -1401,7 +1401,7 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
     if not transcript or not transcript.get('segments'):
         return None  # silent video: nothing to caption
     try:
-        import subtitles as _subs
+        from engine.editing import subtitles as _subs
         style = _subs.AUTO_CAPTION_STYLE
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
@@ -1434,7 +1434,7 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
 
         try:
             if split_ranges is None:
-                import layout_ranges as _layouts
+                from engine.layouts import layout_ranges as _layouts
                 split_ranges = _layouts.split_ranges(_layouts.read(clip_path))
             if not _subs.generate_ass(
                     transcript, clip_start, clip_end, ass_path,
@@ -1488,7 +1488,7 @@ def auto_hook_clip(clip_path, clip):
     except ValueError:
         seconds = 5.0
     try:
-        from hooks import add_hook_to_video, HOOK_STYLES
+        from engine.editing.hooks import add_hook_to_video, HOOK_STYLES
         if style not in HOOK_STYLES:
             style = "classic"
         output_dir = os.path.dirname(clip_path)
@@ -1600,7 +1600,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     # falls back to the v1 frame loop below so a v2 edge case can't kill jobs.
     if os.environ.get("REFRAME_ENGINE", "v2").strip().lower() != "v1":
         try:
-            import reframe_v2
+            from engine.layouts import reframe_v2
             t0 = time.time()
             result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
                                        force_strategy=force_strategy,
@@ -1651,7 +1651,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     # Same delivery floor as the v2 engine — a fallback render is still the clip
     # the user posts, so it must not ship sub-HD. The frame loop below already
     # resizes every cropped frame to these dims, so nothing else changes.
-    from reframe_v2 import delivery_size
+    from engine.layouts.reframe_v2 import delivery_size
     OUTPUT_WIDTH, OUTPUT_HEIGHT = delivery_size(original_width, original_height,
                                                 aspect_ratio)
 
@@ -1871,7 +1871,7 @@ def clear_transcript_checkpoint(output_dir):
 
 def transcribe_video(video_path):
     print("🎙️  Transcribing video...")
-    from transcribe_backends import transcribe_media
+    from engine.intelligence.transcribe_backends import transcribe_media
 
     transcript = transcribe_media(video_path)
 
@@ -1999,20 +1999,31 @@ def score_batch_size():
 
 def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=None, max_secs=None, target_clips=None):
     """Heuristic clip generation when no LLM API key is configured."""
-    try:
-        import viral_brain
-    except Exception:
-        viral_brain = None
+    from engine.intelligence import viral_brain
 
-    segments = transcript_result.get("segments", []) if transcript_result else []
+    segments = []
+    for segment in (transcript_result or {}).get("segments", []):
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        start = max(0.0, start)
+        end = min(video_duration, end)
+        text = str(segment.get("text") or "").strip()
+        if end > start and text:
+            segments.append((round(start, 3), round(end, 3), text))
     if not segments:
         return []
+    segments.sort()
 
     min_b, max_b = clip_duration_bounds()
     eff_min = float(min_secs) if min_secs is not None else float(min_b)
     eff_max = float(max_secs) if max_secs is not None else float(max_b)
     eff_min = max(5.0, eff_min)
-    eff_max = max(eff_min + 5.0, eff_max)
+    eff_max = max(eff_min, eff_max)
 
     if target_clips is None:
         # clip_count_targets expects window count (~1 window per 90s), not raw seconds!
@@ -2024,119 +2035,70 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=None
     step = max(1, len(segments) // 250)
     candidates = []
     for i in range(0, len(segments), step):
-        seg = segments[i]
-        start_t = float(seg.get("start", 0.0))
-        text_parts = [str(seg.get("text", "") or "").strip()]
-        end_t = float(seg.get("end", start_t))
-
+        start_t = segments[i][0]
+        text_parts = []
+        end_t = start_t
         best_for_start = None
-        for next_seg in segments[i + 1:]:
-            next_end = float(next_seg.get("end", end_t))
-            dur = next_end - start_t
+        for j in range(i, len(segments)):
+            _, next_end, text = segments[j]
+            end_t = max(end_t, next_end)
+            dur = round(end_t - start_t, 3)
             if dur > eff_max:
                 break
-            text_parts.append(str(next_seg.get("text", "") or "").strip())
-            end_t = next_end
-            if dur >= eff_min:
-                full_text = " ".join(p for p in text_parts if p).strip()
-                if not full_text:
-                    continue
-                if viral_brain:
-                    assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
-                    cand = {
-                        "start": round(start_t, 2),
-                        "end": round(end_t, 2),
-                        "predicted_score": assessment.overall_score,
-                        "video_description_for_tiktok": assessment.tiktok_description,
-                        "video_description_for_instagram": assessment.instagram_description,
-                        "video_title_for_youtube_short": assessment.suggested_title,
-                        "viral_hook_text": assessment.viral_hook_text,
-                    }
-                else:
-                    cand = {
-                        "start": round(start_t, 2),
-                        "end": round(end_t, 2),
-                        "predicted_score": 65,
-                        "video_description_for_tiktok": full_text[:100],
-                        "video_description_for_instagram": full_text[:100],
-                        "video_title_for_youtube_short": full_text[:50],
-                        "viral_hook_text": full_text.split(".")[0][:30],
-                    }
-                if best_for_start is None or cand["predicted_score"] > best_for_start["predicted_score"]:
-                    best_for_start = cand
+            text_parts.append(text)
+            if dur < eff_min:
+                continue
+            assessment = viral_brain.evaluate_viral_clip(" ".join(text_parts), duration=dur)
+            if best_for_start is None or assessment.overall_score > best_for_start["predicted_score"]:
+                best_for_start = {
+                    "start": start_t,
+                    "end": end_t,
+                    "predicted_score": assessment.overall_score,
+                    "video_description_for_tiktok": assessment.tiktok_description,
+                    "video_description_for_instagram": assessment.instagram_description,
+                    "video_title_for_youtube_short": assessment.suggested_title,
+                    "viral_hook_text": assessment.viral_hook_text,
+                }
         if best_for_start is not None:
             candidates.append(best_for_start)
 
     deduped = deduplicate_overlapping_clips(candidates, max_overlap_ratio=0.25)
-    chosen = trim_to_best(deduped, target_clips)
-
-    if not chosen and segments:
-        s0 = max(0.0, float(segments[0].get("start", 0.0)))
-        e0 = float(segments[-1].get("end", s0))
-        if video_duration and float(video_duration) > 0:
-            e0 = min(e0, float(video_duration))
-        dur = max(1.0, e0 - s0)
-        full_text = " ".join(str(s.get("text", "") or "").strip() for s in segments).strip()
-        hook = "WATCH THIS! 🤯"
-        title = full_text[:50] or "Highlight Moment"
-        score = 50
-        tiktok_desc = full_text[:100]
-        ig_desc = full_text[:100]
-        if viral_brain and full_text:
-            assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
-            hook = assessment.viral_hook_text
-            title = assessment.suggested_title
-            score = assessment.overall_score
-            tiktok_desc = assessment.tiktok_description
-            ig_desc = assessment.instagram_description
-        if e0 > s0:
-            chosen.append({
-                "start": round(s0, 2),
-                "end": round(e0, 2),
-                "predicted_score": score,
-                "video_description_for_tiktok": tiktok_desc,
-                "video_description_for_instagram": ig_desc,
-                "video_title_for_youtube_short": title,
-                "viral_hook_text": hook,
-            })
-    return chosen
+    return trim_to_best(deduped, target_clips)
 
 
 def _heuristic_visual_clips(video_path, video_duration, target_clips=3):
     """Heuristic visual highlight detector for silent videos when no vision AI key is present."""
+    min_secs, max_secs = clip_duration_bounds()
+    if video_duration < min_secs:
+        return []
     shorts = []
     try:
-        from highlight_detector import detect_highlights
-        highlights = detect_highlights(video_path, target_clips=target_clips)
-        for i, h in enumerate(highlights):
-            # highlight_detector.HighlightMoment.score is already calibrated to 0..100
-            raw_score = float(h.score or 0.0)
-            norm_score = int(round(min(99.0, max(20.0, raw_score if raw_score > 1.0 else raw_score * 100.0))))
+        from engine.editing.highlight_detector import detect_highlights
+        highlights = detect_highlights(
+            video_path, target_clips=target_clips,
+            target_clip_duration=min(max_secs, max(min_secs, 20.0)),
+        )
+        for h in highlights:
+            end = min(h.end, video_duration)
+            if not min_secs <= round(end - h.start, 3) <= max_secs:
+                continue
             shorts.append({
-                "start": round(h.start, 2),
-                "end": round(h.end, 2),
-                "predicted_score": norm_score,
-                "video_description_for_tiktok": f"Epic highlight moment #{i+1} 🔥",
-                "video_description_for_instagram": f"Unreal peak moment #{i+1} ⚡",
-                "video_title_for_youtube_short": f"Best Moment #{i+1} That You Won't Believe",
-                "viral_hook_text": "WAIT FOR IT... 😱",
+                "start": h.start,
+                "end": end,
+                "predicted_score": h.score,
+                "video_title_for_youtube_short": h.title,
             })
     except Exception as e:
         print(f"⚠️ Highlight detector notice ({e}) — falling back to windowing.")
 
     shorts = deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35)
 
-    if not shorts and float(video_duration or 0.0) >= 1.0:
-        min_b, max_b = clip_duration_bounds()
-        clip_dur = min(float(video_duration), min(float(max_b), max(float(min_b), float(video_duration))))
+    if not shorts:
         shorts.append({
             "start": 0.0,
-            "end": round(clip_dur, 2),
-            "predicted_score": 55,
-            "video_description_for_tiktok": "Best moment from this video 🔥",
-            "video_description_for_instagram": "Must watch highlight ⚡",
-            "video_title_for_youtube_short": "Highlight Moment",
-            "viral_hook_text": "WATCH THIS! 🤯",
+            "end": min(video_duration, max_secs),
+            "predicted_score": 0,
+            "video_title_for_youtube_short": "Unscored clip",
         })
     return shorts
 
@@ -2572,7 +2534,7 @@ def _process_video_pipeline_impl(
         return path
 
     if is_url:
-        from security_utils import normalize_media_url
+        from engine.utils.security_utils import normalize_media_url
         url = normalize_media_url(input_video_or_url)
         resolved_output_dir = _ensure_dir(output_dir or "./output")
         input_video, video_title = download_youtube_video(url, resolved_output_dir)
@@ -2597,7 +2559,7 @@ def _process_video_pipeline_impl(
     # Layout choice is per SOURCE video, not per clip
     if layout_picker.ENABLED:
         try:
-            from reframe_v2 import source_already_fits
+            from engine.layouts.reframe_v2 import source_already_fits
             if src_w and src_h and source_already_fits(src_w, src_h, ASPECT_RATIO):
                 print(f"   ↕️  Source is {src_w}x{src_h} — already vertical, no layout to pick.")
             else:
@@ -2617,7 +2579,7 @@ def _process_video_pipeline_impl(
             output_file = os.path.join(output_file or resolved_output_dir, f"{video_title}_vertical.mp4")
         os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         rendered = render_clip(input_video, output_file, output_format)
-        ok, _out_info, reason = validate_media_output(output_file, require_video=True)
+        ok, _out_info, reason = validate_media_output(output_file, require_video=True, decode_check=True)
         if rendered and ok:
             ready_clips.append(output_file)
         else:
@@ -2626,7 +2588,7 @@ def _process_video_pipeline_impl(
         print(f"🎥 Video Duration: {duration:.2f}s ({src_w}x{src_h} @ {fps:.2f} fps)")
 
         # 3. Transcribe
-        from transcribe_backends import NoAudioError
+        from engine.intelligence.transcribe_backends import NoAudioError
         transcript = None
         if transcript_path:
             try:
@@ -2665,16 +2627,11 @@ def _process_video_pipeline_impl(
 
         if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
             print("⚠️ AI clip detection returned empty — generating heuristic highlight clips...")
-            if transcript is not None:
-                clips_data = {
-                    "shorts": _heuristic_transcript_clips(transcript, duration),
-                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
-                }
-            else:
-                clips_data = {
-                    "shorts": _heuristic_visual_clips(input_video, duration),
-                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
-                }
+            choices = _heuristic_transcript_clips(transcript, duration) if transcript is not None else []
+            clips_data = {
+                "shorts": choices or _heuristic_visual_clips(input_video, duration),
+                "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+            }
 
         if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
             raise RuntimeError("Clip detection failed — unable to identify usable clips for this video.")
@@ -2733,7 +2690,7 @@ def _process_video_pipeline_impl(
                 if success and os.environ.get("WATERMARK") == "1":
                     apply_watermark(clip_final_path)
                 deliver_path = clip_final_path
-                import layout_ranges as _layouts
+                from engine.layouts import layout_ranges as _layouts
                 clip['layout_ranges'] = _layouts.read(clip_final_path)
                 if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
                     hook_grounding.reground(clip_final_path, clip, transcript, start, end)
@@ -2751,7 +2708,7 @@ def _process_video_pipeline_impl(
                         expected_duration=(end - start),
                         duration_tolerance=max(3.0, (end - start) * 0.15),
                         require_video=True,
-                        decode_check=False,
+                        decode_check=True,
                     )
                     if not ok:
                         print(f"   ❌ Clip {i+1} failed output validation ({reason}) — not marking ready.")

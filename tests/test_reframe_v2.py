@@ -1,4 +1,4 @@
-from reframe_v2 import (
+from engine.layouts.reframe_v2 import (
     DELIVERY_MIN_WIDTH,
     concat_list_content,
     dedupe_sendcmd_lines,
@@ -93,7 +93,7 @@ class TestGeneralLayout:
     """GENERAL used to leave the content at 32% of the frame, floating in blur."""
 
     def test_content_is_scaled_by_height_not_width(self):
-        from reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
+        from engine.layouts.reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
         graph = general_filtergraph(1080, 1920)
         expected = int(1920 * GENERAL_CONTENT_HEIGHT_RATIO)
         expected += expected % 2
@@ -116,14 +116,14 @@ class TestGeneralLayout:
     def test_content_fills_more_than_the_old_full_width_fit(self):
         # A 16:9 source fitted to full width was 9/16 of it — 0.5625 * 1080
         # = 608px, i.e. 32% of a 1920 frame. The new layout must beat that.
-        from reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
+        from engine.layouts.reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
         old_ratio = (1080 * 9 / 16) / 1920
         assert GENERAL_CONTENT_HEIGHT_RATIO > old_ratio
 
     def test_keeps_most_of_the_source_width(self):
         # GENERAL is for groups and landscapes: cropping the sides too hard
         # cuts people out of frame, which is the whole thing it exists to avoid.
-        from reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
+        from engine.layouts.reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
         scaled_w = 1920 * GENERAL_CONTENT_HEIGHT_RATIO * (16 / 9)
         assert 1080 / scaled_w > 0.70, "keeps less than 70% of the source width"
 
@@ -160,7 +160,7 @@ class TestVerticalSource:
     def test_landscape_keeps_the_presence_ratio(self):
         # The floor must not disturb the case the ratio was tuned for: a 16:9
         # source fills the width at 608, below the 806 the ratio asks for.
-        from reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
+        from engine.layouts.reframe_v2 import GENERAL_CONTENT_HEIGHT_RATIO
         expected = int(1920 * GENERAL_CONTENT_HEIGHT_RATIO)
         expected += expected % 2
         graph = general_filtergraph(1080, 1920, orig_w=1920, orig_h=1080)

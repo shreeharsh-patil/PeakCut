@@ -1,7 +1,7 @@
 """A policy block on a batch of windows must bisect, not kill the job."""
 import pytest
 main = pytest.importorskip("main")
-import gemini_worker
+from engine.intelligence import gemini_worker
 
 
 def _windows(n):

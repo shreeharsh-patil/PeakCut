@@ -26,10 +26,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app
-import peakcut_bridge
-from publishing_queue import PostItem, PublishingQueue, QueueWorker
-import youtube_uploader
-import llm_backend
+from engine.studio import peakcut_bridge
+from engine.services.publishing_queue import PostItem, PublishingQueue, QueueWorker
+from engine.services import youtube_uploader
+from engine.intelligence import llm_backend
 
 
 @pytest.fixture

@@ -2,7 +2,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from channel_watcher import ChannelWatcherService, WatchedChannel
+from engine.discovery.channel_watcher import ChannelWatcherService, WatchedChannel
 
 SAMPLE_RSS_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">

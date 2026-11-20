@@ -1,7 +1,7 @@
 """Tests for Creator Workspaces (creator_workspaces.py)."""
 from pathlib import Path
 
-from creator_workspaces import CreatorWorkspaceManager
+from engine.services.creator_workspaces import CreatorWorkspaceManager
 
 
 def test_creator_workspaces_crud(tmp_path: Path):

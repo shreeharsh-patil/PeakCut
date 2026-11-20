@@ -4,10 +4,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from main import SmoothedCameraman, get_video_resolution
-from reframe_v2 import delivery_size
-from subtitles import _escape_ass_text, generate_ass
-from live_clipper import resolve_live_stream
-import batch_runner
+from engine.layouts.reframe_v2 import delivery_size
+from engine.editing.subtitles import _escape_ass_text, generate_ass
+from engine.discovery.live_clipper import resolve_live_stream
+from engine.utils import batch_runner
 
 
 def test_smoothed_cameraman_even_dimensions_and_centered_y():

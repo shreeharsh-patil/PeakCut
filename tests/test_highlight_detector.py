@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from highlight_detector import detect_hype_moments, extract_audio_energy
+from engine.editing.highlight_detector import detect_hype_moments, extract_audio_energy
 
 
 def test_detect_hype_moments_synthetic(tmp_path: Path):
@@ -16,7 +16,7 @@ def test_detect_hype_moments_synthetic(tmp_path: Path):
     # Spike at index 60 (30.0 seconds)
     envelope[58:64] = 0.85
 
-    with patch("highlight_detector.extract_audio_energy") as mock_extract:
+    with patch("engine.editing.highlight_detector.extract_audio_energy") as mock_extract:
         mock_extract.return_value = (envelope, 60.0)
 
         moments = detect_hype_moments(

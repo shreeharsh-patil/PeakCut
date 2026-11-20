@@ -7,7 +7,7 @@ without the FastAPI app or a database.
 """
 import asyncio
 
-from mcp_server import PROTOCOL_VERSIONS, TOOLS, _TOOL_IMPLS, handle_message
+from engine.studio.mcp_server import PROTOCOL_VERSIONS, TOOLS, _TOOL_IMPLS, handle_message
 
 
 async def _ok_tool(name, args):

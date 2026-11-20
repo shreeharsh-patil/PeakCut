@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 import pytest
-from security_utils import normalize_media_url, assert_public_url
+from engine.utils.security_utils import normalize_media_url, assert_public_url
 
 
 def test_normalize_media_url_bare_id():

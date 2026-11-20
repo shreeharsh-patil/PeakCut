@@ -4,14 +4,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-from youtube_uploader import (
+from engine.services.youtube_uploader import (
     YouTubeAuthError,
     YouTubeUploadError,
     refresh_access_token,
     upload_youtube_short,
     register_youtube_dispatcher,
 )
-from publishing_queue import PostItem, PublishingQueue
+from engine.services.publishing_queue import PostItem, PublishingQueue
 
 
 def test_refresh_access_token_success():
@@ -69,6 +69,7 @@ def test_upload_youtube_short_success(tmp_path: Path):
             title="My Epic Podcast Highlight",
             access_token="test_bearer_token",
             privacy_status="unlisted",
+            dry_run=False,
         )
 
         assert result["id"] == "v_test_9876"
@@ -95,7 +96,7 @@ def test_register_youtube_dispatcher(tmp_path: Path):
     dummy_video = tmp_path / "clip.mp4"
     dummy_video.write_bytes(b"fake data")
 
-    with patch("youtube_uploader.upload_youtube_short") as mock_upload:
+    with patch("engine.services.youtube_uploader.upload_youtube_short") as mock_upload:
         mock_upload.return_value = {
             "id": "yt_123",
             "url": "https://youtube.com/shorts/yt_123",

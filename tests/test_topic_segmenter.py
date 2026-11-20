@@ -1,5 +1,5 @@
 """Tests for Hearst TextTiling Topic Segmenter (topic_segmenter.py)."""
-from topic_segmenter import segment_transcript_topics
+from engine.intelligence.topic_segmenter import segment_transcript_topics
 
 
 def test_segment_transcript_topics():

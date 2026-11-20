@@ -1,5 +1,5 @@
 import os
-import llm_backend
+from engine.intelligence import llm_backend
 import re
 import sys
 import uuid
@@ -25,12 +25,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
-from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
-import recut
-import layout_ranges
+from engine.services.s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from engine.editing import recut
+from engine.layouts import layout_ranges
 
 load_dotenv()
 
@@ -159,7 +159,7 @@ async def _user_from_request(request: Request):
     return await get_current_user_optional(request)
 
 
-import api_key_rotator
+from engine.services import api_key_rotator
 
 
 def get_gemini_key() -> Optional[str]:
@@ -779,7 +779,7 @@ def cancel_job(job_id: str) -> bool:
             pass
 
     try:
-        import peakcut_bridge as _pb
+        from engine.studio import peakcut_bridge as _pb
         _pb.notify_state_changed()
     except Exception:
         pass
@@ -1589,7 +1589,7 @@ async def _deliver_webhook(url, body: bytes, secret):
     headers = {"Content-Type": "application/json", "User-Agent": "OpenShorts-Webhook/1.0"}
     if secret:
         headers["X-OpenShorts-Signature"] = _sign_webhook(body, secret)
-    from security_utils import assert_public_url, UnsafeURLError
+    from engine.utils.security_utils import assert_public_url, UnsafeURLError
     loop = asyncio.get_event_loop()
     for attempt, delay in enumerate(WEBHOOK_RETRY_DELAYS, 1):
         if delay:
@@ -1782,24 +1782,32 @@ if BILLING_ENABLED:
 
 # MCP server (/mcp): the pipeline as agent-callable tools. Works in both modes —
 # cloud requires an osk_ API key, self-host keeps BYOK (see mcp_server.py).
-import mcp_server as _mcp_server
+from engine.studio import mcp_server as _mcp_server
 app.include_router(_mcp_server.router)
 
 # Supercharged extensions: Live clipping, Niche discovery, Channel watcher, Publishing queue, Audio highlights
-import supercharged_routes as _supercharged_routes
+from engine.studio import supercharged_routes as _supercharged_routes
 app.include_router(_supercharged_routes.router)
 
 # PeakCut Studio UI and API compatibility bridge (/app, /studio, /api/sync, /api/overview, /api/load, etc.)
-import peakcut_bridge as _peakcut_bridge
+from engine.studio import peakcut_bridge as _peakcut_bridge
 app.include_router(_peakcut_bridge.router)
 
-# Enable CORS for frontend. Cloud mode locks this down to the configured origins;
-# self-host/Colab uses allow_origin_regex=".*" so credentialed requests (including
-# the tunnel session cookie) receive an explicit echoed Origin instead of "*".
+# The Studio and Colab tunnel use the API on the same origin. Allow the
+# project's known Vite dev ports and explicitly configured split deployments.
+_SELF_HOST_BROWSER_ORIGINS = [
+    f"http://{host}:{port}"
+    for host in ("localhost", "127.0.0.1")
+    for port in (5173, 5175)
+]
+_SELF_HOST_BROWSER_ORIGINS.extend(
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("PEAKCUT_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else [],
-    allow_origin_regex=None if BILLING_ENABLED else r".*",
+    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else _SELF_HOST_BROWSER_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1837,7 +1845,7 @@ async def _colab_access_token_gate(request: Request, call_next):
     query_tok = (request.query_params.get("token") or "").strip()
 
     def _matches(candidate: str) -> bool:
-        return bool(candidate) and _hmac.compare_digest(candidate, expected)
+        return bool(candidate) and _hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
     if _matches(query_tok):
         # Strip token from URL on browser navigation and set an HttpOnly session cookie
@@ -1942,7 +1950,7 @@ def _visible_logs(logs):
     """
     if not BILLING_ENABLED or DEBUG_LOGS:
         return logs
-    from log_view import friendly_logs
+    from engine.utils.log_view import friendly_logs
     return friendly_logs(logs)
 
 
@@ -2110,7 +2118,7 @@ async def run_job(job_id, job_data):
                     # Use a lock or just robust read? json.load might fail if file is partial.
                     # Usually main.py writes it once at start (based on my review).
                     if os.path.getsize(target_json) > 0:
-                        with open(target_json, 'r') as f:
+                        with open(target_json, 'r', encoding='utf-8') as f:
                             data = json.load(f)
                             
                         base_name = os.path.basename(target_json).replace('_metadata.json', '')
@@ -2141,18 +2149,13 @@ async def run_job(job_id, job_data):
                 # Ignore read errors during processing
                 pass
 
+        # Drain the worker's last log lines, including its CLIP_READY messages.
+        await asyncio.to_thread(t_log.join, 2)
+        if jobs[job_id]['status'] == 'cancelled':
+            return
         returncode = process.returncode
         
         if returncode == 0:
-            jobs[job_id]['status'] = 'completed'
-            jobs[job_id]['logs'].append("Process finished successfully.")
-            
-            # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
-            # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
             # Find result JSON
             json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if not json_files:
@@ -2166,22 +2169,39 @@ async def run_job(job_id, job_data):
                 
                 # Enhance result with video URLs
                 base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                clips = data.get('shorts', [])
+                clips = []
                 cost_analysis = data.get('cost_analysis')
+                ready_files = jobs[job_id].get('ready_files') or {}
 
-                for i, clip in enumerate(clips):
-                     clip_filename = _canonical_clip_file(output_dir, base_name, i)
-                     clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                     clip.setdefault('id', f"c_{i+1:02d}")
+                for i, clip in enumerate(data.get('shorts') or []):
+                    if not isinstance(clip, dict):
+                        continue
+                    clip_filename = ready_files.get(i) if ready_files else _canonical_clip_file(output_dir, base_name, i)
+                    if not clip_filename:
+                        continue
+                    clip_path = os.path.join(output_dir, clip_filename)
+                    if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+                        continue
+                    clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                    clip.setdefault('id', f"c_{i+1:02d}")
+                    clips.append(clip)
+                if not clips:
+                    raise RuntimeError("No rendered clip files were found.")
                 
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['logs'].append("Process finished successfully.")
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
                 clean_job_title = re.sub(r"_+", " ", base_name.removeprefix("source_")).strip()
                 _sync_job_status_disk(job_id, output_dir, "done", clips=clips, title=clean_job_title or None)
+                # Cloud mode archives to R2 in the worker wrapper.
+                if not BILLING_ENABLED:
+                    asyncio.get_running_loop().run_in_executor(None, upload_job_artifacts, output_dir, job_id)
                 drive_sync_root = (os.environ.get("PEAKCUT_DRIVE_SYNC_DIR") or "").strip()
                 if drive_sync_root:
                     try:
                         import colab_runner as _cr
-                        sync_res = _cr.sync_job_directory_to_storage(
+                        sync_res = await asyncio.to_thread(
+                            _cr.sync_job_directory_to_storage,
                             output_dir, job_id, drive_root=drive_sync_root, cleanup_temp=False,
                         )
                         if sync_res.get("ok"):
@@ -2237,7 +2257,7 @@ async def get_config():
     upload_post_key = os.environ.get("UPLOAD_POST_API_KEY", "").strip()
     upload_post_configured = bool(upload_post_key)
     is_mock = upload_post_key.lower() in ("mock", "test", "sandbox") or os.environ.get("UPLOAD_POST_MOCK") == "1"
-    from youtube_uploader import is_youtube_auth_configured
+    from engine.services.youtube_uploader import is_youtube_auth_configured
     yt_configured = is_youtube_auth_configured()
     default_privacy = os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")
 
@@ -2557,7 +2577,7 @@ async def process_endpoint(
     # Completion callback: reject unsafe targets NOW (clear 400) — delivery
     # re-validates anyway, but failing at submit is the debuggable behavior.
     if webhook_url:
-        from security_utils import assert_public_url, UnsafeURLError
+        from engine.utils.security_utils import assert_public_url, UnsafeURLError
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None, assert_public_url, webhook_url)
@@ -2650,7 +2670,7 @@ async def process_endpoint(
     # byte-for-byte; the dashboard sends an explicit value either way.
     if str(auto_hook).lower() in ("1", "true", "yes"):
         env["AUTO_HOOK"] = "1"
-        from hooks import HOOK_STYLES
+        from engine.editing.hooks import HOOK_STYLES
         if auto_hook_style in HOOK_STYLES:
             env["AUTO_HOOK_STYLE"] = auto_hook_style
         print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'classic')}")
@@ -2880,7 +2900,7 @@ def start_job_process_background(
         env["RANGE_END"] = str(opts["range_end"])
 
     if url:
-        from security_utils import normalize_media_url
+        from engine.utils.security_utils import normalize_media_url
         url = normalize_media_url(url)
         is_colab_env = os.environ.get("IS_COLAB") == "1" or os.path.exists("/content/drive")
         if is_colab_env:
@@ -3354,11 +3374,11 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
         return False
 
 
-from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
-from hooks import add_hook_to_video
-from translate import translate_video, get_supported_languages
-from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
+from engine.editing.editor import VideoEditor
+from engine.editing.subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
+from engine.editing.hooks import add_hook_to_video
+from engine.intelligence.translate import translate_video, get_supported_languages
+from engine.editing.thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
                        generate_youtube_description, extract_face_frames)
 
 class EditRequest(BaseModel):
@@ -4976,7 +4996,7 @@ async def translate_clip(
     # AI Act art. 50(2): the voice in this file was synthesised, so the file
     # says so in a way a machine can read. Best-effort by design — see
     # ffmpeg_utils.mark_ai_generated.
-    from ffmpeg_utils import mark_ai_generated
+    from engine.editing.ffmpeg_utils import mark_ai_generated
     await loop.run_in_executor(
         None, lambda: mark_ai_generated(output_path, "AI voice dubbing"))
 
@@ -5070,7 +5090,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
     # Step 3: Resolve credentials and verify upload readiness
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
 
-    from youtube_uploader import (
+    from engine.services.youtube_uploader import (
         is_youtube_auth_configured,
         upload_youtube_short,
         YouTubeAuthError,
@@ -5115,7 +5135,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         # Fallback to direct YouTube uploader if Upload-Post key is not configured and only YouTube is selected
         if is_only_youtube and direct_yt_ready and not upload_key:
             if req.scheduled_date:
-                from publishing_queue import get_publishing_queue
+                from engine.services.publishing_queue import get_publishing_queue
                 import datetime as dt_module
                 try:
                     clean_dt = req.scheduled_date.replace("Z", "+00:00")
@@ -5236,7 +5256,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
 @app.get("/api/social/readiness")
 async def get_social_readiness(request: Request):
     """Check readiness of YouTube and social publishing backends."""
-    from youtube_uploader import get_youtube_readiness_status
+    from engine.services.youtube_uploader import get_youtube_readiness_status
     upload_key, _ = await resolve_upload_post(request)
     direct_status = get_youtube_readiness_status()
     default_privacy = direct_status["default_privacy"]
@@ -5280,7 +5300,7 @@ class DirectYouTubeUploadRequest(BaseModel):
 @app.post("/api/youtube/upload")
 async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Request):
     """Directly upload a video file or processed clip to YouTube Shorts."""
-    from youtube_uploader import (
+    from engine.services.youtube_uploader import (
         upload_youtube_short,
         is_youtube_auth_configured,
         YouTubeAuthError,
@@ -6232,7 +6252,7 @@ async def thumbnail_publish_status(publish_id: str):
 # SaaSShorts: AI UGC Video Generator for SaaS Products
 # ═══════════════════════════════════════════════════════════════════════
 
-from saasshorts import (
+from engine.utils.saasshorts import (
     scrape_website,
     research_saas_online,
     analyze_saas,
@@ -6442,7 +6462,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
 
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
 
-    from youtube_uploader import (
+    from engine.services.youtube_uploader import (
         is_youtube_auth_configured,
         upload_youtube_short,
         YouTubeAuthError,
@@ -6497,7 +6517,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
 
         if is_only_youtube and direct_yt_ready and not upload_key:
             if req.scheduled_date:
-                from publishing_queue import get_publishing_queue
+                from engine.services.publishing_queue import get_publishing_queue
                 import datetime as dt_module
                 try:
                     clean_dt = req.scheduled_date.replace("Z", "+00:00")
@@ -6842,7 +6862,7 @@ async def saasshorts_generate(
         if req.selected_actor_url.startswith("http"):
             # Download from S3 public URL to job output dir
             import httpx
-            from security_utils import assert_public_url
+            from engine.utils.security_utils import assert_public_url
             try:
                 # SSRF guard: block private / metadata hosts before fetching.
                 safe_actor_url = assert_public_url(req.selected_actor_url)

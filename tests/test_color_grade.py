@@ -1,7 +1,7 @@
 """Tests for Visual Color Grading (color_grade.py)."""
 import pytest
 
-from color_grade import get_color_grade_filter, list_color_grade_presets
+from engine.editing.color_grade import get_color_grade_filter, list_color_grade_presets
 
 
 def test_list_and_get_presets():

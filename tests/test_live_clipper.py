@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from live_clipper import (
+from engine.discovery.live_clipper import (
     ClipEvent,
     LiveClipperManager,
     LiveClipperSession,

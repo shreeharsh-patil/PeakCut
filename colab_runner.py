@@ -440,7 +440,7 @@ def ensure_ollama_ready(
     Never fabricates readiness: if any step fails, returns `ready=False` with
     `fallback_mode="heuristic"` and the concrete reason.
     """
-    import llm_backend
+    from engine.intelligence import llm_backend
 
     log_path = get_log_dir() / "ollama.log"
     status: Dict[str, Any] = {
@@ -1261,7 +1261,7 @@ def parse_url_list(urls_input: Union[str, List[str]]) -> List[str]:
     elif isinstance(urls_input, (list, tuple)):
         raw_items = [str(u).strip() for u in urls_input if str(u).strip()]
 
-    from security_utils import normalize_media_url
+    from engine.utils.security_utils import normalize_media_url
     seen = set()
     cleaned: List[str] = []
     for item in raw_items:
@@ -1354,7 +1354,7 @@ def run_shorts_pipeline(
     print("=" * 70)
 
     from main import process_video_pipeline
-    from ffmpeg_utils import validate_media_output
+    from engine.editing.ffmpeg_utils import validate_media_output
 
     results: Dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -1453,7 +1453,7 @@ def run_shorts_pipeline(
                 # Optional YouTube scheduling
                 if schedule_to_youtube and final_clips:
                     try:
-                        import youtube_uploader
+                        from engine.services import youtube_uploader
                         shorts_meta = (job_res.get("metadata") or {}).get("shorts") or []
                         for c_idx, clip_path in enumerate(final_clips):
                             delay = youtube_interval_hours * (len(all_produced_clips) - len(final_clips) + c_idx + 1)
@@ -1525,7 +1525,7 @@ def publish_clip(
     if access_token and access_token.strip():
         os.environ["YOUTUBE_ACCESS_TOKEN"] = access_token.strip()
 
-    import youtube_uploader
+    from engine.services import youtube_uploader
     publish_at = None
     if delay_hours > 0:
         pub_dt = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
@@ -1579,7 +1579,7 @@ def diagnose_peakcut(port: int = 8000, run_inference_check: bool = False) -> Dic
 
     Never prints sensitive token values or API keys.
     """
-    import llm_backend
+    from engine.intelligence import llm_backend
 
     checks: List[Dict[str, str]] = []
 
@@ -1792,7 +1792,7 @@ def show_status(port: int = 8000) -> Dict[str, Any]:
             except ValueError:
                 pass
 
-    import llm_backend
+    from engine.intelligence import llm_backend
     llm_h = llm_backend.check_local_llm_health(timeout=2.0, use_cache=False)
     if llm_h.get("reachable"):
         models = llm_h.get("installed_models") or []

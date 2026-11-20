@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from niche_discovery import (
+from engine.discovery.niche_discovery import (
     DiscoveredVideo,
     NicheDiscoveryEngine,
     SeenLedger,

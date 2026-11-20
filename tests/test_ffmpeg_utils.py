@@ -2,8 +2,8 @@ import subprocess
 
 import pytest
 
-import ffmpeg_utils
-from ffmpeg_utils import (
+from engine.editing import ffmpeg_utils
+from engine.editing.ffmpeg_utils import (
     AI_DISCLOSURE,
     DELIVERY,
     METADATA_SCRUB,

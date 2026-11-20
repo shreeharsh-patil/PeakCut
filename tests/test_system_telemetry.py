@@ -1,5 +1,5 @@
 """Tests for Hardware & System Telemetry (system_telemetry.py)."""
-from system_telemetry import SystemTelemetry
+from engine.services.system_telemetry import SystemTelemetry
 
 
 def test_system_telemetry_get():

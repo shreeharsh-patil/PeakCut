@@ -1,5 +1,5 @@
-import split_layout
-from split_layout import (
+from engine.layouts import split_layout
+from engine.layouts.split_layout import (
     analyze_scene,
     split_filtergraph,
     split_geometry,

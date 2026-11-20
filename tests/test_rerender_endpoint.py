@@ -16,7 +16,7 @@ import httpx
 import pytest
 
 app_module = pytest.importorskip("app")
-import recut  # noqa: E402
+from engine.editing import recut  # noqa: E402
 
 JOB_ID = "recut-endpoint-test-job"
 
@@ -339,7 +339,7 @@ class TestRerenderPersistence:
 
 class TestMcpTool:
     def test_recut_clip_is_registered(self):
-        import mcp_server
+        from engine.studio import mcp_server
         names = [t["name"] for t in mcp_server.TOOLS]
         assert "recut_clip" in names
         assert "recut_clip" in mcp_server._TOOL_IMPLS

@@ -1,5 +1,5 @@
-import punch_in
-from punch_in import MAX_ZOOM, crop_boxes, sendcmd_lines, zoom_curve
+from engine.layouts import punch_in
+from engine.layouts.punch_in import MAX_ZOOM, crop_boxes, sendcmd_lines, zoom_curve
 
 
 class TestZoomCurve:
@@ -87,19 +87,19 @@ class TestSendcmdLines:
 
 class TestEmphasisTimes:
     def test_silent_or_unreadable_audio_yields_no_beats(self, monkeypatch):
-        import active_speaker
+        from engine.layouts import active_speaker
         monkeypatch.setattr(active_speaker, "audio_envelope",
                             lambda *a, **k: [])
         assert punch_in.emphasis_times("x.mp4", 30.0) == []
 
     def test_flat_audio_yields_no_beats(self, monkeypatch):
-        import active_speaker
+        from engine.layouts import active_speaker
         monkeypatch.setattr(active_speaker, "audio_envelope",
                             lambda *a, **k: [0.5] * 50)
         assert punch_in.emphasis_times("x.mp4", 10.0) == []
 
     def test_beats_respect_the_minimum_gap(self, monkeypatch):
-        import active_speaker
+        from engine.layouts import active_speaker
         envelope = [1.0 if i % 2 == 0 else 0.0 for i in range(100)]
         monkeypatch.setattr(active_speaker, "audio_envelope",
                             lambda *a, **k: envelope)

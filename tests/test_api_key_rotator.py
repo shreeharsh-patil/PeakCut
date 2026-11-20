@@ -11,8 +11,8 @@ Verifies:
 """
 import time
 import pytest
-import api_key_rotator
-from api_key_rotator import ApiKeyRotator, is_rotatable_error, mask_key, parse_comma_keys
+from engine.services import api_key_rotator
+from engine.services.api_key_rotator import ApiKeyRotator, is_rotatable_error, mask_key, parse_comma_keys
 
 
 def test_parse_comma_keys():

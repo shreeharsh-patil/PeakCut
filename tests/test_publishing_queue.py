@@ -3,7 +3,7 @@ import datetime as dt
 import time
 from pathlib import Path
 
-from publishing_queue import PostItem, PublishingQueue
+from engine.services.publishing_queue import PostItem, PublishingQueue
 
 
 def test_queue_enqueue_and_persistence(tmp_path: Path):

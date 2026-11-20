@@ -11,7 +11,7 @@ import pytest
 from unittest.mock import patch, MagicMock, mock_open
 
 import colab_runner
-import llm_backend
+from engine.intelligence import llm_backend
 
 
 @pytest.fixture(autouse=True)
@@ -144,7 +144,7 @@ def test_publish_clip_pure_python(tmp_path):
     clip_file = tmp_path / "clip.mp4"
     clip_file.write_bytes(b"dummy")
 
-    with patch("youtube_uploader.upload_youtube_short", return_value={"video_id": "yt_123", "status": "scheduled"}) as mock_up:
+    with patch("engine.services.youtube_uploader.upload_youtube_short", return_value={"video_id": "yt_123", "status": "scheduled"}) as mock_up:
         res = colab_runner.publish_clip(
             video_path=str(clip_file),
             title="Short Title #Shorts",
@@ -221,14 +221,14 @@ def test_peakcut_bridge_ai_status_in_local_mode(monkeypatch):
         "error": "Connection refused",
     }
 
-    with patch("llm_backend.check_local_llm_health", return_value=healthy_probe):
+    with patch("engine.intelligence.llm_backend.check_local_llm_health", return_value=healthy_probe):
         asyncio.run(_test_ready())
-    with patch("llm_backend.check_local_llm_health", return_value=offline_probe):
+    with patch("engine.intelligence.llm_backend.check_local_llm_health", return_value=offline_probe):
         asyncio.run(_test_offline())
 
 
 def test_infer_job_stage_and_progress_dynamic():
-    import peakcut_bridge
+    from engine.studio import peakcut_bridge
 
     # Downloading stage
     stage, prog = peakcut_bridge._infer_job_stage_and_progress(["📥 Downloading video from YouTube..."])
@@ -260,7 +260,7 @@ def test_infer_job_stage_and_progress_dynamic():
 
 
 def test_normalize_media_url_variations():
-    from security_utils import normalize_media_url, assert_public_url
+    from engine.utils.security_utils import normalize_media_url, assert_public_url
 
     urls = [
         "watch?v=irNhWMG560k",
@@ -286,12 +286,12 @@ def test_core_modules_annotations_python312_compatible():
     core_mods = [
         "main",
         "app",
-        "peakcut_bridge",
+        "engine.studio.peakcut_bridge",
         "colab_runner",
-        "llm_backend",
-        "ffmpeg_utils",
-        "security_utils",
-        "batch_runner",
+        "engine.intelligence.llm_backend",
+        "engine.editing.ffmpeg_utils",
+        "engine.utils.security_utils",
+        "engine.utils.batch_runner",
     ]
     for mname in core_mods:
         mod = importlib.import_module(mname)
@@ -310,7 +310,7 @@ def test_core_modules_annotations_python312_compatible():
 def test_heuristic_transcript_clips_fallback_and_unicode():
     """Verify heuristic fallback works when Ollama/LLM is unreachable, including Hindi/Unicode text."""
     import main
-    import viral_brain
+    from engine.intelligence import viral_brain
 
     # Direct evaluate_viral_clip accepts optional duration
     a1 = viral_brain.evaluate_viral_clip("Wait why did nobody tell you this secret? Because it works!", 28.0)
@@ -492,7 +492,7 @@ def test_ensure_ollama_ready_five_step_verification_and_fallback(tmp_path, monke
 
     # 2. Binary exists + server healthy + model installed + test inference passes -> ready=True
     with patch("colab_runner.shutil.which", return_value="/usr/local/bin/ollama"), \
-         patch("llm_backend.check_local_llm_health") as mock_health:
+         patch("engine.intelligence.llm_backend.check_local_llm_health") as mock_health:
         mock_health.side_effect = [
             {"reachable": True, "model_installed": True, "ready": True, "installed_models": ["gemma2:2b"], "test_inference_ok": None, "error": None},
             {"reachable": True, "model_installed": True, "ready": True, "installed_models": ["gemma2:2b"], "test_inference_ok": True, "error": None},
@@ -506,7 +506,7 @@ def test_ensure_ollama_ready_five_step_verification_and_fallback(tmp_path, monke
 
     # 3. Model installed, but real test inference FAILS -> never falsely claims ready!
     with patch("colab_runner.shutil.which", return_value="/usr/local/bin/ollama"), \
-         patch("llm_backend.check_local_llm_health") as mock_health:
+         patch("engine.intelligence.llm_backend.check_local_llm_health") as mock_health:
         mock_health.side_effect = [
             {"reachable": True, "model_installed": True, "ready": True, "installed_models": ["gemma2:2b"], "test_inference_ok": None, "error": None},
             {"reachable": True, "model_installed": True, "ready": False, "installed_models": ["gemma2:2b"], "test_inference_ok": False, "error": "CUDA OOM"},
@@ -600,6 +600,13 @@ def test_colab_access_token_gate_middleware(monkeypatch):
             # 2. Protected routes reject unauthenticated access
             r_no_auth = await client.get("/api/status")
             assert r_no_auth.status_code == 401
+            invalid_token = await client.get("/api/status", params={"token": "é"})
+            assert invalid_token.status_code == 401
+            preflight = await client.options("/api/status", headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "GET",
+            })
+            assert "access-control-allow-origin" not in preflight.headers
             r_app_no_auth = await client.get("/app")
             assert r_app_no_auth.status_code == 401
 
@@ -689,7 +696,7 @@ def test_diagnose_peakcut_all_14_checks_and_token_scrubbing(tmp_path, monkeypatc
         f"Started server with ?token={secret} ok\n", encoding="utf-8"
     )
 
-    with patch("llm_backend.check_local_llm_health", return_value={
+    with patch("engine.intelligence.llm_backend.check_local_llm_health", return_value={
         "ready": False, "reachable": False, "model_installed": False,
         "installed_models": [], "base_url": "http://127.0.0.1:11434/v1", "error": "offline",
     }), patch("colab_runner._http_get_ok", return_value=(False, 0, "offline")):

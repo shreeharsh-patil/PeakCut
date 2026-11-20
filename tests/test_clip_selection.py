@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from clip_selection import (
+from engine.intelligence.clip_selection import (
     build_transcript_windows,
     clip_count_targets,
     snap_clip_to_words,
@@ -154,7 +154,7 @@ class TestClipCountTargets:
 
 class TestDetailPromptCarriesTheCount:
     def test_template_formats_with_the_targets(self):
-        gw = pytest.importorskip("gemini_worker")
+        gw = pytest.importorskip("engine.intelligence.gemini_worker")
         low, high = clip_count_targets(5)
         prompt = gw.DETAIL_PROMPT_TEMPLATE.format(
             video_duration=300, language="es", min_clips=low, max_clips=high,

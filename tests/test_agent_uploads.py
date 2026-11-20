@@ -45,9 +45,11 @@ def dirs(tmp_path, monkeypatch):
 
 
 def test_create_upload_is_an_mcp_tool():
-    names = [t["name"] for t in __import__("mcp_server").TOOLS]
+    from engine.studio.mcp_server import TOOLS
+
+    names = [t["name"] for t in TOOLS]
     assert "create_upload" in names
-    pv = next(t for t in __import__("mcp_server").TOOLS if t["name"] == "process_video")
+    pv = next(t for t in TOOLS if t["name"] == "process_video")
     assert "upload_id" in pv["inputSchema"]["properties"]
     assert "captions" in pv["inputSchema"]["properties"]
     assert "source_url" not in pv["inputSchema"]["required"]
@@ -131,7 +133,7 @@ def test_delete_upload(dirs):
 
 
 def test_tmpfiles_link_is_refreshed_through_the_page():
-    import file_hosts
+    from engine.services import file_hosts
     stale = "https://tmpfiles.org/dl/1787841143.abc/wAwNGnPW0lXW/video.mp4"
     fresh = "https://tmpfiles.org/dl/1787841582.def/wAwNGnPW0lXW/video.mp4"
     seen = {}

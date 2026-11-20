@@ -10,8 +10,8 @@ import json
 import httpx
 import pytest
 
-import gemini_worker
-import llm_backend
+from engine.intelligence import gemini_worker
+from engine.intelligence import llm_backend
 
 
 @pytest.fixture

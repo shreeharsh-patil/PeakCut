@@ -9,7 +9,10 @@ it read as "the hooks are broken" (reported 24-ago-2026).
 main.py now announces each clip once its whole chain is done and names the file
 to serve; app.py consumes the marker the way it already consumes PROXY_BYTES.
 """
+import asyncio
 import io
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,3 +78,36 @@ class TestMainAnnouncesTheDeliveredFile:
         assert caption_at < marker_at
         marker_line = main_src[marker_at:marker_at + 200]
         assert "captioned or deliver_path" in marker_line
+
+
+@pytest.mark.parametrize("rendered", [False, True])
+def test_finished_job_only_exposes_rendered_files(tmp_path, monkeypatch, rendered):
+    job_id = "finished-render"
+    (tmp_path / "source_metadata.json").write_text(
+        json.dumps({"shorts": [{"start": 0, "end": 10}, {"start": 11, "end": 21}]}),
+        encoding="utf-8",
+    )
+    # A failed candidate can leave an intermediate MP4 but no CLIP_READY marker.
+    (tmp_path / "source_clip_2.mp4").write_bytes(b"unfinished")
+    if rendered:
+        (tmp_path / "source_clip_1.mp4").write_bytes(b"rendered")
+    job = {"logs": [], "cmd": ["mock-worker"], "env": {}, "output_dir": str(tmp_path)}
+    process = SimpleNamespace(
+        stdout=io.BytesIO(b"CLIP_READY 0 source_clip_1.mp4\n"),
+        poll=lambda: 0,
+        returncode=0,
+    )
+    monkeypatch.delenv("PEAKCUT_DRIVE_SYNC_DIR", raising=False)
+    monkeypatch.setattr(app, "jobs", {job_id: job})
+    monkeypatch.setattr(app, "_job_processes", {})
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(app, "upload_job_artifacts", lambda *args: None)
+
+    asyncio.run(app.run_job(job_id, job))
+
+    if rendered:
+        assert job["status"] == "completed"
+        assert [c["id"] for c in job["result"]["clips"]] == ["c_01"]
+    else:
+        assert job["status"] == "failed"
+        assert "No rendered clip files" in job["logs"][-1]

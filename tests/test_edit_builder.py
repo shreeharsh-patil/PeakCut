@@ -1,6 +1,6 @@
 import pytest
 
-from edit_builder import EFFECT_LIMITS, build_filter_string, normalize_edits
+from engine.editing.edit_builder import EFFECT_LIMITS, build_filter_string, normalize_edits
 
 
 def _edit(type_, start, end, strength=0.0):

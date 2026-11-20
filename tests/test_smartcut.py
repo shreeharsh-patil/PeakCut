@@ -2,7 +2,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from smartcut import compute_speech_segments, detect_silences
+from engine.editing.smartcut import compute_speech_segments, detect_silences
 
 
 def test_compute_speech_segments():

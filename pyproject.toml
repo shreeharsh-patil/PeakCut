@@ -13,7 +13,17 @@ requires-python = ">=3.9"
 peakcut = "colab_runner:cli_main"
 
 [tool.setuptools]
-py-modules = ["colab_runner"]
+py-modules = ["app", "main", "colab_runner", "clipmind_runner", "run_transform_pipeline"]
 
 [tool.setuptools.packages.find]
-include = ["engine", "engine.*"]
+include = [
+    "engine", "engine.*", "clipmind", "clipmind.*", "cloud", "cloud.*",
+    "anti_reused_pipeline", "anti_reused_pipeline.*", "web", "web.brand",
+    "fonts", "assets",
+]
+
+[tool.setuptools.package-data]
+web = ["*.html", "*.js"]
+"web.brand" = ["*.svg", "*.png", "*.jpg"]
+fonts = ["*.ttf", "*.conf"]
+assets = ["*.png", "*.mp3"]

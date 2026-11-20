@@ -3,7 +3,7 @@ import asyncio
 from pathlib import Path
 
 import app as app_module
-import peakcut_bridge
+from engine.studio import peakcut_bridge
 
 
 def _call(method: str, path: str, json_body: dict = None, params: dict = None):
@@ -161,8 +161,8 @@ def test_peakcut_accounts_apps_and_workers_metadata():
 def test_peakcut_clip_edit_and_post_uses_real_title_and_file(tmp_path):
     import json
     import shutil
-    import peakcut_bridge as pb
-    from publishing_queue import PublishingQueue, reset_publishing_queue, get_publishing_queue
+    from engine.studio import peakcut_bridge as pb
+    from engine.services.publishing_queue import PublishingQueue, reset_publishing_queue, get_publishing_queue
 
     jid = "test_clip_resolution_job"
     job_dir = pb.OUTPUT_DIR / jid
@@ -237,7 +237,7 @@ def test_peakcut_clip_edit_and_post_uses_real_title_and_file(tmp_path):
 
 
 def test_peakcut_sync_never_freezes_on_active_job():
-    import peakcut_bridge as pb
+    from engine.studio import peakcut_bridge as pb
 
     jid = "active_sync_test_job"
     app_module.jobs[jid] = {
@@ -274,7 +274,7 @@ def test_peakcut_sync_never_freezes_on_active_job():
 
 def test_peakcut_failed_job_never_vanishes_and_can_retry():
     import shutil
-    import peakcut_bridge as pb
+    from engine.studio import peakcut_bridge as pb
 
     jid = None
     try:
@@ -319,7 +319,7 @@ def test_peakcut_failed_job_never_vanishes_and_can_retry():
 
 
 def test_peakcut_preview_uses_oembed_even_when_ytdlp_fails(monkeypatch):
-    import peakcut_bridge as pb
+    from engine.studio import peakcut_bridge as pb
 
     monkeypatch.setattr(
         pb,

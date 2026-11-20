@@ -33,13 +33,13 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, Response, Upl
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from live_clipper import LiveClipperManager
-import api_key_rotator
-from alerts_dispatcher import AlertDispatcher
-from creator_workspaces import CreatorWorkspaceManager
-from profile_fetcher import check_live_cached, fetch_channel_profile
-from publishing_queue import get_publishing_queue
-from system_telemetry import SystemTelemetry
+from engine.discovery.live_clipper import LiveClipperManager
+from engine.services import api_key_rotator
+from engine.services.alerts_dispatcher import AlertDispatcher
+from engine.services.creator_workspaces import CreatorWorkspaceManager
+from engine.services.profile_fetcher import check_live_cached, fetch_channel_profile
+from engine.services.publishing_queue import get_publishing_queue
+from engine.services.system_telemetry import SystemTelemetry
 
 logger = logging.getLogger("openshorts.peakcut_bridge")
 
@@ -579,7 +579,7 @@ async def serve_media(jid: str, name: str):
 
 def _get_ai_status_info() -> Dict[str, Any]:
     """Detect active AI backend and verify real Ollama/model readiness when in local mode."""
-    import llm_backend
+    from engine.intelligence import llm_backend
     is_local = (
         llm_backend.active()
         or llm_backend.is_colab()
@@ -766,7 +766,7 @@ def _build_accounts_public() -> List[Dict[str, Any]]:
     """Return connected publishing accounts with platform labels and live auth status."""
     yt_detail = "OAuth connected"
     try:
-        from youtube_uploader import is_youtube_auth_configured
+        from engine.services.youtube_uploader import is_youtube_auth_configured
         if not is_youtube_auth_configured():
             yt_detail = "Ready (dry-run until YouTube OAuth keys are added in Settings)"
     except Exception:
@@ -1317,7 +1317,7 @@ async def preview_video_endpoint(url: str):
     u = url.strip()
     if not u:
         raise HTTPException(status_code=400, detail="Missing video URL.")
-    from security_utils import normalize_media_url
+    from engine.utils.security_utils import normalize_media_url
     u = normalize_media_url(u)
 
     if _is_youtube_homepage_or_invalid(u):
@@ -1617,7 +1617,7 @@ async def create_job_endpoint(req: Request):
     raw_url = str(body.get("url") or "").strip()
     if not raw_url:
         raise HTTPException(status_code=400, detail="Missing video URL.")
-    from security_utils import normalize_media_url
+    from engine.utils.security_utils import normalize_media_url
     url = normalize_media_url(raw_url)
     if not url:
         raise HTTPException(status_code=400, detail="Missing or invalid video URL.")
@@ -2226,7 +2226,7 @@ async def update_connected_apps(req: Request):
         if rtoken:
             os.environ["YOUTUBE_REFRESH_TOKEN"] = rtoken
         try:
-            from youtube_uploader import invalidate_cached_token
+            from engine.services.youtube_uploader import invalidate_cached_token
             invalidate_cached_token()
         except Exception:
             pass
@@ -2340,7 +2340,7 @@ async def add_post_to_queue(req: Request):
     _bump_version()
     yt_ready = False
     try:
-        from youtube_uploader import is_youtube_auth_configured
+        from engine.services.youtube_uploader import is_youtube_auth_configured
         yt_ready = is_youtube_auth_configured()
     except Exception:
         pass
@@ -2419,7 +2419,7 @@ async def save_settings_endpoint(req: Request):
 async def get_ai_settings():
     """AI settings contract expected by PeakCut Settings -> AI tab."""
     ai_info = _get_ai_status_info()
-    import llm_backend
+    from engine.intelligence import llm_backend
     active_model = ai_info["model"]
     if ai_info["provider"] == "ollama":
         models = list(dict.fromkeys([active_model, "gemma2:2b", "gemma2:9b", "llama3.2"]))
@@ -2696,7 +2696,7 @@ async def complete_tour():
 
 @router.post("/api/smartcut")
 async def apply_smartcut_endpoint(req: Request):
-    from smartcut import apply_smartcut
+    from engine.editing.smartcut import apply_smartcut
     data = await req.json()
     input_path = data["input_path"]
     output_path = data.get("output_path") or str(Path(input_path).with_stem(Path(input_path).stem + "_tight"))
@@ -2706,7 +2706,7 @@ async def apply_smartcut_endpoint(req: Request):
 
 @router.post("/api/colorgrade")
 async def apply_colorgrade_endpoint(req: Request):
-    from color_grade import apply_color_grade
+    from engine.editing.color_grade import apply_color_grade
     data = await req.json()
     input_path = data["input_path"]
     output_path = data.get("output_path") or str(Path(input_path).with_stem(Path(input_path).stem + "_graded"))
@@ -2717,7 +2717,7 @@ async def apply_colorgrade_endpoint(req: Request):
 
 @router.post("/api/branding")
 async def apply_branding_endpoint(req: Request):
-    from branding_overlay import apply_branding_overlay
+    from engine.editing.branding_overlay import apply_branding_overlay
     data = await req.json()
     input_video = data["input_video"]
     logo_image = data["logo_image"]
@@ -2730,7 +2730,7 @@ async def apply_branding_endpoint(req: Request):
 
 @router.post("/api/topics")
 async def segment_topics_endpoint(req: Request):
-    from topic_segmenter import segment_transcript_topics
+    from engine.intelligence.topic_segmenter import segment_transcript_topics
     data = await req.json()
     words = data.get("words", [])
     topics = segment_transcript_topics(words)
@@ -2739,7 +2739,7 @@ async def segment_topics_endpoint(req: Request):
 
 @router.post("/api/viral-score")
 async def evaluate_viral_score_endpoint(req: Request):
-    from viral_brain import evaluate_viral_clip
+    from engine.intelligence.viral_brain import evaluate_viral_clip
     data = await req.json()
     transcript = data.get("transcript", "")
     res = evaluate_viral_clip(transcript)

@@ -1,8 +1,9 @@
 import sys
 import types
 
-import layout_picker
-from layout_picker import _module_flags, apply, pick
+from engine.layouts import layout_picker
+from engine import layouts
+from engine.layouts.layout_picker import _module_flags, apply, pick
 
 
 def fake_modules(monkeypatch, **initial):
@@ -11,7 +12,7 @@ def fake_modules(monkeypatch, **initial):
     for name in ("split_layout", "screencast_layout", "active_speaker"):
         module = types.ModuleType(name)
         module.ENABLED = initial.get(name, False)
-        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setattr(layouts, name, module, raising=False)
         made[name] = module
     return made
 

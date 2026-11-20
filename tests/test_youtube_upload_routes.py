@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
 import app as app_module
-from youtube_uploader import (
+from engine.services.youtube_uploader import (
     is_youtube_auth_configured,
     get_youtube_readiness_status,
 )
@@ -104,7 +104,7 @@ def test_social_post_youtube_direct_fallback_with_custom_privacy(client, monkeyp
         "title": "Clip Title #Shorts",
     }
 
-    with patch("youtube_uploader.upload_youtube_short", return_value=mock_upload_res) as mock_upload:
+    with patch("engine.services.youtube_uploader.upload_youtube_short", return_value=mock_upload_res) as mock_upload:
         payload = {
             "job_id": "mock_job_2",
             "clip_index": 0,
@@ -186,7 +186,7 @@ def test_direct_youtube_upload_endpoint(client, monkeypatch, tmp_path):
         "privacy": "private",
     }
 
-    with patch("youtube_uploader.upload_youtube_short", return_value=mock_res) as mock_upload:
+    with patch("engine.services.youtube_uploader.upload_youtube_short", return_value=mock_res) as mock_upload:
         payload = {
             "video_path": str(dummy_video),
             "title": "Standalone Short",
@@ -267,7 +267,7 @@ def test_config_endpoint_upload_post_state(client, monkeypatch):
 
 
 def test_upload_youtube_short_publish_at(tmp_path, monkeypatch):
-    from youtube_uploader import upload_youtube_short
+    from engine.services.youtube_uploader import upload_youtube_short
 
     test_video = tmp_path / "clip.mp4"
     test_video.write_bytes(b"dummy_mp4_bytes")
@@ -299,7 +299,8 @@ def test_upload_youtube_short_publish_at(tmp_path, monkeypatch):
         video_path=test_video,
         title="Scheduled Viral Clip",
         publish_at="2026-11-19T10:00:00Z",
-        access_token="fake_token"
+        access_token="fake_token",
+        dry_run=False,
     )
 
     assert result["id"] == "vid_sched_123"
@@ -352,7 +353,7 @@ def test_youtube_upload_negative_clip_index_rejected(client):
 
 
 def test_publishing_queue_privacy_defaults_and_remote_keys(tmp_path):
-    from publishing_queue import PublishingQueue, QueueWorker
+    from engine.services.publishing_queue import PublishingQueue, QueueWorker
 
     q_file = tmp_path / "queue_priv.json"
     queue = PublishingQueue(queue_file=q_file)

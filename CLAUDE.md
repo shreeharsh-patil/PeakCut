@@ -50,11 +50,11 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 |------|---------|
 | `main.py` | Core video processing: transcription, scene detection, clip extraction, vertical reframing |
 | `app.py` | FastAPI server with async job queue and REST endpoints |
-| `editor.py` | Gemini AI integration for dynamic video effects (FFmpeg filter generation) |
-| `hooks.py` | Hook text overlay generation with font rendering |
-| `s3_uploader.py` | AWS S3 upload with caching |
-| `subtitles.py` | SRT generation, FFmpeg subtitle burning, and dubbed video transcription |
-| `translate.py` | ElevenLabs dubbing API for AI voice translation |
+| `engine/editing/editor.py` | Gemini AI integration for dynamic video effects (FFmpeg filter generation) |
+| `engine/editing/hooks.py` | Hook text overlay generation with font rendering |
+| `engine/services/s3_uploader.py` | AWS S3 upload with caching |
+| `engine/editing/subtitles.py` | SRT generation, FFmpeg subtitle burning, and dubbed video transcription |
+| `engine/intelligence/translate.py` | ElevenLabs dubbing API for AI voice translation |
 | `dashboard/src/App.jsx` | Main React component with state management |
 | `dashboard/src/components/TranslateModal.jsx` | Voice dubbing UI with language selection |
 | `dashboard/vite-plugin-seo.js` | Build-time SEO surface: injects crawler-visible homepage content, emits static pages, sitemap.xml and llms.txt |
@@ -95,7 +95,7 @@ despliegue, que desde el 25-ago-2026 es `AUTO_LAYOUT=1`. El dashboard lo expone
 en opciones avanzadas ("vertical layout": auto / split / screencast / none,
 `MediaInput.jsx`, recordado en `localStorage.os_layout`).
 
-`auto` activa `layout_picker.py`: **una** llamada a Gemini por vídeo de origen
+`auto` activa `engine/layouts/layout_picker.py`: **una** llamada a Gemini por vídeo de origen
 (no por clip) que elige entre `none` / `screencast` / `split`. Medido sobre el
 corpus de 48 contra etiquetas revisadas a mano: 94% / 92% / 96% en tres pasadas,
 con 0-1 falsos positivos sobre los 28 clips que no deben tocarse, y solo 2 clips
@@ -120,7 +120,7 @@ Gemini era de las medidas continuas, no del modelo.
 `layout_picker.apply()` sólo **añade**: una elección explícita del usuario nunca
 se desactiva porque el modelo diga `none`.
 
-### Hook grounding for on-screen clips (`hook_grounding.py`)
+### Hook grounding for on-screen clips (`engine/editing/hook_grounding.py`)
 
 The hook and title come from the detail pass, which only reads the
 transcript, so on a clip whose meaning is on the screen (a settings dialog,
@@ -137,7 +137,7 @@ LLM it logs one line and keeps the transcript hook. `HOOK_GROUNDING=0`
 disables it. The detail prompt itself now carries the rule "about this
 moment, not the video", which is the cheap half of the same fix.
 
-### Local LLM for the moment picker (`llm_backend.py`)
+### Local LLM for the moment picker (`engine/intelligence/llm_backend.py`)
 
 `LLM_BASE_URL` (+ `LLM_MODEL`, `LLM_API_KEY`) routes the two transcript
 passes of `get_viral_clips` to any OpenAI-compatible `/chat/completions`
@@ -150,7 +150,7 @@ not to demand one. Frame-based stages (`layout_picker`, `screencast_layout`,
 `get_visual_clips`) stay on Gemini and degrade as they always did without a
 key. Never wired in cloud mode: `BILLING_ENABLED` ignores it.
 
-### Thumbnail Studio (`thumbnail.py`, `/api/thumbnail/*`)
+### Thumbnail Studio (`engine/editing/thumbnail.py`, `/api/thumbnail/*`)
 
 Titles come from the transcript plus 10 frames at 1024px, never the whole
 video (same reasoning as the layout picker: an hour of video is ~1M tokens for
@@ -193,7 +193,7 @@ portrait clip cannot reproduce the shrink either.
 
 - **TRACK Mode** (single subject): MediaPipe face detection + YOLOv8 fallback with "Heavy Tripod" stabilization
 - **GENERAL Mode** (groups/landscapes): Blurred background layout preserving full width
-- **SPLIT Mode** (two-shot conversation, `split_layout.py`): both speakers stacked
+- **SPLIT Mode** (two-shot conversation, `engine/layouts/split_layout.py`): both speakers stacked
   in half-frames. Off by default (`SPLIT_LAYOUT=1`); v2 engine only, so a
   fallback to the v1 loop silently renders GENERAL instead. It upgrades scenes
   the classifier already sent to GENERAL, never TRACK ones, and needs both faces
@@ -204,12 +204,12 @@ portrait clip cannot reproduce the shrink either.
   stretch sit on the seam between the halves (`{\an5}` per word event in
   `subtitles.generate_ass`), the one place they cover nobody; the render
   records which stretches are stacked in a `<clip>.layout.json` sidecar
-  (`layout_ranges.py`) and every metadata writer copies it into the clip's
+  (`engine/layouts/layout_ranges.py`) and every metadata writer copies it into the clip's
   `layout_ranges`, so `/api/subtitle` finds it after a restyle too. The fast
   rerender (cut without reframe) carries the canonical clip's ranges through
   the new cut (`layout_ranges.remap`, in `recut.perform_recut`). Only the
   ASS path can do this; SRT burns keep one alignment for the whole file.
-- **SCREENCAST / WIDE Modes** (`screencast_layout.py`, `SCREENCAST_LAYOUT=1`):
+- **SCREENCAST / WIDE Modes** (`engine/layouts/screencast_layout.py`, `SCREENCAST_LAYOUT=1`):
   for scenes whose meaning lives outside the centre. Gemini reports each range's
   **width_fraction**, and that is the gate — coverage was tried before and did
   not separate a spreadsheet from a corner ticker, while width does (a bug spans
@@ -218,7 +218,7 @@ portrait clip cannot reproduce the shrink either.
   content, so SCREENCAST stacks it over the presenter. Above 0.85 the presenter
   is composited **on top of** the content and stacking would show it twice, so
   those scenes get WIDE: the GENERAL layout with side-cropping disabled.
-- **INSET Mode** (`camera_inset.py`): pantalla a ancho completo arriba, el
+- **INSET Mode** (`engine/layouts/camera_inset.py`): pantalla a ancho completo arriba, el
   recuadro de la webcam ampliado abajo. Para el caso de una sola fuente con la
   cámara compuesta en una esquina (OBS, VOD de stream). Se encadena detrás de
   la decisión `screencast`, **no** se le pregunta a Gemini: ofrecido como cuarta
@@ -228,14 +228,14 @@ portrait clip cannot reproduce the shrink either.
   uno pagado con una iteración: sujeto **pequeño**, **descentrado en
   horizontal** (una cara de talking head está centrada aunque esté alta), y
   **quieto entre muestras** (3-11px frente a 316px de una persona real).
-- **ALTERNATE Mode** (`active_speaker.py`, `SPEAKER_SIGNAL=1` + `SPEAKER_CUT=1`):
+- **ALTERNATE Mode** (`engine/layouts/active_speaker.py`, `SPEAKER_SIGNAL=1` + `SPEAKER_CUT=1`):
   hard cuts to whoever is talking, rendered through the TRACK path as a
   trajectory with jumps. `SPEAKER_SIGNAL=1` alone just gates SPLIT on both people
   actually speaking. Mouth activity **must** be normalised per speaker before
   comparing (`normalise_activity`): raw frame-difference magnitude scales with
   local contrast and lighting, and on a real two-shot it handed one speaker
   90-100% of the scene.
-- **Punch-in** (`punch_in.py`, `PUNCH_IN=1`): not a layout. A ~12% push on the
+- **Punch-in** (`engine/layouts/punch_in.py`, `PUNCH_IN=1`): not a layout. A ~12% push on the
   clip's beats, riding the TRACK path by widening its per-frame crop command
   from x-only to w/h/x/y. Beats currently come from the audio envelope;
   `emphasis_times` is a plain list of seconds so the transcript's hook words can
@@ -268,7 +268,7 @@ portrait clip cannot reproduce the shrink either.
   entitlement, plan priority and job ownership apply to agents with zero
   endpoint changes. Key management itself refuses API-key auth: a leaked key
   cannot mint replacements.
-- **MCP server** (`mcp_server.py`, mounted always): stateless Streamable-HTTP
+- **MCP server** (`engine/studio/mcp_server.py`, mounted always): stateless Streamable-HTTP
   JSON-RPC at `/mcp` — no SDK dependency, ~3 methods + 8 tools. Each tool calls
   back into this same app in-process (`httpx.ASGITransport`) forwarding the
   caller's auth headers, so it can never drift from the REST behavior. Cloud

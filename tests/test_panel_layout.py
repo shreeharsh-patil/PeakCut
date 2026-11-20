@@ -1,5 +1,5 @@
-import panel_layout
-from panel_layout import (
+from engine.layouts import panel_layout
+from engine.layouts.panel_layout import (
     analyze_scene,
     panel_filtergraph,
     panel_geometry,
@@ -192,7 +192,7 @@ class TestNeighbourClamp:
         assert abs((w / h) - (tw / th)) < 0.05
 
     def test_gaps_measure_the_closest_neighbour(self):
-        from panel_layout import neighbour_gaps
+        from engine.layouts.panel_layout import neighbour_gaps
         gaps = neighbour_gaps([(100, 0, 0, 0), (400, 0, 0, 0), (1500, 0, 0, 0)])
         assert gaps == [300, 300, 1100]
 

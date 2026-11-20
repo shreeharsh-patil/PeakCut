@@ -16,7 +16,8 @@ import json
 import pytest
 import httpx
 import app as app_module
-import api_key_rotator
+from engine.services import api_key_rotator
+from engine.studio import peakcut_bridge
 
 
 def _async_client():
@@ -101,6 +102,45 @@ def test_ui_chunked_and_direct_uploads():
             r_canc = await client.delete(f"/api/upload/{upid}")
             assert r_canc.status_code == 200
             assert r_canc.json()["ok"] is True
+
+    asyncio.run(_test())
+
+
+def test_chunked_upload_waits_for_every_complete_part(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    pending = output / "uploads"
+    starts = []
+    monkeypatch.setattr(peakcut_bridge, "OUTPUT_DIR", output)
+    monkeypatch.setattr(peakcut_bridge, "_UPLOAD_ROOT", pending)
+    monkeypatch.setattr(peakcut_bridge, "_UPLOAD_PART_BYTES", 4)
+    monkeypatch.setattr(peakcut_bridge, "_get_start_job_fn", lambda: lambda **kw: starts.append(kw))
+
+    async def _test():
+        async with _async_client() as client:
+            invalid = await client.post("/api/upload/start", json={"size": -1})
+            assert invalid.status_code == 400
+            inverted = await client.post("/api/upload/start", json={
+                "size": 7, "options": {"min_len": 60, "max_len": 15},
+            })
+            assert inverted.status_code == 400
+
+            started = await client.post("/api/upload/start", json={"name": "sample.mp4", "size": 7})
+            assert started.status_code == 200
+            path = f"/api/upload/{started.json()['id']}"
+            assert (await client.post(f"{path}/finish")).status_code == 409
+            assert (await client.put(f"{path}/2", content=b"X")).status_code == 400
+            assert (await client.put(f"{path}/0", content=b"ABC")).status_code == 400
+            assert (await client.put(f"{path}/0", content=b"ABCDE")).status_code == 413
+            assert not starts
+
+            assert (await client.put(f"{path}/1", content=b"EFG")).status_code == 200
+            assert (await client.put(f"{path}/0", content=b"ABCD")).status_code == 200
+            assert (await client.put(f"{path}/0", content=b"X")).status_code == 400
+            finished = await client.post(f"{path}/finish")
+            assert finished.status_code == 200
+            assert len(starts) == 1
+            assert (output / finished.json()["id"] / "source_sample.mp4").read_bytes() == b"ABCDEFG"
+            assert (await client.post(f"{path}/finish")).status_code == 404
 
     asyncio.run(_test())
 
