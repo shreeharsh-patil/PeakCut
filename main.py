@@ -11,6 +11,7 @@ try:
 except Exception:
     pass
 
+import math
 import time
 import cv2
 import subprocess
@@ -71,10 +72,11 @@ import hook_grounding
 import layout_picker
 import llm_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
-                            clip_duration_bounds, snap_clip_to_words,
-                            trim_to_best)
+                            clip_duration_bounds, deduplicate_overlapping_clips,
+                            snap_clip_to_words, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
-                          QUALITY_FAST, METADATA_SCRUB)
+                          QUALITY_FAST, METADATA_SCRUB, probe_media,
+                          run_ffmpeg_with_fallback, validate_media_output)
 from dotenv import load_dotenv
 import json
 
@@ -126,13 +128,20 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once (Keep for backup or scene analysis if needed)
+# Lazy-loaded YOLO model (avoids network downloads & multi-second startup cost on import)
 model = None
-if YOLO is not None:
+_yolo_load_attempted = False
+
+
+def _get_yolo_model():
+    global model, _yolo_load_attempted
+    if model is not None or _yolo_load_attempted or YOLO is None:
+        return model
+    _yolo_load_attempted = True
     try:
         yolo_path = os.environ.get("YOLO_MODEL_PATH")
         if not yolo_path:
-            for cand in ["models/yolov8n.pt", "assets/yolov8n.pt", "yolov8n.pt"]:
+            for cand in ("models/yolov8n.pt", "assets/yolov8n.pt", "yolov8n.pt"):
                 if os.path.exists(cand):
                     yolo_path = cand
                     break
@@ -141,6 +150,7 @@ if YOLO is not None:
         model = YOLO(yolo_path)
     except Exception as e:
         print(f"⚠️ YOLO model init notice: {e}")
+    return model
 
 # --- MediaPipe Setup ---
 mp_face_detection = None
@@ -286,19 +296,12 @@ class SmoothedCameraman:
             # SIMPLIFIED LOGIC:
             # 1. Is the target outside the safe zone?
             if abs(diff) > self.safe_zone_radius:
-                # 2. If yes, move towards it slowly (Linear Speed)
-                # Determine direction
+                # 2. Move smoothly with proportional damping (no abrupt speed jumps)
                 direction = 1 if diff > 0 else -1
-                
-                # Speed: 2 pixels per frame (Slow pan)
-                # If the distance is HUGE (scene change or fast movement), speed up slightly
-                if abs(diff) > self.crop_width * 0.5:
-                    speed = 15.0 # Fast re-frame
-                else:
-                    speed = 3.0  # Slow, steady pan
-                
+                excess = abs(diff) - self.safe_zone_radius
+                speed = max(2.0, min(18.0, 2.0 + excess * 0.08))
                 self.current_center_x += direction * speed
-                
+
                 # Check if we overshot (prevent oscillation)
                 new_diff = self.target_center_x - self.current_center_x
                 if (direction == 1 and new_diff < 0) or (direction == -1 and new_diff > 0):
@@ -366,33 +369,44 @@ class SpeakerTracker:
         """
         current_candidates = []
         
-        # 1. Match faces to known IDs (simple distance tracking)
-        for face in face_candidates:
+        # 1. Match faces to known IDs (1-to-1 per frame so two faces never share an ID)
+        safe_width = max(float(width or 0), 1.0)
+        matched_ids_this_frame = set()
+        ordered_faces = sorted(
+            [f for f in (face_candidates or []) if f.get('box') and f['box'][2] > 0 and f['box'][3] > 0],
+            key=lambda f: float(f.get('score', 0) or 0),
+            reverse=True,
+        )
+        for face in ordered_faces:
             x, y, w, h = face['box']
             center_x = x + w / 2
-            
+
             best_match_id = -1
-            min_dist = width * 0.15 # Reduced matching radius to avoid jumping in groups
-            
-            # Try to match with known faces seen recently
+            min_dist = safe_width * 0.15  # Reduced matching radius to avoid jumping in groups
+
+            # Try to match with known faces seen recently (not yet claimed this frame)
             for kf in self.known_faces:
-                if frame_number - kf['last_frame'] > 30: # Forgot faces older than 1s (was 2s)
+                if kf['id'] in matched_ids_this_frame:
                     continue
-                    
+                if frame_number - kf['last_frame'] > 30:  # Forget faces older than 1s
+                    continue
+
                 dist = abs(center_x - kf['center'])
                 if dist < min_dist:
                     min_dist = dist
                     best_match_id = kf['id']
-            
+
             # If no match, assign new ID
             if best_match_id == -1:
                 best_match_id = self.next_id
                 self.next_id += 1
-            
+
+            matched_ids_this_frame.add(best_match_id)
+
             # Update known face
             self.known_faces = [kf for kf in self.known_faces if kf['id'] != best_match_id]
             self.known_faces.append({'id': best_match_id, 'center': center_x, 'last_frame': frame_number})
-            
+
             current_candidates.append({
                 'id': best_match_id,
                 'box': face['box'],
@@ -401,7 +415,7 @@ class SpeakerTracker:
 
         # 2. Update Scores with decay
         for pid in list(self.speaker_scores.keys()):
-             self.speaker_scores[pid] *= 0.85 # Faster decay (was 0.9)
+             self.speaker_scores[pid] *= 0.85  # Faster decay (was 0.9)
              if self.speaker_scores[pid] < 0.1:
                  del self.speaker_scores[pid]
 
@@ -409,7 +423,7 @@ class SpeakerTracker:
         for cand in current_candidates:
             pid = cand['id']
             # Score is purely based on size (proximity) now that we don't have mouth
-            raw_score = cand['score'] / (width * width * 0.05)
+            raw_score = cand['score'] / (safe_width * safe_width * 0.05)
             self.speaker_scores[pid] = self.speaker_scores.get(pid, 0) + raw_score
 
         # 3. Determine Best Speaker
@@ -500,12 +514,9 @@ def detect_face_candidates(frame):
     MediaPipe's relative coords make the mapping exact).
     """
     if face_detection is None:
-        height, width, _ = frame.shape
-        w = int(width * 0.4)
-        h = int(height * 0.5)
-        x = (width - w) // 2
-        y = int(height * 0.15)
-        return [{'box': [x, y, w, h], 'score': w * h}]
+        # Return empty list so callers fall back honestly to YOLO person
+        # detection or GENERAL framing rather than hallucinating a center face.
+        return []
 
     height, width, _ = frame.shape
     small, _scale = _detection_frame(frame)
@@ -520,14 +531,16 @@ def detect_face_candidates(frame):
         
     for detection in results.detections:
         bboxC = detection.location_data.relative_bounding_box
-        x = int(bboxC.xmin * width)
-        y = int(bboxC.ymin * height)
-        w = int(bboxC.width * width)
-        h = int(bboxC.height * height)
-        
+        x = max(0, int(bboxC.xmin * width))
+        y = max(0, int(bboxC.ymin * height))
+        w = min(width - x, int(bboxC.width * width))
+        h = min(height - y, int(bboxC.height * height))
+        if w <= 0 or h <= 0:
+            continue
+
         candidates.append({
             'box': [x, y, w, h],
-            'score': w * h # Area as score
+            'score': w * h  # Area as score
         })
             
     return candidates
@@ -538,12 +551,14 @@ def detect_person_yolo(frame):
     Returns [x, y, w, h] of the person's 'upper body' approximation, in
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
-    if model is None:
+    with DETECT_LOCK:
+        yolo_model = _get_yolo_model()
+    if yolo_model is None:
         return None
     small, scale = _detection_frame(frame)
     # Use the globally loaded model
     with DETECT_LOCK:
-        results = model(small, verbose=False, classes=[0]) # class 0 is person
+        results = yolo_model(small, verbose=False, classes=[0])  # class 0 is person
 
     if not results:
         return None
@@ -642,7 +657,8 @@ def analyze_scenes_strategy(video_path, scenes):
     if not cap.isOpened():
         return ['TRACK'] * len(scenes)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    raw_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = float(raw_fps) if (raw_fps and math.isfinite(raw_fps) and 0.1 <= raw_fps <= 240.0) else 30.0
 
     for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
         s_f, e_f = start.get_frames(), end.get_frames()
@@ -820,13 +836,75 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True):
     return plan
 
 
+class YouTubeDownloadError(RuntimeError):
+    """Deterministic YouTube / media ingestion error with a machine-readable reason code."""
+
+    def __init__(self, message: str, reason_code: str = "download_failed"):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def _classify_youtube_error(exc: Exception) -> tuple[str, bool]:
+    """Return ``(reason_code, is_permanently_non_retryable)`` for a yt-dlp/download error.
+
+    Note: plain "video unavailable" is NOT marked permanently fatal because
+    YouTube frequently returns a fake "Video unavailable" to datacenter-ISP IPs
+    on the default web client while fallback clients or proxies succeed.
+    """
+    msg = str(exc or "").lower()
+    if "is upcoming" in msg or "premieres in" in msg or "live event will begin" in msg:
+        return "upcoming_live", True
+    if "private video" in msg:
+        return "private_video", True
+    if "members-only" in msg or "join this channel" in msg:
+        return "members_only", True
+    if "copyright" in msg or "removed by the uploader" in msg or "account associated with this video has been terminated" in msg:
+        return "removed_or_copyright", True
+    if "sign in to confirm your age" in msg or "age-restricted" in msg or "confirm your age" in msg:
+        return "age_restricted", False  # may still succeed with cookies/fallback client
+    if "not available in your country" in msg or "geo-restricted" in msg or "uploader has not made this video available in your country" in msg:
+        return "geo_restricted", False  # proxy in another region may succeed
+    if "is not a valid url" in msg or "unsupported url" in msg or "empty url" in msg:
+        return "invalid_url", True
+    if any(k in msg for k in ("429", "too many requests", "rate limit")):
+        return "rate_limited", False
+    if any(k in msg for k in ("timeout", "timed out", "connection reset", "503", "403", "forbidden", "remotedisconnected", "broken pipe", "connection refused")):
+        return "transient_network", False
+    if "video unavailable" in msg:
+        return "unavailable", False
+    return "download_failed", False
+
+
+def _cleanup_partial_downloads(output_dir: str, stem: Optional[str]) -> None:
+    """Remove leftover .part/.ytdl/temp fragments for a failed download attempt."""
+    if not stem or not os.path.isdir(output_dir):
+        return
+    try:
+        for name in os.listdir(output_dir):
+            if name.startswith(stem) and (
+                name.endswith(".part")
+                or name.endswith(".ytdl")
+                or ".part-Frag" in name
+            ):
+                try:
+                    os.remove(os.path.join(output_dir, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def download_youtube_video(url, output_dir="."):
     """
-    Downloads a YouTube video using yt-dlp.
+    Downloads a YouTube video using yt-dlp with bounded retries, progress
+    reporting, deterministic error classification, resumable downloads, and
+    post-download media validation.
     Returns the path to the downloaded video and the video title.
     """
     from security_utils import assert_public_url, normalize_media_url
     url = normalize_media_url(url)
+    if not url:
+        raise YouTubeDownloadError("Empty or invalid media URL.", reason_code="invalid_url")
     assert_public_url(url)
     # Throwaway hosts agents fall back to (tmpfiles.org) hand out short-lived
     # signed links; refresh through the host's page so yt-dlp gets the file.
@@ -838,12 +916,13 @@ def download_youtube_video(url, output_dir="."):
     step_start_time = time.time()
 
     import tempfile as _tempfile
-    cookies_path = os.path.join(_tempfile.gettempdir(), 'peakcut_cookies.txt')
+    cookies_path = None
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating temporary cookies file...")
+        print("🍪 Found YOUTUBE_COOKIES env var, creating isolated temporary cookies file...")
         try:
-            with open(cookies_path, 'w', encoding="utf-8") as f:
+            fd, cookies_path = _tempfile.mkstemp(prefix="peakcut_cookies_", suffix=".txt")
+            with os.fdopen(fd, 'w', encoding="utf-8") as f:
                 f.write(cookies_env)
             if os.path.exists(cookies_path):
                  # Never print file CONTENT here: with a headerless cookies
@@ -853,9 +932,20 @@ def download_youtube_video(url, output_dir="."):
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
     else:
-        cookies_path = None
         print("⚠️ YOUTUBE_COOKIES env var not found.")
-    
+
+    try:
+        return _download_youtube_video_impl(url, output_dir, cookies_path, step_start_time)
+    finally:
+        if cookies_path and os.path.exists(cookies_path):
+            try:
+                os.remove(cookies_path)
+            except OSError:
+                pass
+
+
+def _download_youtube_video_impl(url, output_dir, cookies_path, step_start_time):
+    os.makedirs(output_dir, exist_ok=True)
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
     _proxy = os.environ.get("PROXY_URL", "").strip() or None
@@ -918,9 +1008,10 @@ def download_youtube_video(url, output_dir="."):
 
     def _base_opts(extractor_args, proxy):
         opts = {
-            'quiet': False, 'verbose': True, 'no_warnings': False,
+            'quiet': False, 'verbose': False, 'no_warnings': False,
             'cookiefile': cookies_path if cookies_path else None,
-            'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
+            'proxy': proxy, 'socket_timeout': 30, 'retries': 5, 'fragment_retries': 5,
+            'continuedl': True, 'noplaylist': True,
             'nocheckcertificate': True, 'cachedir': False,
             'http_headers': {
                 'User-Agent': (
@@ -935,32 +1026,48 @@ def download_youtube_video(url, output_dir="."):
 
     # Wire bytes actually pulled through the (paid) proxy, summed across
     # fragments/streams. Reported to app.py via the PROXY_BYTES= line below.
-    _dl_bytes = {"total": 0, "partial": 0}
+    _dl_bytes = {"total": 0, "partial": 0, "next_pct": 25}
 
     def _progress_hook(d):
         if d.get('status') == 'downloading':
             # Bytes of a fragment still in flight: a failed attempt has
             # already paid for these even though 'finished' never fires.
-            _dl_bytes["partial"] = int(d.get('downloaded_bytes') or 0)
+            dl = int(d.get('downloaded_bytes') or 0)
+            _dl_bytes["partial"] = dl
+            tot = int(d.get('total_bytes') or d.get('total_bytes_estimate') or 0)
+            if tot > 0:
+                pct = min(100, int(dl * 100 / tot))
+                while pct >= _dl_bytes["next_pct"] and _dl_bytes["next_pct"] <= 100:
+                    print(f"📥 Downloading… {_dl_bytes['next_pct']}%", flush=True)
+                    _dl_bytes["next_pct"] += 25
         elif d.get('status') == 'finished':
             _dl_bytes["partial"] = 0
             _dl_bytes["total"] += int(d.get('total_bytes')
                                       or d.get('total_bytes_estimate')
                                       or d.get('downloaded_bytes') or 0)
 
+    last_stem = {"name": None}
+
     def _attempt(extractor_args, fmt, proxy):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
+        _dl_bytes["next_pct"] = 25
         info_opts = {**_base_opts(extractor_args, proxy), 'format': fmt}
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-        sanitized = sanitize_filename(info.get('title', 'youtube_video'))
+        if not info:
+            raise YouTubeDownloadError("yt-dlp returned empty metadata for URL.", reason_code="unavailable")
+        sanitized = sanitize_filename(info.get('title') or info.get('id') or 'youtube_video') or 'youtube_video'
+        last_stem["name"] = sanitized
         expected = os.path.join(output_dir, f'{sanitized}.mp4')
         if os.path.exists(expected):
             os.remove(expected)
 
         if info.get('live_status') == 'is_upcoming':
-            raise ValueError(f"YouTube Live stream '{info.get('title')}' is upcoming and has not started yet.")
+            raise YouTubeDownloadError(
+                f"YouTube Live stream '{info.get('title')}' is upcoming and has not started yet.",
+                reason_code="upcoming_live",
+            )
 
         is_live = bool(info.get('is_live') or info.get('live_status') == 'is_live')
         if is_live:
@@ -1009,7 +1116,10 @@ def download_youtube_video(url, output_dir="."):
                     "-movflags", "+faststart",
                     expected
                 ])
-                res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                res = subprocess.run(
+                    ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    timeout=max(600, live_sec + 300),
+                )
                 if res.returncode == 0 and os.path.exists(expected) and os.path.getsize(expected) > 1000:
                     print(f"✅ Live stream segment captured: {expected} ({os.path.getsize(expected)/(1024*1024):.1f} MB)")
                     return sanitized
@@ -1053,21 +1163,29 @@ def download_youtube_video(url, output_dir="."):
             reqs = info.get("requested_formats") or ([info] if info.get("url") else [])
             stream_items = [rf for rf in reqs if isinstance(rf, dict) and rf.get("url")]
             if stream_items:
-                ff_cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-                for rf in stream_items:
-                    hdrs = rf.get("http_headers") or info.get("http_headers") or {}
-                    ua = hdrs.get("User-Agent")
-                    if ua:
-                        ff_cmd.extend(["-user_agent", ua])
-                    ff_cmd.extend(["-ss", str(slice_start), "-t", str(slice_dur), "-i", rf["url"]])
-                if len(stream_items) >= 2:
-                    ff_cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
-                ff_cmd.extend(["-c", "copy", "-movflags", "+faststart", expected])
-                res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if res.returncode == 0 and os.path.exists(expected) and os.path.getsize(expected) > 50000:
-                    mb = os.path.getsize(expected) / (1024 * 1024)
-                    print(f"✅ Smart VOD slice captured: {os.path.basename(expected)} ({mb:.1f} MB)")
-                    return sanitized
+                for audio_codec_args in (["-c", "copy"], ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]):
+                    ff_cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+                    for rf in stream_items:
+                        hdrs = rf.get("http_headers") or info.get("http_headers") or {}
+                        ua = hdrs.get("User-Agent")
+                        if ua:
+                            ff_cmd.extend(["-user_agent", ua])
+                        ff_cmd.extend(["-ss", str(slice_start), "-t", str(slice_dur), "-i", rf["url"]])
+                    if len(stream_items) >= 2:
+                        ff_cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
+                    ff_cmd.extend([*audio_codec_args, "-movflags", "+faststart", expected])
+                    res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1200)
+                    if res.returncode == 0 and os.path.exists(expected) and os.path.getsize(expected) > 50000:
+                        probe = probe_media(expected)
+                        if probe.get("valid") and probe.get("has_video"):
+                            mb = os.path.getsize(expected) / (1024 * 1024)
+                            print(f"✅ Smart VOD slice captured: {os.path.basename(expected)} ({mb:.1f} MB)")
+                            return sanitized
+                    if os.path.exists(expected):
+                        try:
+                            os.remove(expected)
+                        except OSError:
+                            pass
                 err = res.stderr.decode("utf-8", errors="ignore") if res.stderr else "unknown error"
                 raise RuntimeError(f"FFmpeg slice download failed ({err[:180]})")
 
@@ -1075,7 +1193,7 @@ def download_youtube_video(url, output_dir="."):
             **_base_opts(extractor_args, proxy),
             'format': fmt,
             'outtmpl': os.path.join(output_dir, f'{sanitized}.%(ext)s'),
-            'merge_output_format': 'mp4', 'overwrites': True,
+            'merge_output_format': 'mp4', 'overwrites': False,
             'progress_hooks': [_progress_hook],
         }
         if is_live:
@@ -1109,11 +1227,13 @@ def download_youtube_video(url, output_dir="."):
 
     sanitized_title = None
     last_err = None
+    last_reason = "download_failed"
     used_proxy = False
     # Every attempt, with its bytes and failure text: printed as PROXY_ROUTE=
     # below so app.py can keep a durable trail of WHY a job reached the paid
     # proxy (the container log rotates within the hour; see cloud/proxy_ledger).
     attempt_log = []
+    fatal_stop = False
     for label, ea, fmt, proxy in attempts:
         # A 403 on the media fetch is usually transient: the googlevideo URL is
         # bound to the IP that extracted it, and the residential proxy rotates
@@ -1134,29 +1254,31 @@ def download_youtube_video(url, output_dir="."):
                 break
             except Exception as e:
                 last_err = e
+                reason_code, permanently_fatal = _classify_youtube_error(e)
+                last_reason = reason_code
                 attempt_log.append({"label": label, "ok": False,
                                     "bytes": _dl_bytes["total"] + _dl_bytes["partial"],
                                     "paid": proxy is not None and proxy == _proxy,
+                                    "reason": reason_code,
                                     "error": str(e)[:300]})
-                print(f"⚠️  Download attempt '{label}' failed: {str(e)[:200]}")
-                err_str = str(e).lower()
-                retryable = any(k in err_str for k in [
-                    '403', 'forbidden', 'timeout', 'timed out', 'connection reset',
-                    '503', '429', 'remotedisconnected', 'broken pipe', 'connection refused'
-                ])
+                print(f"⚠️  Download attempt '{label}' failed [{reason_code}]: {str(e)[:200]}")
+                if permanently_fatal:
+                    fatal_stop = True
+                    break
+                retryable = reason_code in ("transient_network", "rate_limited")
                 if not retryable or retry == 1:
                     break
-                time.sleep(3)
-        if sanitized_title is not None:
+                time.sleep(3 * (retry + 1))
+        if sanitized_title is not None or fatal_stop:
             break
 
     if sanitized_title is None:
-        import sys
+        _cleanup_partial_downloads(output_dir, last_stem["name"])
         error_msg = f"""
 ❌ ================================================================= ❌
-❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED (all strategies)
+❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED [{last_reason}]
 ❌ ================================================================= ❌
-REASON: YouTube blocked the request or the download tooling is out of date.
+REASON: YouTube blocked the request or the video is unavailable ({last_reason}).
 👇 SOLUTION FOR USER: download the video manually and use the 'Upload Video' tab.
 Technical Details: {str(last_err)}
 """
@@ -1164,7 +1286,9 @@ Technical Details: {str(last_err)}
         print(error_msg, file=sys.stderr)
         sys.stdout.flush(); sys.stderr.flush()
         time.sleep(0.5)
-        raise last_err
+        if isinstance(last_err, YouTubeDownloadError):
+            raise last_err
+        raise YouTubeDownloadError(str(last_err), reason_code=last_reason) from last_err
 
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if not os.path.exists(downloaded_file):
@@ -1177,16 +1301,41 @@ Technical Details: {str(last_err)}
                     else:
                         remuxed = os.path.join(output_dir, f'{sanitized_title}.mp4')
                         remux_cmd = ['ffmpeg', '-y', '-i', candidate, '-c', 'copy', '-movflags', '+faststart', remuxed]
-                        r = subprocess.run(remux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                        if r.returncode == 0 and os.path.exists(remuxed):
+                        r = subprocess.run(remux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+                        if r.returncode == 0 and os.path.exists(remuxed) and os.path.getsize(remuxed) > 0:
                             try:
                                 os.remove(candidate)
                             except OSError:
                                 pass
                             downloaded_file = remuxed
+                        else:
+                            # Fallback if stream copy fails (e.g. opus in mp4): re-encode audio to aac
+                            remux_aac = ['ffmpeg', '-y', '-i', candidate, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', remuxed]
+                            r2 = subprocess.run(remux_aac, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+                            if r2.returncode == 0 and os.path.exists(remuxed) and os.path.getsize(remuxed) > 0:
+                                try:
+                                    os.remove(candidate)
+                                except OSError:
+                                    pass
+                                downloaded_file = remuxed
                     break
             if os.path.exists(downloaded_file):
                 break
+
+    if not os.path.exists(downloaded_file) or os.path.getsize(downloaded_file) == 0:
+        _cleanup_partial_downloads(output_dir, sanitized_title)
+        raise YouTubeDownloadError(
+            f"Downloaded file missing or empty after yt-dlp completed: {downloaded_file}",
+            reason_code="invalid_media",
+        )
+
+    dl_probe = probe_media(downloaded_file)
+    if not dl_probe.get("valid") or not dl_probe.get("has_video"):
+        _cleanup_partial_downloads(output_dir, sanitized_title)
+        raise YouTubeDownloadError(
+            f"Downloaded media is corrupt or has no video stream: {dl_probe.get('error')}",
+            reason_code="invalid_media",
+        )
 
     # Paid bytes across EVERY attempt that used the per-GB proxy, failed ones
     # included: a paid attempt that died after three 10 MB fragments was
@@ -1201,7 +1350,10 @@ Technical Details: {str(last_err)}
         # Machine-parseable marker consumed by app.py's log reader for the
         # monthly proxy-bandwidth counter. Not shown to clients (log filter).
         print(f"PROXY_BYTES={paid_bytes}")
-    print(f"✅ Video downloaded in {time.time() - step_start_time:.2f}s: {downloaded_file}")
+    print(
+        f"✅ Video downloaded in {time.time() - step_start_time:.2f}s: "
+        f"{downloaded_file} ({dl_probe['width']}x{dl_probe['height']}, {dl_probe['duration']:.1f}s)"
+    )
     return downloaded_file, sanitized_title
 
 def finalize_clip_passthrough(input_video, final_output_video):
@@ -1626,21 +1778,26 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-i', input_video, '-vn', '-c:a', 'copy', audio_track_path],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         print("\n   ❌ Audio extraction failed (maybe no audio?). Proceeding without audio.")
 
     print("\n   ✨ Step 6: Merging...")
     mux = ['ffmpeg', '-y', '-i', silent_video_path]
-    if os.path.exists(audio_track_path):
+    if os.path.exists(audio_track_path) and os.path.getsize(audio_track_path) > 0:
         mux += ['-i', audio_track_path]
     mux += ['-c', 'copy', *METADATA_SCRUB, '-movflags', '+faststart', final_output_video]
     try:
-        subprocess.run(mux, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(mux, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+        ok, _info, reason = validate_media_output(final_output_video, require_video=True)
+        if not ok:
+            print(f"\n   ❌ V1 merged clip failed validation: {reason}")
+            return False
         print(f"   ✅ Clip saved to {final_output_video}")
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print("\n   ❌ Final merge failed.")
-        print("   Stderr:", e.stderr.decode())
+        if getattr(e, "stderr", None):
+            print("   Stderr:", e.stderr.decode(errors="replace"))
         return False
 
     for leftover in (silent_video_path, audio_track_path):
@@ -1840,7 +1997,7 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
-def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, max_secs=60, target_clips=None):
+def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=None, max_secs=None, target_clips=None):
     """Heuristic clip generation when no LLM API key is configured."""
     try:
         import viral_brain
@@ -1852,29 +2009,41 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, 
         return []
 
     min_b, max_b = clip_duration_bounds()
-    min_secs = max(5, int(min_b))
-    max_secs = max(min_secs + 5, int(max_b))
+    eff_min = float(min_secs) if min_secs is not None else float(min_b)
+    eff_max = float(max_secs) if max_secs is not None else float(max_b)
+    eff_min = max(5.0, eff_min)
+    eff_max = max(eff_min + 5.0, eff_max)
+
     if target_clips is None:
-        _, target_clips = clip_count_targets(video_duration)
+        # clip_count_targets expects window count (~1 window per 90s), not raw seconds!
+        n_windows = max(1, int(float(video_duration or 0.0) // 90) + 1)
+        _, target_clips = clip_count_targets(n_windows)
         target_clips = max(1, int(target_clips or 3))
 
+    # Bound start-segment stride on very long transcripts to keep complexity linear-ish
+    step = max(1, len(segments) // 250)
     candidates = []
-    for i, seg in enumerate(segments):
+    for i in range(0, len(segments), step):
+        seg = segments[i]
         start_t = float(seg.get("start", 0.0))
-        text_parts = [seg.get("text", "")]
-        end_t = float(seg.get("end", 0.0))
+        text_parts = [str(seg.get("text", "") or "").strip()]
+        end_t = float(seg.get("end", start_t))
 
-        for next_seg in segments[i+1:]:
-            dur = float(next_seg.get("end", 0.0)) - start_t
-            if dur > max_secs:
+        best_for_start = None
+        for next_seg in segments[i + 1:]:
+            next_end = float(next_seg.get("end", end_t))
+            dur = next_end - start_t
+            if dur > eff_max:
                 break
-            text_parts.append(next_seg.get("text", ""))
-            end_t = float(next_seg.get("end", 0.0))
-            if dur >= min_secs:
-                full_text = " ".join(text_parts).strip()
+            text_parts.append(str(next_seg.get("text", "") or "").strip())
+            end_t = next_end
+            if dur >= eff_min:
+                full_text = " ".join(p for p in text_parts if p).strip()
+                if not full_text:
+                    continue
                 if viral_brain:
                     assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
-                    candidates.append({
+                    cand = {
                         "start": round(start_t, 2),
                         "end": round(end_t, 2),
                         "predicted_score": assessment.overall_score,
@@ -1882,49 +2051,54 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=15, 
                         "video_description_for_instagram": assessment.instagram_description,
                         "video_title_for_youtube_short": assessment.suggested_title,
                         "viral_hook_text": assessment.viral_hook_text,
-                    })
+                    }
                 else:
-                    candidates.append({
+                    cand = {
                         "start": round(start_t, 2),
                         "end": round(end_t, 2),
-                        "predicted_score": 85,
+                        "predicted_score": 65,
                         "video_description_for_tiktok": full_text[:100],
                         "video_description_for_instagram": full_text[:100],
                         "video_title_for_youtube_short": full_text[:50],
                         "viral_hook_text": full_text.split(".")[0][:30],
-                    })
+                    }
+                if best_for_start is None or cand["predicted_score"] > best_for_start["predicted_score"]:
+                    best_for_start = cand
+        if best_for_start is not None:
+            candidates.append(best_for_start)
 
-    candidates.sort(key=lambda c: c["predicted_score"], reverse=True)
-    chosen = []
-    for c in candidates:
-        overlap = False
-        for ch in chosen:
-            if not (c["end"] <= ch["start"] or c["start"] >= ch["end"]):
-                overlap = True
-                break
-        if not overlap:
-            chosen.append(c)
-            if len(chosen) >= target_clips:
-                break
+    deduped = deduplicate_overlapping_clips(candidates, max_overlap_ratio=0.25)
+    chosen = trim_to_best(deduped, target_clips)
 
     if not chosen and segments:
-        dur = max(1.0, float(segments[-1].get("end", 0.0)) - float(segments[0].get("start", 0.0)))
-        full_text = " ".join(s.get("text", "") for s in segments)
+        s0 = max(0.0, float(segments[0].get("start", 0.0)))
+        e0 = float(segments[-1].get("end", s0))
+        if video_duration and float(video_duration) > 0:
+            e0 = min(e0, float(video_duration))
+        dur = max(1.0, e0 - s0)
+        full_text = " ".join(str(s.get("text", "") or "").strip() for s in segments).strip()
         hook = "WATCH THIS! 🤯"
         title = full_text[:50] or "Highlight Moment"
-        if viral_brain:
+        score = 50
+        tiktok_desc = full_text[:100]
+        ig_desc = full_text[:100]
+        if viral_brain and full_text:
             assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
             hook = assessment.viral_hook_text
             title = assessment.suggested_title
-        chosen.append({
-            "start": round(float(segments[0].get("start", 0.0)), 2),
-            "end": round(float(segments[-1].get("end", 0.0)), 2),
-            "predicted_score": 88,
-            "video_description_for_tiktok": full_text[:100],
-            "video_description_for_instagram": full_text[:100],
-            "video_title_for_youtube_short": title,
-            "viral_hook_text": hook,
-        })
+            score = assessment.overall_score
+            tiktok_desc = assessment.tiktok_description
+            ig_desc = assessment.instagram_description
+        if e0 > s0:
+            chosen.append({
+                "start": round(s0, 2),
+                "end": round(e0, 2),
+                "predicted_score": score,
+                "video_description_for_tiktok": tiktok_desc,
+                "video_description_for_instagram": ig_desc,
+                "video_title_for_youtube_short": title,
+                "viral_hook_text": hook,
+            })
     return chosen
 
 
@@ -1935,10 +2109,13 @@ def _heuristic_visual_clips(video_path, video_duration, target_clips=3):
         from highlight_detector import detect_highlights
         highlights = detect_highlights(video_path, target_clips=target_clips)
         for i, h in enumerate(highlights):
+            # highlight_detector.HighlightMoment.score is already calibrated to 0..100
+            raw_score = float(h.score or 0.0)
+            norm_score = int(round(min(99.0, max(20.0, raw_score if raw_score > 1.0 else raw_score * 100.0))))
             shorts.append({
                 "start": round(h.start, 2),
                 "end": round(h.end, 2),
-                "predicted_score": int(min(99, max(60, h.score * 100))),
+                "predicted_score": norm_score,
                 "video_description_for_tiktok": f"Epic highlight moment #{i+1} 🔥",
                 "video_description_for_instagram": f"Unreal peak moment #{i+1} ⚡",
                 "video_title_for_youtube_short": f"Best Moment #{i+1} That You Won't Believe",
@@ -1947,16 +2124,18 @@ def _heuristic_visual_clips(video_path, video_duration, target_clips=3):
     except Exception as e:
         print(f"⚠️ Highlight detector notice ({e}) — falling back to windowing.")
 
-    if not shorts:
+    shorts = deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35)
+
+    if not shorts and float(video_duration or 0.0) >= 1.0:
         min_b, max_b = clip_duration_bounds()
-        clip_dur = min(float(max_b), max(float(min_b), video_duration))
+        clip_dur = min(float(video_duration), min(float(max_b), max(float(min_b), float(video_duration))))
         shorts.append({
             "start": 0.0,
             "end": round(clip_dur, 2),
-            "predicted_score": 85,
+            "predicted_score": 55,
             "video_description_for_tiktok": "Best moment from this video 🔥",
             "video_description_for_instagram": "Must watch highlight ⚡",
-            "video_title_for_youtube_short": "You Won't Believe What Happened",
+            "video_title_for_youtube_short": "Highlight Moment",
             "viral_hook_text": "WATCH THIS! 🤯",
         })
     return shorts
@@ -2084,6 +2263,8 @@ def get_viral_clips(transcript_result, video_duration):
 
         shorts = _run_stage_split(client, model_name, shortlist, _detail_prompt,
                                   gemini_worker.DetailResponse, "shorts", costs, "detail")
+        # Remove overlapping/duplicate clips across overlapping windows before trimming
+        shorts = deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35)
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
             # order, so slicing kept the earliest clips and silently dropped
@@ -2092,11 +2273,12 @@ def get_viral_clips(transcript_result, video_duration):
             shorts = trim_to_best(shorts, max_clips)
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
-        # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+        # Snap each proposed clip onto real word/sentence boundaries (+ a bit of silence).
         for s in shorts:
             ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
+        shorts = deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35)
 
         # Aggregate cost across both passes.
         cost_analysis = None
@@ -2317,16 +2499,71 @@ def process_video_pipeline(
     Extracts viral short clips, reframes to vertical 9:16 (or chosen format),
     applies AI face-tracking and burned subtitles without requiring CLI interaction.
     """
+    # Save and restore any env vars overridden for this invocation so
+    # programmatic calls never leak settings across jobs or tests.
+    _env_overrides = {}
     if live_record_seconds:
-        os.environ["LIVE_RECORD_SECONDS"] = str(live_record_seconds)
+        _env_overrides["LIVE_RECORD_SECONDS"] = str(live_record_seconds)
     if clip_min_seconds:
-        os.environ["CLIP_MIN_SECONDS"] = str(clip_min_seconds)
+        _env_overrides["CLIP_MIN_SECONDS"] = str(clip_min_seconds)
     if clip_max_seconds:
-        os.environ["CLIP_MAX_SECONDS"] = str(clip_max_seconds)
+        _env_overrides["CLIP_MAX_SECONDS"] = str(clip_max_seconds)
     if target_clips:
-        os.environ["CLIP_TARGET_MIN"] = str(target_clips)
-        os.environ["CLIP_TARGET_MAX"] = str(target_clips)
+        _env_overrides["CLIP_TARGET_MIN"] = str(target_clips)
+        _env_overrides["CLIP_TARGET_MAX"] = str(target_clips)
+    _prev_env = {k: os.environ.get(k) for k in _env_overrides}
+    os.environ.update(_env_overrides)
 
+    try:
+        return _process_video_pipeline_impl(
+            input_video_or_url=input_video_or_url,
+            output_dir=output_dir,
+            is_url=is_url,
+            output_format=output_format,
+            keep_original=keep_original,
+            transcript_path=transcript_path,
+            skip_analysis=skip_analysis,
+        )
+    finally:
+        for k, prev in _prev_env.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
+
+def _probe_video_duration_and_dims(video_path: str) -> tuple[float, int, int, float]:
+    """Return ``(duration, width, height, fps)`` using FFprobe first, OpenCV fallback."""
+    info = probe_media(video_path)
+    if info.get("valid") and info.get("duration", 0.0) > 0:
+        return (
+            float(info["duration"]),
+            int(info.get("width") or 0),
+            int(info.get("height") or 0),
+            float(info.get("fps") or 30.0),
+        )
+    cap = cv2.VideoCapture(video_path)
+    try:
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(raw_fps) if (raw_fps and math.isfinite(raw_fps) and 0.1 <= raw_fps <= 240.0) else 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        dur = (frame_count / fps) if (frame_count > 0 and fps > 0) else 0.0
+        return dur, w, h, fps
+    finally:
+        cap.release()
+
+
+def _process_video_pipeline_impl(
+    input_video_or_url: str,
+    output_dir: Optional[str] = None,
+    is_url: bool = True,
+    output_format: str = "vertical",
+    keep_original: bool = False,
+    transcript_path: Optional[str] = None,
+    skip_analysis: bool = False,
+) -> dict:
     script_start_time = time.time()
 
     def _ensure_dir(path: str) -> str:
@@ -2354,26 +2591,22 @@ def process_video_pipeline(
     if not os.path.exists(input_video):
         raise FileNotFoundError(f"Input video file not found: {input_video}")
 
+    # Probe source metadata once via FFprobe (accurate on VFR / remuxed YouTube streams)
+    duration, src_w, src_h, fps = _probe_video_duration_and_dims(input_video)
+
     # Layout choice is per SOURCE video, not per clip
     if layout_picker.ENABLED:
         try:
-            _cap = cv2.VideoCapture(input_video)
-            _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
-            _duration = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) / _fps
-            _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            _cap.release()
             from reframe_v2 import source_already_fits
-            if _w and _h and source_already_fits(_w, _h, ASPECT_RATIO):
-                print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
+            if src_w and src_h and source_already_fits(src_w, src_h, ASPECT_RATIO):
+                print(f"   ↕️  Source is {src_w}x{src_h} — already vertical, no layout to pick.")
             else:
-                layout_picker.pick_and_apply(input_video, _duration)
+                layout_picker.pick_and_apply(input_video, duration)
         except Exception as e:
             print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
 
     ready_clips = []
     clips_data = None
-    duration = 0.0
 
     if skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
@@ -2383,16 +2616,14 @@ def process_video_pipeline(
                 or not os.path.splitext(output_file)[1]):
             output_file = os.path.join(output_file or resolved_output_dir, f"{video_title}_vertical.mp4")
         os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-        render_clip(input_video, output_file, output_format)
-        ready_clips.append(output_file)
+        rendered = render_clip(input_video, output_file, output_format)
+        ok, _out_info, reason = validate_media_output(output_file, require_video=True)
+        if rendered and ok:
+            ready_clips.append(output_file)
+        else:
+            raise RuntimeError(f"Full-video render failed validation: {reason}")
     else:
-        # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        duration = frame_count / fps if fps > 0 else 0
-        print(f"🎥 Video Duration: {duration:.2f}s ({frame_count} frames @ {fps:.2f} fps)")
+        print(f"🎥 Video Duration: {duration:.2f}s ({src_w}x{src_h} @ {fps:.2f} fps)")
 
         # 3. Transcribe
         from transcribe_backends import NoAudioError
@@ -2466,8 +2697,14 @@ def process_video_pipeline(
         print(f"⚡ Launching {active_clip_workers} parallel clip workers for {len(shorts)} clip(s) ({ffmpeg_threads_per_worker} FFmpeg threads/worker)...")
 
         def _process_one_clip(i, clip):
-            start = clip['start']
-            end = clip['end']
+            start = max(0.0, float(clip['start']))
+            end = float(clip['end'])
+            if duration > 0:
+                end = min(end, duration)
+            if end <= start + 0.5:
+                print(f"❌ Skipping invalid clip {i+1}: start={start}s end={end}s")
+                return None
+
             print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
             print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
 
@@ -2486,11 +2723,11 @@ def process_video_pipeline(
                     *audio_encode_args(),
                     clip_temp_path
                 ]
-                proc = subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                proc = run_ffmpeg_with_fallback(cut_command, timeout=1800, tier=QUALITY_FAST)
                 if proc.returncode != 0 or not os.path.exists(clip_temp_path) or os.path.getsize(clip_temp_path) == 0:
                     err_msg = proc.stderr.decode("utf-8", errors="ignore") if proc.stderr else "unknown error"
                     print(f"❌ Failed to cut clip {i+1} with FFmpeg: {err_msg[:200]}")
-                    return False
+                    return None
 
                 success = render_clip(clip_temp_path, clip_final_path, output_format)
                 if success and os.environ.get("WATERMARK") == "1":
@@ -2509,23 +2746,36 @@ def process_video_pipeline(
                         deliver_path, transcript, start, end,
                         split_ranges=_layouts.split_ranges(clip['layout_ranges']))
                     final_ready = captioned or deliver_path
-                    ready_clips.append(final_ready)
+                    ok, _info, reason = validate_media_output(
+                        final_ready,
+                        expected_duration=(end - start),
+                        duration_tolerance=max(3.0, (end - start) * 0.15),
+                        require_video=True,
+                        decode_check=False,
+                    )
+                    if not ok:
+                        print(f"   ❌ Clip {i+1} failed output validation ({reason}) — not marking ready.")
+                        return None
                     print(f"   ✅ Clip {i+1} ready: {final_ready}")
                     print(f"CLIP_READY {i} "
                           f"{os.path.basename(captioned or deliver_path)}")
-                return success
+                    return final_ready
+                return None
             finally:
                 if os.path.exists(clip_temp_path):
                     os.remove(clip_temp_path)
 
+        clip_results = [None] * len(shorts)
         with ThreadPoolExecutor(max_workers=active_clip_workers) as pool:
             futures = {pool.submit(_process_one_clip, i, clip): i for i, clip in enumerate(shorts)}
             for future in as_completed(futures):
                 i = futures[future]
                 try:
-                    future.result()
+                    clip_results[i] = future.result()
                 except Exception as e:
                     print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
+
+        ready_clips = [p for p in clip_results if p]
 
         if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
             with open(metadata_file, 'w', encoding="utf-8") as f:
@@ -2545,7 +2795,7 @@ def process_video_pipeline(
     total_time = time.time() - script_start_time
     print(f"\n⏱️  Total execution time: {total_time:.2f}s")
     return {
-        "success": True,
+        "success": bool(ready_clips),
         "video_title": video_title,
         "input_video": input_video,
         "output_dir": resolved_output_dir,

@@ -28,7 +28,8 @@ import screencast_layout
 import layout_ranges
 import split_layout
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY_FAST,
-                          METADATA_SCRUB)
+                          METADATA_SCRUB, run_ffmpeg_with_fallback,
+                          validate_media_output)
 
 ANALYSIS_MAX_WIDTH = 640
 
@@ -108,9 +109,8 @@ def scene_frame_ranges(scene_boundaries, strategies, total_frames):
 
 
 def concat_list_content(segment_paths):
-    # Single quotes per concat-demuxer spec; our paths are tempfile-generated
-    # (no quotes in them).
-    return "".join(f"file '{p}'\n" for p in segment_paths)
+    # Single quotes per concat-demuxer spec; normalize backslashes to '/' for Windows.
+    return "".join(f"file '{str(p).replace(chr(92), '/')}'\n" for p in segment_paths)
 
 
 # How much of the frame height the real content should fill in GENERAL layout.
@@ -257,7 +257,21 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
 def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
                         fps, orig_w, orig_h, cameraman, tracker):
     """Replays v1's per-frame decision loop on a downscaled ffmpeg-decoded
-    stream. Returns xs: crop x per frame (None on GENERAL frames)."""
+    stream. Returns xs: crop x per frame (None on GENERAL frames).
+
+    Performance fast-path: if no scene requires dynamic face tracking (all
+    scenes are static layouts such as GENERAL/SPLIT/SCREENCAST/WIDE/INSET/
+    ALTERNATE), skip decoding the entire video completely.
+    """
+    static_strategies = ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE')
+    if scenes_boundaries and scene_strategies and all(
+        (scene_strategies[i] if i < len(scene_strategies) else 'TRACK') in static_strategies
+        for i in range(len(scenes_boundaries))
+    ):
+        total_frames = max(e for _s, e in scenes_boundaries)
+        if total_frames > 0:
+            return [None] * total_frames
+
     import numpy as np
     import main as m
 
@@ -284,12 +298,10 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape((small_h, small_w, 3))
 
-            if current_scene_index < len(scenes_boundaries):
-                start_f, end_f = scenes_boundaries[current_scene_index]
-                if frame_number >= end_f and current_scene_index < len(scenes_boundaries) - 1:
-                    current_scene_index += 1
+            while (current_scene_index < len(scenes_boundaries) - 1
+                   and frame_number >= scenes_boundaries[current_scene_index][1]):
+                current_scene_index += 1
 
             strategy = (scene_strategies[current_scene_index]
                         if current_scene_index < len(scene_strategies) else 'TRACK')
@@ -297,8 +309,7 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
             # SPLIT, SCREENCAST and WIDE crops are static (fixed boxes for the
             # whole scene), so like GENERAL they need no camera trajectory.
             # ALTERNATE gets one written in after this pass.
-            if strategy in ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE',
-                            'INSET', 'ALTERNATE'):
+            if strategy in static_strategies:
                 cameraman.current_center_x = orig_w / 2
                 cameraman.target_center_x = orig_w / 2
                 xs.append(None)
@@ -314,6 +325,7 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
                     cameraman.begin_scene()
 
                 if frame_number % m.DETECT_STRIDE == 0 or cut:
+                    frame = np.frombuffer(buf, dtype=np.uint8).reshape((small_h, small_w, 3))
                     candidates = m.detect_face_candidates(frame)
                     for cand in candidates:
                         cand['box'] = [int(v * scale) for v in cand['box']]
@@ -332,7 +344,11 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
             frame_number += 1
     finally:
         proc.stdout.close()
-        proc.wait()
+        try:
+            proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     return xs
 
@@ -340,8 +356,7 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
 # --- render -----------------------------------------------------------------
 
 def _run(cmd):
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.PIPE, timeout=1800)
+    run_ffmpeg_with_fallback(cmd, timeout=1800, tier=QUALITY_FAST, check=True)
 
 
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
@@ -571,7 +586,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     crop_y = max(0, (orig_h - crop_h) // 2)
                     crop_y -= crop_y % 2
                     init = f"w={crop_w}:h={crop_h}:x={seg_xs[0]}:y={crop_y}"
-                with open(cmd_path, "w") as f:
+                with open(cmd_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
                 graph = (
                     f"[0:v]sendcmd=f='{escape_filter_value(cmd_path)}',"
@@ -588,7 +603,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             segments.append(seg_path)
 
         list_path = os.path.join(workdir, "concat.txt")
-        with open(list_path, "w") as f:
+        with open(list_path, "w", encoding="utf-8") as f:
             f.write(concat_list_content(segments))
 
         # Concat video segments (stream copy) + audio straight from the clip.
@@ -608,6 +623,14 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     finally:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
+
+    ok, _out_info, reason = validate_media_output(
+        final_output_video,
+        require_video=True,
+        expected_resolution=(out_w, out_h),
+    )
+    if not ok:
+        raise RuntimeError(f"reframe_v2 output validation failed: {reason}")
 
     # Tell the caption pass which stretches are stacked (see layout_ranges).
     layout_ranges.write(final_output_video,

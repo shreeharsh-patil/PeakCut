@@ -14,6 +14,7 @@ Gated off by default (``SPLIT_LAYOUT=1`` to enable): a wrong SPLIT is a worse
 failure than a wrong TRACK, because half the frame is then a person who never
 moves.
 """
+import math
 import os
 
 import numpy as np
@@ -228,7 +229,8 @@ def detect_split_scenes(video_path, scenes, strategies, samples=None):
     if not cap.isOpened():
         return {}
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    raw_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = float(raw_fps) if (raw_fps and math.isfinite(raw_fps) and 0.1 <= raw_fps <= 240.0) else 30.0
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     # Scene ends can sit past the last decodable frame (the detector counts from
     # container metadata). Seeking there returns nothing, and those misses used

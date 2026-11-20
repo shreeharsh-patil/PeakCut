@@ -2,9 +2,10 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
-                          METADATA_SCRUB)
+                          METADATA_SCRUB, _swap_nvenc_to_x264)
 
 # Patch PyAV 19+ compatibility with faster-whisper (metadata_errors argument removed in av>=19)
 try:
@@ -120,7 +121,13 @@ def _escape_ffmpeg_filter_value(value):
 
 
 def _normalize_subtitle_word(value):
-    return " ".join(str(value or "").split())
+    normalized = unicodedata.normalize("NFC", str(value or ""))
+    return " ".join(normalized.split())
+
+
+def _visual_char_len(text):
+    """Count visible glyph slots, excluding Unicode combining marks (e.g. Devanagari matras)."""
+    return sum(1 for ch in str(text or "") if unicodedata.category(ch) != "Mn")
 
 
 def transcribe_audio(video_path):
@@ -158,7 +165,8 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration)
 
 
-def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0):
+def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0,
+                         max_pause=0.75):
     """
     Flatten transcript words for a clip range and group them into short blocks
     suitable for vertical video. Returns a list of blocks; each block is a list
@@ -168,26 +176,64 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
     from old jobs on disk store unmerged tokens (the leading space is still
     present, so the boundary signal survives).
     """
+    clip_start = float(clip_start or 0.0)
+    clip_end = float(clip_end or 0.0)
+    clip_dur = max(0.0, clip_end - clip_start)
+
     flat_words = []
-    for segment in transcript.get('segments', []):
-        flat_words.extend(segment.get('words', []))
+    for segment in (transcript or {}).get('segments', []):
+        seg_words = segment.get('words') or []
+        if seg_words:
+            flat_words.extend(seg_words)
+        else:
+            # Fallback for segment-only transcripts without word timestamps
+            seg_text = str(segment.get('text') or '').strip()
+            seg_s = float(segment.get('start', 0.0))
+            seg_e = float(segment.get('end', seg_s))
+            tokens = seg_text.split()
+            if tokens and seg_e > seg_s:
+                weights = [max(1, _visual_char_len(t)) for t in tokens]
+                total_w = float(sum(weights))
+                cursor = seg_s
+                for tok, wt in zip(tokens, weights):
+                    span = (seg_e - seg_s) * (wt / total_w)
+                    flat_words.append({
+                        'word': ' ' + tok,
+                        'start': cursor,
+                        'end': cursor + span,
+                    })
+                    cursor += span
+
     flat_words = merge_continuation_words(flat_words)
 
     words = []
     for word_info in flat_words:
-        if word_info.get('end', 0) > clip_start and word_info.get('start', 0) < clip_end:
+        try:
+            raw_s = float(word_info.get('start', 0.0))
+            raw_e = float(word_info.get('end', raw_s))
+        except (TypeError, ValueError):
+            continue
+        if raw_e < raw_s:
+            raw_e = raw_s
+        if raw_e >= clip_start and raw_s < clip_end and (raw_e > clip_start or raw_s >= clip_start):
             cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
             if not cleaned_word:
                 continue
+            rel_s = max(0.0, min(clip_dur, raw_s - clip_start))
+            rel_e = max(rel_s, min(clip_dur, raw_e - clip_start))
             words.append({
                 'word': cleaned_word,
-                'start': max(0, word_info['start'] - clip_start),
-                'end': max(0, word_info['end'] - clip_start),
+                'start': rel_s,
+                'end': rel_e,
             })
+
+    # Ensure strictly chronological ordering to prevent timing drift / overlap
+    words.sort(key=lambda w: (w['start'], w['end']))
 
     blocks = []
     current_block = []
     block_start = None
+    sentence_ends = (".", "!", "?", "।")
 
     for word in words:
         if not current_block:
@@ -195,10 +241,20 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
             block_start = word['start']
             continue
 
-        current_text_len = sum(len(w['word']) + 1 for w in current_block)
+        prev_word = current_block[-1]
+        pause_gap = word['start'] - prev_word['end']
+        current_text_len = sum(_visual_char_len(w['word']) + 1 for w in current_block)
         duration = word['end'] - block_start
+        prev_ended_sentence = prev_word['word'].endswith(sentence_ends)
 
-        if current_text_len + len(word['word']) > max_chars or duration > max_duration:
+        should_split = (
+            current_text_len + _visual_char_len(word['word']) > max_chars
+            or duration > max_duration
+            or (max_pause is not None and pause_gap > max_pause)
+            or (prev_ended_sentence and current_text_len >= max(8, int(max_chars * 0.55)))
+        )
+
+        if should_split:
             blocks.append(current_block)
             current_block = [word]
             block_start = word['start']
@@ -213,16 +269,37 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
 def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0):
     """
     Generates an SRT file from the transcript for a specific time range.
-    Groups words into short lines suitable for vertical video.
+    Groups words into short lines suitable for vertical video without overlaps.
     """
     blocks = _collect_word_blocks(transcript, clip_start, clip_end, max_chars, max_duration)
     if not blocks:
         return False
 
+    clip_dur = max(0.0, float(clip_end or 0.0) - float(clip_start or 0.0))
     srt_content = ""
-    for index, block in enumerate(blocks, 1):
+    prev_end = 0.0
+    index = 1
+    for b_idx, block in enumerate(blocks):
         text = " ".join(w['word'] for w in block).strip()
-        srt_content += format_srt_block(index, block[0]['start'], block[-1]['end'], text)
+        if not text:
+            continue
+        st = max(prev_end, float(block[0]['start']))
+        et = float(block[-1]['end'])
+        next_start = float(blocks[b_idx + 1][0]['start']) if b_idx + 1 < len(blocks) else clip_dur
+        if et <= st:
+            et = st + 0.1
+        if next_start > st:
+            et = min(et, next_start)
+        if clip_dur > 0:
+            et = min(et, clip_dur)
+        if et <= st:
+            continue
+        srt_content += format_srt_block(index, st, et, text)
+        prev_end = et
+        index += 1
+
+    if not srt_content:
+        return False
 
     # Write UTF-8 with BOM so Windows/FFmpeg subtitle readers reliably detect Unicode text.
     with open(output_path, 'w', encoding='utf-8-sig') as f:
@@ -264,14 +341,13 @@ AUTO_CAPTION_STYLE = {
 
 
 def _ass_time(seconds):
-    """Format seconds as ASS timestamp H:MM:SS.cc (centiseconds)."""
-    seconds = max(0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 100))
-    if centis >= 100:
-        centis = 99
+    """Format seconds as ASS timestamp H:MM:SS.cc (centiseconds) with proper carry."""
+    total_cs = int(round(max(0.0, float(seconds or 0.0)) * 100))
+    centis = total_cs % 100
+    total_secs = total_cs // 100
+    hours = total_secs // 3600
+    minutes = (total_secs % 3600) // 60
+    secs = total_secs % 60
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
@@ -412,21 +488,47 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
+    clip_dur = max(0.0, float(clip_end or 0.0) - float(clip_start or 0.0))
     events = []
-    for block in blocks:
-        last_ev_end = None
+    global_last_end = 0.0
+    for b_idx, block in enumerate(blocks):
+        next_block_start = (
+            float(blocks[b_idx + 1][0]['start']) if b_idx + 1 < len(blocks) else clip_dur
+        )
         for i, word in enumerate(block):
             # Event runs until the next word starts (no flicker in gaps);
-            # the last word holds until the block ends.
-            raw_start = block[0]['start'] if i == 0 else word['start']
-            raw_end = block[i + 1]['start'] if i < len(block) - 1 else block[-1]['end']
+            # the last word holds until the block ends (clamped before the next block).
+            raw_start = float(block[0]['start'] if i == 0 else word['start'])
+            raw_end = float(block[i + 1]['start'] if i < len(block) - 1 else block[-1]['end'])
 
-            ev_start = max(raw_start, last_ev_end) if last_ev_end is not None else raw_start
+            ev_start = max(raw_start, global_last_end)
             ev_end = raw_end
             if ev_end <= ev_start:
                 ev_end = max(ev_start + 0.08, float(word.get('end', ev_start + 0.08)))
 
-            last_ev_end = ev_end
+            # Never overlap the next block or overshoot the clip end
+            if i == len(block) - 1 and b_idx + 1 < len(blocks) and next_block_start > ev_start:
+                ev_end = min(ev_end, next_block_start)
+            if clip_dur > 0:
+                if ev_start >= clip_dur:
+                    continue
+                ev_end = min(ev_end, clip_dur)
+            if ev_end <= ev_start:
+                ev_end = min(clip_dur, ev_start + 0.05) if clip_dur > 0 else ev_start + 0.05
+            if ev_end <= ev_start:
+                continue
+
+            global_last_end = ev_end
+
+            # Adaptive pop animation duration so ultra-short words (<110ms) still animate cleanly
+            if effect == "pop":
+                anim_ms = max(40, min(110, int(round((ev_end - ev_start) * 1000))))
+                word_active_prefix = (
+                    f"{{\\c{highlight_inline}"
+                    f"\\fscx90\\fscy90\\t(0,{anim_ms},\\fscx108\\fscy108)}}"
+                )
+            else:
+                word_active_prefix = active_prefix
 
             is_seam = bool(seam_ranges and any(a <= ev_start < b for a, b in seam_ranges))
             # On a split scene, {\r} would reset alignment back to style Default (bottom);
@@ -439,7 +541,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                 if uppercase:
                     text = text.upper()
                 if j == i:
-                    parts.append(f"{active_prefix}{text}{reset_tag}")
+                    parts.append(f"{word_active_prefix}{text}{reset_tag}")
                 else:
                     parts.append(text)
 
@@ -458,12 +560,14 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
 def format_srt_block(index, start, end, text):
     def format_time(seconds):
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds - int(seconds)) * 1000)
+        total_ms = int(round(max(0.0, float(seconds or 0.0)) * 1000))
+        millis = total_ms % 1000
+        total_secs = total_ms // 1000
+        hours = total_secs // 3600
+        minutes = (total_secs % 3600) // 60
+        secs = total_secs % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-        
+
     return f"{index}\n{format_time(start)} --> {format_time(end)}\n{text}\n\n"
 
 _HEX_COLOR_RE = re.compile(r'^[0-9A-Fa-f]{6}$')
@@ -513,13 +617,13 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
     - Outline mode (bg_opacity=0): Text with colored outline/border
     - Box mode (bg_opacity>0): Text with semi-transparent background box
     """
-    # Position mapping
+    # Position mapping (ASS v4+ numpad alignment: 2=bottom, 5=middle, 8=top)
     ass_alignment = 2
     align_lower = str(alignment).lower()
     if align_lower == 'top':
-        ass_alignment = 6
+        ass_alignment = 8
     elif align_lower == 'middle':
-        ass_alignment = 10
+        ass_alignment = 5
     elif align_lower == 'bottom':
         ass_alignment = 2
 
@@ -595,10 +699,16 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
     ]
 
     _log(f"🎬 Burning subtitles: {' '.join(cmd)}")
-    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+
+    if result.returncode != 0 and "h264_nvenc" in cmd:
+        swapped = _swap_nvenc_to_x264(cmd, tier=QUALITY)
+        if swapped:
+            _log("⚠️ NVENC subtitle burn failed — retrying with CPU libx264")
+            result = subprocess.run(swapped, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
 
     if result.returncode != 0:
-        stderr_text = result.stderr.decode(errors='replace')
+        stderr_text = (result.stderr or b"").decode(errors='replace')
         _log(f"❌ FFmpeg Subtitle Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
 
