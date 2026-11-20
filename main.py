@@ -1999,20 +1999,31 @@ def score_batch_size():
 
 def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=None, max_secs=None, target_clips=None):
     """Heuristic clip generation when no LLM API key is configured."""
-    try:
-        import viral_brain
-    except Exception:
-        viral_brain = None
+    import viral_brain
 
-    segments = transcript_result.get("segments", []) if transcript_result else []
+    segments = []
+    for segment in (transcript_result or {}).get("segments", []):
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        start = max(0.0, start)
+        end = min(video_duration, end)
+        text = str(segment.get("text") or "").strip()
+        if end > start and text:
+            segments.append((round(start, 3), round(end, 3), text))
     if not segments:
         return []
+    segments.sort()
 
     min_b, max_b = clip_duration_bounds()
     eff_min = float(min_secs) if min_secs is not None else float(min_b)
     eff_max = float(max_secs) if max_secs is not None else float(max_b)
     eff_min = max(5.0, eff_min)
-    eff_max = max(eff_min + 5.0, eff_max)
+    eff_max = max(eff_min, eff_max)
 
     if target_clips is None:
         # clip_count_targets expects window count (~1 window per 90s), not raw seconds!
@@ -2024,119 +2035,70 @@ def _heuristic_transcript_clips(transcript_result, video_duration, min_secs=None
     step = max(1, len(segments) // 250)
     candidates = []
     for i in range(0, len(segments), step):
-        seg = segments[i]
-        start_t = float(seg.get("start", 0.0))
-        text_parts = [str(seg.get("text", "") or "").strip()]
-        end_t = float(seg.get("end", start_t))
-
+        start_t = segments[i][0]
+        text_parts = []
+        end_t = start_t
         best_for_start = None
-        for next_seg in segments[i + 1:]:
-            next_end = float(next_seg.get("end", end_t))
-            dur = next_end - start_t
+        for j in range(i, len(segments)):
+            _, next_end, text = segments[j]
+            end_t = max(end_t, next_end)
+            dur = round(end_t - start_t, 3)
             if dur > eff_max:
                 break
-            text_parts.append(str(next_seg.get("text", "") or "").strip())
-            end_t = next_end
-            if dur >= eff_min:
-                full_text = " ".join(p for p in text_parts if p).strip()
-                if not full_text:
-                    continue
-                if viral_brain:
-                    assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
-                    cand = {
-                        "start": round(start_t, 2),
-                        "end": round(end_t, 2),
-                        "predicted_score": assessment.overall_score,
-                        "video_description_for_tiktok": assessment.tiktok_description,
-                        "video_description_for_instagram": assessment.instagram_description,
-                        "video_title_for_youtube_short": assessment.suggested_title,
-                        "viral_hook_text": assessment.viral_hook_text,
-                    }
-                else:
-                    cand = {
-                        "start": round(start_t, 2),
-                        "end": round(end_t, 2),
-                        "predicted_score": 65,
-                        "video_description_for_tiktok": full_text[:100],
-                        "video_description_for_instagram": full_text[:100],
-                        "video_title_for_youtube_short": full_text[:50],
-                        "viral_hook_text": full_text.split(".")[0][:30],
-                    }
-                if best_for_start is None or cand["predicted_score"] > best_for_start["predicted_score"]:
-                    best_for_start = cand
+            text_parts.append(text)
+            if dur < eff_min:
+                continue
+            assessment = viral_brain.evaluate_viral_clip(" ".join(text_parts), duration=dur)
+            if best_for_start is None or assessment.overall_score > best_for_start["predicted_score"]:
+                best_for_start = {
+                    "start": start_t,
+                    "end": end_t,
+                    "predicted_score": assessment.overall_score,
+                    "video_description_for_tiktok": assessment.tiktok_description,
+                    "video_description_for_instagram": assessment.instagram_description,
+                    "video_title_for_youtube_short": assessment.suggested_title,
+                    "viral_hook_text": assessment.viral_hook_text,
+                }
         if best_for_start is not None:
             candidates.append(best_for_start)
 
     deduped = deduplicate_overlapping_clips(candidates, max_overlap_ratio=0.25)
-    chosen = trim_to_best(deduped, target_clips)
-
-    if not chosen and segments:
-        s0 = max(0.0, float(segments[0].get("start", 0.0)))
-        e0 = float(segments[-1].get("end", s0))
-        if video_duration and float(video_duration) > 0:
-            e0 = min(e0, float(video_duration))
-        dur = max(1.0, e0 - s0)
-        full_text = " ".join(str(s.get("text", "") or "").strip() for s in segments).strip()
-        hook = "WATCH THIS! 🤯"
-        title = full_text[:50] or "Highlight Moment"
-        score = 50
-        tiktok_desc = full_text[:100]
-        ig_desc = full_text[:100]
-        if viral_brain and full_text:
-            assessment = viral_brain.evaluate_viral_clip(full_text, duration=dur)
-            hook = assessment.viral_hook_text
-            title = assessment.suggested_title
-            score = assessment.overall_score
-            tiktok_desc = assessment.tiktok_description
-            ig_desc = assessment.instagram_description
-        if e0 > s0:
-            chosen.append({
-                "start": round(s0, 2),
-                "end": round(e0, 2),
-                "predicted_score": score,
-                "video_description_for_tiktok": tiktok_desc,
-                "video_description_for_instagram": ig_desc,
-                "video_title_for_youtube_short": title,
-                "viral_hook_text": hook,
-            })
-    return chosen
+    return trim_to_best(deduped, target_clips)
 
 
 def _heuristic_visual_clips(video_path, video_duration, target_clips=3):
     """Heuristic visual highlight detector for silent videos when no vision AI key is present."""
+    min_secs, max_secs = clip_duration_bounds()
+    if video_duration < min_secs:
+        return []
     shorts = []
     try:
         from highlight_detector import detect_highlights
-        highlights = detect_highlights(video_path, target_clips=target_clips)
-        for i, h in enumerate(highlights):
-            # highlight_detector.HighlightMoment.score is already calibrated to 0..100
-            raw_score = float(h.score or 0.0)
-            norm_score = int(round(min(99.0, max(20.0, raw_score if raw_score > 1.0 else raw_score * 100.0))))
+        highlights = detect_highlights(
+            video_path, target_clips=target_clips,
+            target_clip_duration=min(max_secs, max(min_secs, 20.0)),
+        )
+        for h in highlights:
+            end = min(h.end, video_duration)
+            if not min_secs <= round(end - h.start, 3) <= max_secs:
+                continue
             shorts.append({
-                "start": round(h.start, 2),
-                "end": round(h.end, 2),
-                "predicted_score": norm_score,
-                "video_description_for_tiktok": f"Epic highlight moment #{i+1} 🔥",
-                "video_description_for_instagram": f"Unreal peak moment #{i+1} ⚡",
-                "video_title_for_youtube_short": f"Best Moment #{i+1} That You Won't Believe",
-                "viral_hook_text": "WAIT FOR IT... 😱",
+                "start": h.start,
+                "end": end,
+                "predicted_score": h.score,
+                "video_title_for_youtube_short": h.title,
             })
     except Exception as e:
         print(f"⚠️ Highlight detector notice ({e}) — falling back to windowing.")
 
     shorts = deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35)
 
-    if not shorts and float(video_duration or 0.0) >= 1.0:
-        min_b, max_b = clip_duration_bounds()
-        clip_dur = min(float(video_duration), min(float(max_b), max(float(min_b), float(video_duration))))
+    if not shorts:
         shorts.append({
             "start": 0.0,
-            "end": round(clip_dur, 2),
-            "predicted_score": 55,
-            "video_description_for_tiktok": "Best moment from this video 🔥",
-            "video_description_for_instagram": "Must watch highlight ⚡",
-            "video_title_for_youtube_short": "Highlight Moment",
-            "viral_hook_text": "WATCH THIS! 🤯",
+            "end": min(video_duration, max_secs),
+            "predicted_score": 0,
+            "video_title_for_youtube_short": "Unscored clip",
         })
     return shorts
 
@@ -2617,7 +2579,7 @@ def _process_video_pipeline_impl(
             output_file = os.path.join(output_file or resolved_output_dir, f"{video_title}_vertical.mp4")
         os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         rendered = render_clip(input_video, output_file, output_format)
-        ok, _out_info, reason = validate_media_output(output_file, require_video=True)
+        ok, _out_info, reason = validate_media_output(output_file, require_video=True, decode_check=True)
         if rendered and ok:
             ready_clips.append(output_file)
         else:
@@ -2665,16 +2627,11 @@ def _process_video_pipeline_impl(
 
         if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
             print("⚠️ AI clip detection returned empty — generating heuristic highlight clips...")
-            if transcript is not None:
-                clips_data = {
-                    "shorts": _heuristic_transcript_clips(transcript, duration),
-                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
-                }
-            else:
-                clips_data = {
-                    "shorts": _heuristic_visual_clips(input_video, duration),
-                    "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
-                }
+            choices = _heuristic_transcript_clips(transcript, duration) if transcript is not None else []
+            clips_data = {
+                "shorts": choices or _heuristic_visual_clips(input_video, duration),
+                "cost_analysis": {"total_cost": 0.0, "currency": "USD", "provider": "heuristic"}
+            }
 
         if not clips_data or 'shorts' not in clips_data or not clips_data.get('shorts'):
             raise RuntimeError("Clip detection failed — unable to identify usable clips for this video.")
@@ -2751,7 +2708,7 @@ def _process_video_pipeline_impl(
                         expected_duration=(end - start),
                         duration_tolerance=max(3.0, (end - start) * 0.15),
                         require_video=True,
-                        decode_check=False,
+                        decode_check=True,
                     )
                     if not ok:
                         print(f"   ❌ Clip {i+1} failed output validation ({reason}) — not marking ready.")

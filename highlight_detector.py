@@ -15,6 +15,8 @@ import logging
 import math
 import os
 import subprocess
+import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,7 +57,7 @@ def extract_audio_energy(
     chunk_bytes = samples_per_win * 2  # 16-bit signed mono PCM
     cmd = [
         "ffmpeg",
-        "-v", "error",
+        "-nostdin", "-v", "error", "-xerror",
         "-i", str(video_or_audio_path),
         "-vn",
         "-ac", "1",
@@ -63,56 +65,50 @@ def extract_audio_energy(
         "-f", "s16le",
         "-",
     ]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=max(chunk_bytes * 4, 65536),
-        )
-    except OSError as e:
-        logger.error(f"FFmpeg audio extraction failed to start: {e}")
-        return np.array([], dtype=np.float32), 0.0
-
     rms_values: List[float] = []
     total_samples = 0
-    buf = bytearray()
-    try:
-        assert proc.stdout is not None
-        while True:
-            data = proc.stdout.read(chunk_bytes)
-            if not data:
-                break
-            buf.extend(data)
-            while len(buf) >= chunk_bytes:
-                win_bytes = bytes(buf[:chunk_bytes])
-                del buf[:chunk_bytes]
-                samples = np.frombuffer(win_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                total_samples += len(samples)
-                rms_values.append(float(np.sqrt(np.mean(samples ** 2) + 1e-10)))
-        if len(buf) >= 2:
-            rem = len(buf) - (len(buf) % 2)
-            total_samples += rem // 2
+    # A second pipe can fill while stdout is being read. Use a file for
+    # diagnostics and start the deadline before any potentially blocking read.
+    with tempfile.TemporaryFile() as stderr:
         try:
-            _, stderr_bytes = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            logger.error(f"FFmpeg audio extraction timed out after {timeout}s")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr)
+        except OSError as e:
+            logger.error("FFmpeg audio extraction failed to start: %s", e)
             return np.array([], dtype=np.float32), 0.0
-        if proc.returncode != 0 and not rms_values:
-            err = (stderr_bytes or b"").decode("utf-8", errors="ignore")
-            logger.error(f"FFmpeg audio extraction failed (rc={proc.returncode}): {err[-300:]}")
-            return np.array([], dtype=np.float32), 0.0
-    finally:
-        if proc.stdout:
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
-        if proc.poll() is None:
-            proc.kill()
+
+        expired = threading.Event()
+
+        def stop_on_timeout():
+            if proc.poll() is None:
+                expired.set()
+                proc.kill()
+
+        watchdog = threading.Timer(timeout, stop_on_timeout)
+        watchdog.start()
+        try:
+            while data := proc.stdout.read(chunk_bytes):
+                total_samples += len(data) // 2
+                if len(data) == chunk_bytes:
+                    samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+                    rms_values.append(float(np.sqrt(np.mean(samples ** 2) + 1e-10)))
             proc.wait()
+        finally:
+            watchdog.cancel()
+            watchdog.join()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        if expired.is_set():
+            logger.error("FFmpeg audio extraction timed out after %ss", timeout)
+            return np.array([], dtype=np.float32), 0.0
+        if proc.returncode != 0:
+            stderr.seek(max(0, stderr.tell() - 300))
+            error = stderr.read().decode("utf-8", errors="replace")
+            logger.error("FFmpeg audio extraction failed (rc=%d): %s", proc.returncode, error)
+            return np.array([], dtype=np.float32), 0.0
 
     duration_sec = total_samples / float(sample_rate) if sample_rate else 0.0
     if not rms_values:

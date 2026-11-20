@@ -758,9 +758,21 @@ class TestOrchestratorAndCLI:
     """Verifies master cycle loop, safety moderation, scheduler initialization, and CLI flags."""
 
     @pytest.fixture
-    def orchestrator(self):
-        cfg = get_config(reload=True)
+    def orchestrator(self, tmp_path, monkeypatch):
+        cfg = Config()
+        cfg.paths = PathSettings(
+            output_dir=tmp_path / "output",
+            temp_dir=tmp_path / "temp",
+            archive_dir=tmp_path / "archive",
+            data_dir=tmp_path / "data",
+            logs_dir=tmp_path / "logs",
+            cycle_logs_dir=tmp_path / "logs" / "cycles",
+            quota_state_file=tmp_path / "data" / "key_quotas.json",
+        )
         cfg.dry_run = True
+        cfg.paths.ensure_directories()
+        monkeypatch.setattr("clipmind.core.config._CONFIG_INSTANCE", cfg)
+        monkeypatch.setattr(TrendAnalyzer, "analyze", lambda *args, **kwargs: [])
         return MasterOrchestrator(config=cfg)
 
     def test_safety_moderator_content_and_copyright_check(self):

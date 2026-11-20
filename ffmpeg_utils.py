@@ -313,7 +313,9 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
             fmt = data.get("format") or {}
             streams = data.get("streams") or []
 
-            v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+            v_stream = next((s for s in streams
+                             if s.get("codec_type") == "video"
+                             and not (s.get("disposition") or {}).get("attached_pic")), None)
             a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
             def _to_pos_float(val):
@@ -388,13 +390,15 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
                 + float(dur_match.group(2)) * 60.0
                 + float(dur_match.group(3))
             )
-        res_match = re.search(r"Stream.*Video:\s*([a-zA-Z0-9_]+).*?,\s*(\d+)x(\d+)", stderr)
+        video_line = next((line for line in stderr.splitlines()
+                           if "Stream #" in line and "Video:" in line and "(attached pic)" not in line), "")
+        res_match = re.search(r"Video:\s*([a-zA-Z0-9_]+).*?,\s*(\d+)x(\d+)", video_line)
         width, height, vcodec = 0, 0, None
         if res_match:
             vcodec = res_match.group(1).lower()
             width = int(res_match.group(2))
             height = int(res_match.group(3))
-        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", stderr)
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", video_line)
         fps = float(fps_match.group(1)) if fps_match else 0.0
         audio_match = re.search(r"Stream.*Audio:\s*([a-zA-Z0-9_]+)", stderr)
         acodec = audio_match.group(1).lower() if audio_match else None
@@ -415,8 +419,8 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
             "has_audio": has_audio,
             "pix_fmt": None,
             "audio_sample_rate": 0,
-            "video_duration": round(duration, 4) if has_video else 0.0,
-            "audio_duration": round(duration, 4) if has_audio else 0.0,
+            "video_duration": 0.0,
+            "audio_duration": 0.0,
             "error": None if valid else (ffprobe_err or "unreadable media"),
         }
     except FileNotFoundError:
@@ -430,15 +434,14 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
             try:
                 if cap.isOpened():
                     ok_frame, frame = cap.read()
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-                    if ok_frame and frame is not None and (w <= 0 or h <= 0):
-                        h, w = frame.shape[:2]
+                    if not ok_frame or frame is None:
+                        return _empty_media_info(file_path, error="OpenCV could not decode a video frame")
+                    h, w = frame.shape[:2]
                     raw_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
                     fps = raw_fps if (math.isfinite(raw_fps) and 0.1 <= raw_fps <= 240.0) else 0.0
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                    duration = (frame_count / fps) if (frame_count > 0 and fps > 0) else 0.0
-                    if ok_frame and w > 0 and h > 0 and duration > 0.0:
+                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    duration = frame_count / fps if math.isfinite(frame_count) and frame_count > 0 and fps > 0 else 0.0
+                    if w > 0 and h > 0 and duration > 0.0:
                         return {
                             "valid": True,
                             "exists": True,
@@ -447,11 +450,11 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
                             "width": w,
                             "height": h,
                             "fps": round(fps, 4),
-                            "video_codec": "mp4v",
+                            "video_codec": None,
                             "audio_codec": None,
                             "has_video": True,
                             "has_audio": False,
-                            "pix_fmt": "yuv420p",
+                            "pix_fmt": None,
                             "audio_sample_rate": 0,
                             "video_duration": round(duration, 4),
                             "audio_duration": 0.0,
@@ -459,9 +462,9 @@ def probe_media(path, ffprobe_bin=None, ffmpeg_bin=None, timeout=30):
                         }
             finally:
                 cap.release()
-        except Exception:
-            pass
-        return _empty_media_info(file_path, error=ffprobe_err or "ffmpeg and ffprobe not found")
+        except Exception as e:
+            return _empty_media_info(file_path, error=f"Video probe binaries unavailable and OpenCV probe failed: {e}")
+        return _empty_media_info(file_path, error="Video probe binaries unavailable and OpenCV found no timed video")
     except Exception as e:
         return _empty_media_info(file_path, error=ffprobe_err or str(e))
 
@@ -564,20 +567,29 @@ def validate_media_output(
 
     if decode_check:
         ff_exe = ffmpeg_bin or shutil.which("ffmpeg") or "ffmpeg"
-        # Decode up to first 10 seconds (or full short clip) to catch bitstream corruption
-        check_cmd = [
-            ff_exe, "-v", "error", "-xerror",
-            "-i", str(path), "-t", "10", "-f", "null", "-",
-        ]
+        maps = []
+        if info["has_video"]:
+            maps.extend(["-map", "0:V:0"])
+        if info["has_audio"]:
+            maps.extend(["-map", "0:a:0"])
+        # Check both ends of an export without decoding the entire video again.
+        samples = [(0, 10)]
+        if dur > 11:
+            samples.append((dur - 2, 2))
         try:
-            dec = subprocess.run(
-                check_cmd, capture_output=True, text=True, errors="replace", timeout=timeout
-            )
-            if dec.returncode != 0 or (dec.stderr and dec.stderr.strip()):
-                err_tail = (dec.stderr or "").strip()[-240:]
-                return False, info, f"media decode error (rc={dec.returncode}): {err_tail}"
+            for start, length in samples:
+                dec = subprocess.run(
+                    [ff_exe, "-nostdin", "-v", "error", "-xerror", "-ss", str(start),
+                     "-i", str(path), *maps, "-t", str(length), "-abort_on", "empty_output_stream",
+                     "-f", "null", "-"],
+                    capture_output=True, text=True, errors="replace", timeout=timeout,
+                )
+                if dec.returncode != 0 or (dec.stderr and dec.stderr.strip()):
+                    err_tail = (dec.stderr or "").strip()[-240:]
+                    return False, info, f"media decode error at {start:.2f}s (rc={dec.returncode}): {err_tail}"
         except FileNotFoundError:
-            # Verify actual frame decoding via OpenCV when ffmpeg CLI is not installed
+            if info["has_audio"] or require_audio:
+                return False, info, "media decode verification requires FFmpeg for audio"
             try:
                 import cv2  # type: ignore
 
@@ -602,7 +614,8 @@ def check_black_frames(path, duration=None, max_black_ratio=0.95, ffmpeg_bin=Non
     """Detect whether a video is unexpectedly almost entirely black frames.
 
     Returns ``(ok: bool, black_ratio: float)`` where ``ok=False`` indicates
-    black frames exceed ``max_black_ratio``.
+    black frames exceed ``max_black_ratio`` or analysis failed. The ratio is
+    ``None`` when the analysis could not run.
     """
     ff_exe = ffmpeg_bin or shutil.which("ffmpeg") or "ffmpeg"
     if duration is None:
@@ -618,13 +631,15 @@ def check_black_frames(path, duration=None, max_black_ratio=0.95, ffmpeg_bin=Non
             ],
             capture_output=True, text=True, errors="replace", timeout=timeout,
         )
+        if res.returncode != 0:
+            return False, None
         black_total = 0.0
         for m in re.finditer(r"black_duration:\s*([0-9.]+)", res.stderr or ""):
             black_total += float(m.group(1))
         ratio = min(1.0, black_total / float(duration))
         return ratio <= float(max_black_ratio), round(ratio, 4)
-    except Exception:
-        return True, 0.0
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
 
 
 def _swap_nvenc_to_x264(cmd, tier=QUALITY):

@@ -17,9 +17,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -35,7 +37,7 @@ import smartcut
 import subtitles
 import transcribe_backends
 import viral_brain
-from clipmind.core.config import get_config
+from clipmind.core.config import Config, PathSettings, get_config
 from clipmind.generation.clip_pipeline import ClipPipeline
 
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -57,6 +59,180 @@ def _make_real_mp4(path: Path, duration: float = 3.0, size: str = "640x360", wit
     cmd.extend(["-movflags", "+faststart", "-t", f"{duration:.2f}", str(path)])
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
     return path
+
+
+@pytest.fixture
+def isolated_pipeline(tmp_path):
+    paths = PathSettings(output_dir=tmp_path / "output", temp_dir=tmp_path / "temp")
+    return ClipPipeline(config=Config(paths=paths))
+
+
+class TestClipMindSourceIntegrity:
+    def test_explicit_link_failure_is_returned_without_substituting(self, isolated_pipeline, monkeypatch):
+        fail = Mock(side_effect=RuntimeError("Video is private"))
+        fallback = Mock(side_effect=AssertionError("Unexpected fallback"))
+        monkeypatch.setattr(isolated_pipeline, "extract_from_youtube", fail)
+        monkeypatch.setattr(isolated_pipeline, "generate_from_ai_script", fallback)
+        with pytest.raises(RuntimeError, match="Video is private"):
+            isolated_pipeline.generate_clip("Example", youtube_url="https://youtu.be/dQw4w9WgXcQ")
+        fail.assert_called_once()
+        fallback.assert_not_called()
+
+    def test_interrupted_download_resumes_and_uses_probed_duration(self, isolated_pipeline, monkeypatch):
+        attempts = []
+
+        def extract(url, download):
+            options = ydl_factory.call_args.args[0]
+            staged = Path(options["outtmpl"].replace("%(ext)s", "mp4"))
+            part = staged.with_suffix(".mp4.part")
+            attempts.append(staged)
+            assert download is True
+            assert options["continuedl"] and options["noplaylist"]
+            assert not options["skip_unavailable_fragments"]
+            assert not options.get("nocheckcertificate")
+            if len(attempts) == 1:
+                part.write_bytes(b"partial transfer")
+                raise TimeoutError("connection timed out")
+            assert part.exists()
+            staged.write_bytes(b"download bytes")
+            return {"duration": 120, "id": "dQw4w9WgXcQ", "live_status": "was_live"}
+
+        fake_ydl = MagicMock()
+        fake_ydl.__enter__.return_value.extract_info.side_effect = extract
+        ydl_factory = Mock(return_value=fake_ydl)
+        monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=ydl_factory))
+        monkeypatch.setattr(security_utils, "assert_public_url", lambda url: url)
+        monkeypatch.setattr(time, "sleep", Mock())
+        monkeypatch.setattr(isolated_pipeline, "get_media_info", lambda path: {
+            "valid": True, "has_video": True, "has_audio": True,
+            "duration": 97.5, "video_duration": 97,
+        })
+
+        target = isolated_pipeline.temp_dir / "source.mp4"
+        info = isolated_pipeline._download_youtube_video("https://youtu.be/dQw4w9WgXcQ", target)
+        assert attempts[0] == attempts[1]
+        assert not attempts[0].parent.exists()
+        assert target.read_bytes() == b"download bytes"
+        assert info["duration"] == 97
+
+    @pytest.mark.parametrize("extension", ["mp4", "webm"])
+    def test_audio_or_remux_failure_leaves_existing_target_alone(self, isolated_pipeline, monkeypatch, extension):
+        def extract(url, download):
+            options = factory.call_args.args[0]
+            Path(options["outtmpl"].replace("%(ext)s", extension)).write_bytes(b"new download")
+            return {"duration": 97}
+
+        fake_ydl = MagicMock()
+        fake_ydl.__enter__.return_value.extract_info.side_effect = extract
+        factory = Mock(return_value=fake_ydl)
+        monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=factory))
+        monkeypatch.setattr(security_utils, "assert_public_url", lambda url: url)
+        monkeypatch.setattr(isolated_pipeline, "get_media_info", lambda path: {
+            "valid": True, "has_video": True, "has_audio": False,
+        })
+        monkeypatch.setattr(subprocess, "run", Mock(side_effect=subprocess.CalledProcessError(
+            1, ["ffmpeg"], stderr="remux failed",
+        )))
+        target = isolated_pipeline.temp_dir / "source.mp4"
+        target.write_bytes(b"previous job")
+
+        reason = "no usable audio stream" if extension == "mp4" else "remux failed"
+        with pytest.raises(RuntimeError, match=reason):
+            isolated_pipeline._download_youtube_video("https://youtu.be/dQw4w9WgXcQ", target)
+        factory.assert_called_once()
+        assert list(target.parent.iterdir()) == [target]
+        assert target.read_bytes() == b"previous job"
+
+    def test_replay_peak_at_end_keeps_complete_window_and_no_invented_hook(self, isolated_pipeline):
+        start, end, hook = isolated_pipeline._detect_peak_engagement_window(
+            {"heatmap": [{"start_time": 7110, "end_time": 7200, "value": 0.95}]},
+            total_duration=7200,
+        )
+        assert end == 7200
+        assert end - start == 52
+        assert hook == ""
+
+    def test_caption_window_rebases_only_overlapping_source_text(self, isolated_pipeline, monkeypatch):
+        api = MagicMock()
+        api.return_value.fetch.return_value.to_raw_data.return_value = [
+            {"start": 8.0, "duration": 2.0, "text": "Previous caption"},
+            {"start": 9.5, "duration": 2.0, "text": "नमस्ते world"},
+            {"start": 59.0, "duration": 4.0, "text": "Closing"},
+            {"start": 62.0, "duration": 3.0, "text": "Next clip"},
+        ]
+        monkeypatch.setitem(sys.modules, "youtube_transcript_api", SimpleNamespace(YouTubeTranscriptApi=api))
+        info = {"id": "dQw4w9WgXcQ", "language": "hi"}
+        result = isolated_pipeline._get_transcript_for_window(info, Path("source.mp4"), 10.0, 52.0)
+        assert result["segments"] == [
+            {"start": 0.0, "end": 1.5, "text": "नमस्ते world"},
+            {"start": 49.0, "end": 52.0, "text": "Closing"},
+        ]
+        api.return_value.fetch.assert_called_once_with(info["id"], languages=["hi", "en"])
+
+    def test_ass_drops_fully_overlapped_and_sub_centisecond_cues(self, isolated_pipeline):
+        output = isolated_pipeline.temp_dir / "captions.ass"
+        isolated_pipeline.create_styled_ass_subtitles([
+            {"start": 0, "end": 2, "text": "नमस्ते world"},
+            {"start": 1, "end": 1.5, "text": "stale duplicate"},
+            {"start": 3.001, "end": 3.003, "text": "too short"},
+            {"start": 3, "end": 7, "text": "clip end"},
+        ], output, duration=5)
+        dialogues = [line for line in output.read_text(encoding="utf-8-sig").splitlines()
+                     if line.startswith("Dialogue:")]
+        assert len(dialogues) == 2
+        assert "0:00:00.00,0:00:02.00" in dialogues[0] and "नमस्ते WORLD" in dialogues[0]
+        assert "0:00:03.00,0:00:05.00" in dialogues[1] and "CLIP END" in dialogues[1]
+
+    @requires_ffmpeg
+    def test_youtube_window_renders_valid_vertical_h264_aac(self, isolated_pipeline, monkeypatch):
+        def download(url, path):
+            _make_real_mp4(path, duration=47, size="320x180")
+            return {"duration": 47.0, "title": "Local video fixture"}
+
+        captions = {"segments": [{"start": 1.0, "end": 3.0, "text": "First caption"}]}
+        monkeypatch.setattr(isolated_pipeline, "_download_youtube_video", download)
+        monkeypatch.setattr(isolated_pipeline, "_get_transcript_for_window", Mock(return_value=captions))
+        result = isolated_pipeline.extract_from_youtube("Test", "https://youtu.be/dQw4w9WgXcQ", "fixture")
+        assert result.duration == pytest.approx(47, abs=0.1)
+        assert result.resolution == (1080, 1920)
+        assert result.metadata["extracted_range"] == (0.0, 47.0)
+        assert "0:00:01.00,0:00:03.00" in result.subtitles_path.read_text(encoding="utf-8-sig")
+        media = isolated_pipeline.get_media_info(result.video_path)
+        assert (media["video_codec"], media["audio_codec"], media["fps"]) == ("h264", "aac", 30)
+        assert abs(media["video_duration"] - media["audio_duration"]) < 0.1
+
+    def test_failed_cycle_render_does_not_write_placeholder(self, isolated_pipeline, monkeypatch):
+        from clipmind.orchestrator import MasterOrchestrator
+        from clipmind.safety.moderator import SafetyModerator
+
+        config = isolated_pipeline.config
+        config.scheduling.max_retries_per_cycle = 1
+        monkeypatch.setattr("clipmind.core.config._CONFIG_INSTANCE", config)
+        runner = MasterOrchestrator(config=config)
+        runner.safety = SafetyModerator()
+        fail = Mock(side_effect=RuntimeError("encoder failed"))
+        monkeypatch.setattr("clipmind.generation.clip_pipeline.generate_clip", fail)
+        cycle = Mock()
+        with pytest.raises(RuntimeError, match="encoder failed"):
+            runner.run_stage_generate_and_edit(cycle, "Test topic", "fixture")
+        assert not list(isolated_pipeline.output_dir.rglob("*.mp4"))
+        assert cycle.finish_step.call_args.kwargs["status"] == "FAILED"
+
+    def test_tts_failure_does_not_return_tone_or_missing_file(self, isolated_pipeline, monkeypatch):
+        class FailedTTS:
+            def __init__(self, text, voice):
+                pass
+
+            async def save(self, path):
+                Path(path).write_bytes(b"incomplete audio")
+                raise OSError("voice service offline")
+
+        monkeypatch.setattr("clipmind.generation.clip_pipeline.get_active_key", lambda service: None)
+        monkeypatch.setitem(sys.modules, "edge_tts", SimpleNamespace(Communicate=FailedTTS))
+        target = isolated_pipeline.temp_dir / "voice.mp3"
+        with pytest.raises(RuntimeError, match="voice service offline"):
+            isolated_pipeline._synthesize_voiceover("This is the narration.", target)
+        assert not target.exists()
 
 
 # ==============================================================================
@@ -160,6 +336,24 @@ class TestInvalidMediaAndOutputValidation:
         assert info["duration"] == 0.0
         assert reason
 
+    def test_output_validation_checks_tail_decode(self, tmp_path, monkeypatch):
+        info = {
+            **ffmpeg_utils._empty_media_info(tmp_path / "export.mp4"),
+            "valid": True, "exists": True, "size_bytes": 1000, "duration": 50.0,
+            "width": 1080, "height": 1920, "fps": 30, "has_video": True,
+        }
+        monkeypatch.setattr(ffmpeg_utils, "probe_media", Mock(return_value=info))
+        decode = Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, stderr=""),
+            subprocess.CompletedProcess([], 1, stderr="Invalid NAL unit"),
+        ])
+        monkeypatch.setattr(subprocess, "run", decode)
+        ok, _, reason = ffmpeg_utils.validate_media_output("export.mp4", decode_check=True)
+        assert not ok
+        assert "48.00s" in reason and "Invalid NAL unit" in reason
+        assert decode.call_count == 2
+        assert "empty_output_stream" in decode.call_args.args[0]
+
     def test_zero_byte_and_missing_files_rejected(self, tmp_path):
         empty = tmp_path / "empty.mp4"
         empty.write_bytes(b"")
@@ -239,6 +433,33 @@ class TestInvalidMediaAndOutputValidation:
 # 3. Long videos, silence, and missing speech
 # ==============================================================================
 class TestLongVideosAndSilence:
+    def test_audio_watchdog_stops_process_blocked_before_stdout(self, monkeypatch):
+        real_popen = subprocess.Popen
+        processes = []
+
+        def blocked_decoder(command, **kwargs):
+            process = real_popen([sys.executable, "-c", "import time; time.sleep(15)"], **kwargs)
+            processes.append(process)
+            return process
+
+        monkeypatch.setattr(subprocess, "Popen", blocked_decoder)
+        start = time.perf_counter()
+        energy, duration = highlight_detector.extract_audio_energy("stalled.mp4", timeout=0.25)
+        assert time.perf_counter() - start < 5
+        assert processes[0].poll() is not None
+        assert energy.size == 0 and duration == 0
+
+    def test_failed_decoder_discards_partial_audio_energy(self, monkeypatch):
+        real_popen = subprocess.Popen
+
+        def corrupt_decoder(command, **kwargs):
+            code = "import sys; sys.stdout.buffer.write(bytes(8000)); sys.stderr.write('bad frame'); sys.exit(1)"
+            return real_popen([sys.executable, "-c", code], **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", corrupt_decoder)
+        energy, duration = highlight_detector.extract_audio_energy("corrupt.mp4")
+        assert energy.size == 0 and duration == 0
+
     def test_highlight_detector_rejects_pure_silence_and_noise_floor(self):
         # Tiny -90dB numerical noise must NOT generate fake hype clips
         rng = np.random.default_rng(42)
@@ -307,6 +528,14 @@ class TestLongVideosAndSilence:
 # 4. Clip duration boundaries, sentence snapping, and viral scoring
 # ==============================================================================
 class TestClipSelectionAndViralScoring:
+    def test_heuristic_keeps_valid_single_segment_and_rejects_oversized_window(self):
+        main = pytest.importorskip("main")
+        segments = {"segments": [{"start": 6.0, "end": 30.0, "text": "Here is why the fix works."}]}
+        clips = main._heuristic_transcript_clips(segments, 120.0, min_secs=24, max_secs=24)
+        assert [(clip["start"], clip["end"]) for clip in clips] == [(6.0, 30.0)]
+        segments["segments"][0]["end"] = 120.0
+        assert main._heuristic_transcript_clips(segments, 120.0, min_secs=20, max_secs=30) == []
+
     def test_clipmind_constraints_stay_separate_from_general_bounds(self, monkeypatch, tmp_path):
         monkeypatch.setenv("CLIP_MIN_SECONDS", "15")
         monkeypatch.setenv("CLIP_MAX_SECONDS", "90")

@@ -424,13 +424,11 @@ class ClipPipeline:
         prev_end = 0.0
         for seg in segments:
             text = seg.get("text", "").strip()
-            if not text:
+            if not text or not all(math.isfinite(seg[key]) for key in ("start", "end")):
                 continue
             s_t = max(prev_end, max(0.0, float(seg["start"])))
             e_t = min(duration, float(seg["end"]))
-            if e_t <= s_t:
-                e_t = min(duration, s_t + 0.25)
-            if e_t <= s_t:
+            if round(e_t * 100) <= round(s_t * 100):
                 continue
             normalized_segments.append({"start": s_t, "end": e_t, "text": text})
             prev_end = e_t
@@ -499,10 +497,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         download_path = self.temp_dir / f"{cycle_prefix}source.mp4"
         info = self._download_youtube_video(target_url, download_path)
         
-        source_duration = float(info.get("duration", 0.0))
-        if source_duration <= 0.0:
-            probe = self.get_media_info(download_path)
-            source_duration = probe["duration"]
+        source_duration = info["duration"]
 
         if source_duration < self.min_duration:
             raise ValueError(f"Source video too short ({source_duration:.1f}s < {self.min_duration}s)")
@@ -510,12 +505,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # 3. Peak engagement window detection
         start_sec, end_sec, hook_text = self._detect_peak_engagement_window(
             info=info,
-            video_path=download_path,
             total_duration=source_duration,
-            topic=topic,
         )
 
-        target_duration = max(self.min_duration, min(self.max_duration, end_sec - start_sec))
+        target_duration = end_sec - start_sec
 
         # 4. Transcribe or fetch captions for the segment
         transcript_data = self._get_transcript_for_window(
@@ -523,15 +516,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             video_path=download_path,
             start_sec=start_sec,
             duration=target_duration,
-            fallback_text=hook_text or topic,
         )
 
         # 5. Burn subtitles & apply 9:16 reframe + loudnorm
         output_clip_path = self.output_dir / f"{cycle_prefix}final.mp4"
-        ass_sub_path = self.temp_dir / f"{cycle_prefix}subs.ass"
-        self.create_styled_ass_subtitles(transcript_data, ass_sub_path, duration=target_duration)
+        ass_sub_path = None
+        if transcript_data["segments"]:
+            ass_sub_path = self.temp_dir / f"{cycle_prefix}subs.ass"
+            self.create_styled_ass_subtitles(transcript_data, ass_sub_path, duration=target_duration)
 
-        self._render_ffmpeg_vertical_cut(
+        rendered = self._render_ffmpeg_vertical_cut(
             input_video=download_path,
             output_video=output_clip_path,
             start_sec=start_sec,
@@ -541,13 +535,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         return ClipResult(
             video_path=output_clip_path,
-            duration=target_duration,
+            duration=rendered["duration"],
             aspect_ratio="9:16",
-            resolution=(1080, 1920),
+            resolution=(rendered["width"], rendered["height"]),
             strategy_used=GenerationStrategy.YOUTUBE_EXTRACT.value,
             hook_text=hook_text,
             subtitles_path=ass_sub_path,
-            transcript=transcript_data if isinstance(transcript_data, dict) else {"text": str(transcript_data)},
+            transcript=transcript_data,
             audio_lufs=self.target_lufs,
             metadata={
                 "source_url": target_url,
@@ -603,121 +597,142 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         except ImportError:
             raise RuntimeError("yt-dlp is not installed; cannot download YouTube video")
 
-        try:
-            from security_utils import assert_public_url, normalize_media_url
-            url = normalize_media_url(url)
-            assert_public_url(url)
-        except ImportError:
-            url = str(url or "").strip()
-            if not url:
-                raise ValueError("Empty YouTube URL")
+        from security_utils import assert_public_url
+
+        url = assert_public_url(url)
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         non_retryable_tokens = (
             "private video", "video unavailable", "this video has been removed",
             "sign in to confirm your age", "age-restricted", "not available in your country",
             "geo-restricted", "members-only", "copyright", "is not a valid url",
-            "unsupported url", "premieres in", "this live event will begin",
+            "unsupported url", "premieres in", "this live event will begin", "no usable audio stream",
+            "active live stream", "no video stream",
         )
+        attempts = max(1, int(max_retries))
+        reported = {}
+
+        def report_progress(status):
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            if status.get("status") == "downloading" and total:
+                file = status.get("filename")
+                percent = min(100, int(100 * (status.get("downloaded_bytes") or 0) / total))
+                bucket = percent // 10
+                if bucket > reported.get(file, -1):
+                    reported[file] = bucket
+                    logger.info("Source download: %d%%", bucket * 10)
+
+        def reject_live(info, *, incomplete):
+            if info.get("is_live") or info.get("live_status") == "is_live":
+                return "An active live stream must finish before it can be clipped here."
+            return None
 
         ydl_opts = {
             "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "outtmpl": str(target_path.with_suffix(".%(ext)s")),
             "merge_output_format": "mp4",
+            "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
             "overwrites": False,
             "continuedl": True,
             "retries": 3,
             "fragment_retries": 3,
+            "skip_unavailable_fragments": False,
             "socket_timeout": 30,
-            "nocheckcertificate": True,
             "cachedir": False,
+            "progress_hooks": [report_progress],
+            "match_filter": reject_live,
         }
 
         last_err: Optional[Exception] = None
-        for attempt in range(1, max(1, int(max_retries)) + 1):
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-
-                actual_file = target_path.with_suffix(".mp4")
-                if not actual_file.exists():
-                    for ext in (".mkv", ".webm", ".mov"):
-                        alt = target_path.with_suffix(ext)
-                        if alt.exists() and alt.stat().st_size > 0:
-                            remux = subprocess.run(
-                                [
-                                    self.ffmpeg_bin, "-y", "-loglevel", "error",
-                                    "-i", str(alt), "-c", "copy", "-movflags", "+faststart",
-                                    str(actual_file),
-                                ],
-                                capture_output=True, text=True, errors="replace", timeout=300,
-                            )
-                            if remux.returncode == 0 and actual_file.exists():
-                                alt.unlink(missing_ok=True)
-                            else:
-                                alt.replace(actual_file)
-                            break
-
-                if not actual_file.exists() or actual_file.stat().st_size == 0:
-                    raise FileNotFoundError(f"yt-dlp downloaded file missing or empty at {actual_file}")
-
-                media_info = self.get_media_info(actual_file)
-                if not media_info.get("valid") or not media_info.get("has_video"):
-                    actual_file.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"Downloaded file failed validation ({media_info.get('error') or 'no video stream'})"
-                    )
-                return info or {}
-            except Exception as e:
-                last_err = e
-                msg_l = str(e).lower()
-                if any(tok in msg_l for tok in non_retryable_tokens) or attempt >= max_retries:
-                    break
-                backoff = min(10.0, 2.0 ** attempt)
-                logger.warning(f"yt-dlp attempt {attempt}/{max_retries} failed ({e}); retrying in {backoff:.1f}s")
-                time.sleep(backoff)
-
-        # Clean up any partial artifacts on fatal failure
-        for suffix in (".mp4", ".part", ".ytdl", ".mkv", ".webm"):
-            p = target_path.with_suffix(suffix)
-            if p.exists():
+        # The same staging directory is used for retries so yt-dlp can resume.
+        # A previous job's similarly named file never becomes this job's source.
+        with tempfile.TemporaryDirectory(prefix="clipmind-download-", dir=target_path.parent) as staging:
+            download_dir = Path(staging)
+            ydl_opts["outtmpl"] = str(download_dir / "source.%(ext)s")
+            for attempt in range(1, attempts + 1):
                 try:
-                    p.unlink()
-                except OSError:
-                    pass
-        raise RuntimeError(f"YouTube download failed for {url}: {last_err}") from last_err
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    if not info:
+                        raise ValueError("No downloadable video was returned. Check the URL and live status.")
+                    if reason := reject_live(info, incomplete=False):
+                        raise ValueError(reason)
+                    mp4 = download_dir / "source.mp4"
+                    if not mp4.is_file():
+                        alt = next((p for p in download_dir.iterdir()
+                                    if p.is_file() and p.stem == "source" and p.suffix in
+                                    (".mkv", ".webm", ".mov")), None)
+                        if alt is None:
+                            raise FileNotFoundError("yt-dlp did not produce a completed download.")
+                        remuxed = download_dir / "remuxed.mp4"
+                        subprocess.run(
+                            [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-i", str(alt),
+                             "-map", "0:V:0", "-map", "0:a:0?", "-c", "copy", str(remuxed)],
+                            capture_output=True, text=True, errors="replace", timeout=300, check=True,
+                        )
+                        mp4 = remuxed
+
+                    media = self.get_media_info(mp4)
+                    if not media["valid"] or not media["has_video"]:
+                        mp4.unlink(missing_ok=True)
+                        raise RuntimeError(f"Downloaded file has no video stream: {media.get('error') or 'unreadable video'}")
+                    if not media["has_audio"]:
+                        raise RuntimeError("Downloaded video has no usable audio stream.")
+                    mp4.replace(target_path)
+                    return {**info, "duration": media["video_duration"] or media["duration"]}
+                except (ValueError, subprocess.CalledProcessError) as e:
+                    last_err = e
+                    break
+                except Exception as e:
+                    last_err = e
+                    if any(token in str(e).lower() for token in non_retryable_tokens) or attempt == attempts:
+                        break
+                    backoff = min(10.0, 2.0 ** attempt)
+                    logger.warning("Source download attempt %d/%d failed: %s. Retrying in %.1fs.",
+                                   attempt, attempts, type(e).__name__, backoff)
+                    time.sleep(backoff)
+        detail = str(last_err)
+        if isinstance(last_err, subprocess.CalledProcessError) and last_err.stderr:
+            detail = last_err.stderr.strip()[-300:]
+        raise RuntimeError(f"YouTube download failed: {detail}") from last_err
 
     def _detect_peak_engagement_window(
         self,
         info: Dict[str, Any],
-        video_path: Path,
         total_duration: float,
-        topic: str,
     ) -> Tuple[float, float, str]:
-        """Calculate the 45-58s window containing the strongest retention hook (0-3s)."""
-        target_span = 52.0  # Ideal target duration
-        if total_duration <= target_span:
-            return 0.0, total_duration, f"Shocking Truth About {topic}"
+        """Prefer actual replay peaks and use chapter boundaries for context."""
+        span = min(total_duration, self.max_duration, max(self.min_duration, 52.0))
+        last_start = total_duration - span
+        peaks = []
+        for sample in info.get("heatmap") or []:
+            try:
+                start = float(sample["start_time"])
+                end = float(sample["end_time"])
+                weight = float(sample["value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= start < end <= total_duration and 0 < weight <= 1:
+                peaks.append((weight, (start + end) / 2))
 
-        # 1. Check if heatmap / chapters available in info
-        chapters = info.get("chapters") or []
-        for ch in chapters:
-            title = str(ch.get("title", "")).lower()
-            start = float(ch.get("start_time", 0.0))
-            end = float(ch.get("end_time", 0.0))
-            if any(k in title for k in ["hook", "secret", "best", "climax", "truth", "reveal"]):
-                if (end - start) >= self.min_duration:
-                    return start, min(total_duration, start + target_span), ch.get("title", "")
-
-        # 2. Heuristic selection: Avoid first 5% (channel intro) and select around 15-25% mark
-        safe_start = max(5.0, total_duration * 0.15)
-        if safe_start + target_span > total_duration:
-            safe_start = max(0.0, total_duration - target_span)
-
-        hook_text = f"The Insane Truth About {topic} You Never Knew!"
-        return round(safe_start, 2), round(safe_start + target_span, 2), hook_text
+        peak = max(peaks, key=lambda sample: sample[0])[1] if peaks else None
+        proposed_start = peak - 6.0 if peak is not None else total_duration * 0.15
+        start = min(last_start, max(0.0, proposed_start))
+        chapter_title = ""
+        for chapter in info.get("chapters") or []:
+            try:
+                left = float(chapter["start_time"])
+                right = float(chapter["end_time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= left <= last_start and right - left >= span and abs(left - start) <= 5.0:
+                if peak is not None and not left <= peak <= left + span:
+                    continue
+                start = left
+                chapter_title = str(chapter.get("title") or "").strip()
+                break
+        return start, start + span, chapter_title
 
     def _get_transcript_for_window(
         self,
@@ -725,28 +740,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_path: Path,
         start_sec: float,
         duration: float,
-        fallback_text: str,
-    ) -> Union[Dict[str, Any], str]:
-        """Fetch transcript segments for the window via youtube_transcript_api or fallback."""
+    ) -> Dict[str, Any]:
+        """Use supplied captions or transcribe just the audio selected for the clip."""
         video_id = info.get("id")
         if video_id:
             try:
+                import requests
                 from youtube_transcript_api import YouTubeTranscriptApi
-                transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-                # Filter for segments overlapping our window
+
+                with requests.Session() as session:
+                    # youtube-transcript-api otherwise uses requests without a timeout.
+                    from functools import partial
+                    session.request = partial(session.request, timeout=10)
+                    languages = list(dict.fromkeys([info.get("language") or "en", "en"]))
+                    transcript_list = YouTubeTranscriptApi(http_client=session).fetch(
+                        video_id, languages=languages,
+                    ).to_raw_data()
                 window_end = start_sec + duration
                 matched_segs = []
                 for item in transcript_list:
                     item_start = item["start"]
-                    item_dur = item.get("duration", 2.0)
-                    item_end = item_start + item_dur
-                    if item_end >= start_sec and item_start <= window_end:
-                        # Normalize timestamp relative to 0.0
-                        rel_start = max(0.0, item_start - start_sec)
-                        rel_end = min(duration, item_end - start_sec)
+                    item_end = item_start + item["duration"]
+                    if item_end > start_sec and item_start < window_end and item_end > item_start:
                         matched_segs.append({
-                            "start": round(rel_start, 2),
-                            "end": round(rel_end, 2),
+                            "start": max(0.0, item_start - start_sec),
+                            "end": min(duration, item_end - start_sec),
                             "text": item.get("text", "")
                         })
                 if matched_segs:
@@ -754,8 +772,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             except Exception as e:
                 logger.debug(f"YouTube transcript extraction skipped/failed: {e}")
 
-        # Fallback to high-retention structured text
-        return fallback_text
+        try:
+            from transcribe_backends import transcribe_media
+
+            with tempfile.TemporaryDirectory(dir=self.temp_dir) as staging:
+                wav = Path(staging) / "clip.wav"
+                subprocess.run(
+                    [self.ffmpeg_bin, "-nostdin", "-v", "error", "-ss", f"{start_sec:.6f}",
+                     "-i", str(video_path), "-t", f"{duration:.6f}", "-map", "0:a:0",
+                     "-ac", "1", "-ar", "16000", str(wav)],
+                    capture_output=True, check=True, timeout=60,
+                )
+                return transcribe_media(wav)
+        except Exception as e:
+            logger.warning("Clip captions unavailable: %s", e)
+            return {"segments": []}
 
     # -----------------------------------------------------------------------
     # Priority 2: Text-to-Video / AI Narration Script Fallback
@@ -887,7 +918,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         f.write(resp.content)
                     probe = self.get_media_info(output_path)
                     dur = probe["duration"]
-                    if dur > 0:
+                    if probe["valid"] and probe["has_audio"] and dur > 0:
                         logger.info(f"ElevenLabs TTS succeeded ({dur:.1f}s)")
                         return output_path, dur
                 elif resp.status_code in (401, 403, 429):
@@ -904,28 +935,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 communicate = edge_tts.Communicate(text, voice)
                 await communicate.save(str(output_path))
 
-            asyncio.run(_run_edge())
+            output_path.unlink(missing_ok=True)
+            asyncio.run(asyncio.wait_for(_run_edge(), timeout=60))
             probe = self.get_media_info(output_path)
             dur = probe["duration"]
-            if dur > 0:
+            if probe["valid"] and probe["has_audio"] and dur > 0:
                 logger.info(f"Edge-TTS synthesized speech ({dur:.1f}s)")
                 return output_path, dur
+            raise RuntimeError("Edge-TTS returned no playable audio.")
         except Exception as e:
-            logger.warning(f"Edge-TTS synthesis failed: {e}")
-
-        # 3. Fallback: Generate synthetic speech or silent audio track using FFmpeg
-        dur = 50.0
-        cmd = [
-            self.ffmpeg_bin, "-y", "-f", "lavfi",
-            "-i", f"sine=frequency=440:duration={dur}",
-            "-af", "volume=0.01",
-            str(output_path)
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            return output_path, dur
-        except Exception:
-            return output_path, dur
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError(f"No narration was generated: {e}") from e
 
     def _acquire_or_generate_broll(self, topic: str, duration: float, cycle_prefix: str) -> Path:
         """Fetch stock video via Pexels or dynamically render high-contrast 9:16 background."""
@@ -1148,7 +1168,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start_sec: float,
         duration: float,
         ass_subtitles_path: Optional[Path] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Cut, reframe to 9:16 (1080x1920), burn subtitles, and normalize audio to -14 LUFS."""
         output_video.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1167,10 +1187,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         af_str = f"loudnorm={self.loudnorm_filter}"
 
         cmd = [
-            self.ffmpeg_bin, "-y",
-            "-ss", f"{start_sec:.2f}",
-            "-t", f"{duration:.2f}",
+            self.ffmpeg_bin, "-nostdin", "-y",
+            "-ss", f"{start_sec:.6f}",
             "-i", str(input_video),
+            "-t", f"{duration:.6f}",
+            "-map", "0:V:0", "-map", "0:a:0",
             "-vf", vf_str,
             "-af", af_str,
             "-c:v", "libx264",
@@ -1185,21 +1206,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ]
 
         logger.info(f"Executing FFmpeg vertical cut: start={start_sec:.2f}s, dur={duration:.2f}s")
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, errors="replace", timeout=600,
-        )
-        if res.returncode != 0:
-            logger.warning(f"FFmpeg render returned code {res.returncode}: {(res.stderr or '')[-300:]}")
-            self._fallback_render_direct(input_video, output_video, start_sec, duration)
-        self.validate_clip_output(
-            output_video,
-            expected_duration=duration,
-            duration_tolerance=2.5,
-            expected_resolution=(1080, 1920),
-            require_audio=False,
-            decode_check=True,
-        )
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", timeout=600,
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"FFmpeg vertical render failed (rc={res.returncode}): {(res.stderr or '')[-300:]}")
+            return self.validate_clip_output(
+                output_video,
+                expected_duration=duration,
+                duration_tolerance=0.5,
+                require_audio=True,
+            )
+        except Exception:
+            output_video.unlink(missing_ok=True)
+            raise
 
     def _composite_video_with_audio(
         self,
@@ -1280,28 +1301,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             require_audio=True,
             decode_check=True,
         )
-
-    def _fallback_render_direct(self, in_v: Path, out_v: Path, start: float, dur: float) -> None:
-        """Simplified direct FFmpeg transcode if complex filter graphs encounter codec issues."""
-        cmd = [
-            self.ffmpeg_bin, "-y",
-            "-ss", f"{start:.2f}",
-            "-t", f"{dur:.2f}",
-            "-i", str(in_v),
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            str(out_v)
-        ]
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, errors="replace", timeout=600,
-        )
-        if res.returncode != 0:
-            if out_v.exists():
-                out_v.unlink(missing_ok=True)
-            raise RuntimeError(f"Direct FFmpeg fallback render failed (rc={res.returncode}): {(res.stderr or '')[-300:]}")
 
     def _create_simulated_video_file(self, target_path: Path, duration: float = 50.0) -> Path:
         """Generate a lightweight, genuinely playable vertical MP4 for simulation / dry-run.
@@ -1439,7 +1438,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         1. Priority 1 (YouTube download & 45-58s viral cut)
         2. Priority 2 (Text-to-Video AI narration & B-roll)
         3. Priority 3 (Image slideshow & AI voiceover)
-        4. Simulation / Dry-run fallback
+        Simulation is available in explicit dry-run mode.
         """
         logger.info(f"=== Starting ClipMind Video Pipeline for: '{topic}' ===")
 
@@ -1460,83 +1459,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 metadata={"dry_run": True, "topic": topic},
             )
 
-        tried: set[str] = set()
+        if youtube_url or source_type == GenerationStrategy.YOUTUBE_EXTRACT.value:
+            return self.extract_from_youtube(topic=topic, youtube_url=youtube_url, cycle_id=cycle_id)
 
-        # Explicit strategy request (never re-attempt the same tier in the fallback ladder)
-        if source_type == GenerationStrategy.YOUTUBE_EXTRACT.value or youtube_url:
-            tried.add(GenerationStrategy.YOUTUBE_EXTRACT.value)
+        strategies = {
+            GenerationStrategy.YOUTUBE_EXTRACT.value: self.extract_from_youtube,
+            GenerationStrategy.AI_SCRIPT_BROLL.value: self.generate_from_ai_script,
+            GenerationStrategy.SLIDESHOW.value: self.generate_from_slideshow,
+        }
+        if source_type:
+            if source_type not in strategies:
+                raise ValueError(f"Unknown generation strategy: {source_type}")
+            return strategies[source_type](topic=topic, cycle_id=cycle_id)
+        order = list(strategies)
+        if is_serverless():
+            order = order[1:] + order[:1]
+        failures = []
+        last_error = None
+        for strategy in order:
             try:
-                return self.extract_from_youtube(topic=topic, youtube_url=youtube_url, cycle_id=cycle_id)
+                return strategies[strategy](topic=topic, cycle_id=cycle_id)
             except Exception as e:
-                logger.warning(f"Direct YouTube extraction failed ({e}), falling back to AI script")
-
-        elif source_type == GenerationStrategy.AI_SCRIPT_BROLL.value:
-            tried.add(GenerationStrategy.AI_SCRIPT_BROLL.value)
-            try:
-                return self.generate_from_ai_script(topic=topic, cycle_id=cycle_id)
-            except Exception as e:
-                logger.warning(f"AI script pipeline failed ({e}), falling back to slideshow")
-
-        elif source_type == GenerationStrategy.SLIDESHOW.value:
-            tried.add(GenerationStrategy.SLIDESHOW.value)
-            try:
-                return self.generate_from_slideshow(topic=topic, cycle_id=cycle_id)
-            except Exception as e:
-                logger.warning(f"Slideshow generation failed ({e}), using simulation")
-
-        # Fallback Ladder: Tier 1 -> Tier 2 -> Tier 3 -> Simulation
-        if is_serverless() and not youtube_url and not source_type:
-            logger.info("Serverless environment detected: optimizing pipeline for execution time limits")
-            for strat, fn in (
-                (GenerationStrategy.AI_SCRIPT_BROLL.value, self.generate_from_ai_script),
-                (GenerationStrategy.SLIDESHOW.value, self.generate_from_slideshow),
-            ):
-                if strat not in tried:
-                    tried.add(strat)
-                    try:
-                        return fn(topic=topic, cycle_id=cycle_id)
-                    except Exception as e_serv:
-                        logger.warning(f"Serverless {strat} failed: {e_serv}")
-
-        # Tier 1
-        if GenerationStrategy.YOUTUBE_EXTRACT.value not in tried:
-            tried.add(GenerationStrategy.YOUTUBE_EXTRACT.value)
-            try:
-                return self.extract_from_youtube(topic=topic, youtube_url=youtube_url, cycle_id=cycle_id)
-            except Exception as e1:
-                logger.warning(f"Priority 1 (YouTube source) failed: {e1}")
-
-        # Tier 2
-        if GenerationStrategy.AI_SCRIPT_BROLL.value not in tried:
-            tried.add(GenerationStrategy.AI_SCRIPT_BROLL.value)
-            try:
-                return self.generate_from_ai_script(topic=topic, cycle_id=cycle_id)
-            except Exception as e2:
-                logger.warning(f"Priority 2 (AI script / narration) failed: {e2}")
-
-        # Tier 3
-        if GenerationStrategy.SLIDESHOW.value not in tried:
-            tried.add(GenerationStrategy.SLIDESHOW.value)
-            try:
-                return self.generate_from_slideshow(topic=topic, cycle_id=cycle_id)
-            except Exception as e3:
-                logger.warning(f"Priority 3 (Slideshow fallback) failed: {e3}")
-
-        # Tier 4: Robust graceful simulation fallback
-        logger.info("All live rendering tiers exhausted: generating compliant simulation clip")
-        out_path = self.output_dir / f"cycle_{cycle_id or int(time.time())}_fallback.mp4"
-        self._create_simulated_video_file(out_path, duration=50.0)
-        media_info = self.get_media_info(out_path)
-        return ClipResult(
-            video_path=out_path,
-            duration=round(media_info["duration"], 2),
-            aspect_ratio="9:16",
-            resolution=(media_info["width"], media_info["height"]),
-            strategy_used=GenerationStrategy.SIMULATION.value,
-            hook_text=f"The Hidden Secret Behind {topic}",
-            audio_lufs=-14.0,
-            metadata={"fallback_simulation": True, "topic": topic},
-        )
+                last_error = e
+                failures.append(f"{strategy}: {e}")
+                logger.warning("ClipMind strategy %s failed: %s", strategy, e)
+        raise RuntimeError("Clip generation failed: " + "; ".join(failures)) from last_error
 
 
 # Module-level convenience function
