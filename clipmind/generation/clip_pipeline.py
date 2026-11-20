@@ -1322,6 +1322,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ]
 
         last_error = ""
+        ffmpeg_missing = False
         for vcodec_args in codec_attempts:
             cmd = [
                 self.ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
@@ -1352,12 +1353,51 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     decode_check=True,
                 )
                 return target_path
+            except FileNotFoundError as e:
+                ffmpeg_missing = True
+                last_error = str(e)
+                target_path.unlink(missing_ok=True)
+                break
             except subprocess.TimeoutExpired:
                 last_error = f"FFmpeg timed out after 60s generating {duration:.2f}s synthetic video"
                 target_path.unlink(missing_ok=True)
             except Exception as e:
                 last_error = str(e)
                 target_path.unlink(missing_ok=True)
+
+        # When the ffmpeg CLI binary is not installed (e.g. GitHub Actions ubuntu-24.04),
+        # generate a genuinely playable, valid 1080x1920 MP4 using OpenCV's bundled
+        # FFmpeg/libavcodec VideoWriter — never write corrupt/unplayable stub bytes.
+        if ffmpeg_missing:
+            try:
+                import cv2  # type: ignore
+                import numpy as np  # type: ignore
+
+                fps = 1.0
+                n_frames = max(1, int(round(duration * fps)))
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(target_path), fourcc, fps, (1080, 1920))
+                if not writer.isOpened():
+                    raise RuntimeError("OpenCV VideoWriter could not open MP4 output")
+                try:
+                    frame = np.full((1920, 1080, 3), (128, 0, 0), dtype=np.uint8)
+                    for _ in range(n_frames):
+                        writer.write(frame)
+                finally:
+                    writer.release()
+
+                self.validate_clip_output(
+                    target_path,
+                    expected_duration=duration,
+                    duration_tolerance=1.5,
+                    expected_resolution=(1080, 1920),
+                    require_audio=False,
+                    decode_check=True,
+                )
+                return target_path
+            except Exception as cv_err:
+                target_path.unlink(missing_ok=True)
+                last_error = f"{last_error}; OpenCV MP4 fallback failed: {cv_err}"
 
         raise RuntimeError(
             f"Failed to generate valid simulated MP4 at {target_path} (duration={duration:.2f}s): {last_error}"

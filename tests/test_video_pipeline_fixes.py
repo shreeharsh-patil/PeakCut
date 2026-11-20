@@ -118,6 +118,31 @@ class TestSyntheticVideoAndCIFix:
         # Must NOT leave behind a corrupt 44-byte unplayable file
         assert not out.exists()
 
+    def test_simulated_video_works_without_ffmpeg_cli_via_real_opencv_mp4(self, tmp_path, monkeypatch):
+        """Simulates minimal CI (e.g. ubuntu-24.04) where ffmpeg/ffprobe CLI are absent."""
+        cfg = get_config(reload=True)
+        cfg.paths.output_dir = tmp_path / "out"
+        cfg.paths.temp_dir = tmp_path / "tmp"
+        cfg.paths.ensure_directories()
+        pipeline = ClipPipeline(config=cfg)
+
+        def raise_missing(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+        monkeypatch.setattr("clipmind.generation.clip_pipeline.subprocess.run", raise_missing)
+        monkeypatch.setattr(ffmpeg_utils.subprocess, "run", raise_missing)
+
+        out = tmp_path / "no_ffmpeg_sim.mp4"
+        created = pipeline._create_simulated_video_file(out, duration=50.0)
+        assert created.exists()
+        assert created.stat().st_size > 10_000
+
+        info = pipeline.get_media_info(created)
+        assert info["valid"] is True
+        assert 48.5 <= info["duration"] <= 51.5
+        assert info["width"] == 1080
+        assert info["height"] == 1920
+
 
 # ==============================================================================
 # 2. Invalid / corrupt media detection & output validation
