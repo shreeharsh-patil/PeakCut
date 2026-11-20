@@ -26,8 +26,11 @@ import threading
 
 import cv2
 import numpy as np
-from scenedetect import open_video, SceneManager, FrameTimecode
-from scenedetect.detectors import ContentDetector
+try:
+    from scenedetect import open_video, SceneManager, FrameTimecode
+    from scenedetect.detectors import ContentDetector
+except ImportError:
+    open_video = SceneManager = FrameTimecode = ContentDetector = None
 
 
 def _safe_fps(val, default=30.0):
@@ -66,6 +69,8 @@ def detect_scenes(video_path):
 # --- legacy engine ----------------------------------------------------------
 
 def _detect_pyscenedetect(video_path):
+    if open_video is None or SceneManager is None or ContentDetector is None:
+        raise ImportError("scenedetect is not installed")
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
