@@ -33,10 +33,10 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, Response, Upl
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from alerts_dispatcher import AlertDispatcher
-import api_key_rotator
-from creator_workspaces import CreatorWorkspaceManager
 from live_clipper import LiveClipperManager
+import api_key_rotator
+from alerts_dispatcher import AlertDispatcher
+from creator_workspaces import CreatorWorkspaceManager
 from profile_fetcher import check_live_cached, fetch_channel_profile
 from publishing_queue import get_publishing_queue
 from system_telemetry import SystemTelemetry
@@ -46,7 +46,8 @@ logger = logging.getLogger("openshorts.peakcut_bridge")
 router = APIRouter(tags=["PeakCut UI & Bridge"])
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 
-WEB_DIR = Path("web")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+WEB_DIR = (_REPO_ROOT / "web") if (_REPO_ROOT / "web").exists() else Path("web")
 BRAND_DIR = WEB_DIR / "brand"
 def _resolve_bridge_output_dir() -> Path:
     explicit = os.environ.get("OUTPUT_DIR")
@@ -577,7 +578,7 @@ async def serve_media(jid: str, name: str):
 
 
 def _get_ai_status_info() -> Dict[str, Any]:
-    """Helper to detect active AI backend (local Gemma/Ollama on GPU vs Gemini API)."""
+    """Detect active AI backend and verify real Ollama/model readiness when in local mode."""
     import llm_backend
     is_local = (
         llm_backend.active()
@@ -588,14 +589,32 @@ def _get_ai_status_info() -> Dict[str, Any]:
     gemini_key = api_key_rotator.get_gemini_key()
     if is_local:
         model = llm_backend.model_name() or "gemma2:2b"
+        health = llm_backend.check_local_llm_health(model=model, timeout=1.5)
+        is_ready = bool(health.get("ready"))
+        reachable = bool(health.get("reachable"))
+        model_installed = bool(health.get("model_installed"))
+        if is_ready:
+            label = f"Local LLM ({model})"
+            status_str = "local_gpu_active"
+        elif reachable:
+            label = f"Local LLM ({model} not pulled — heuristic fallback)"
+            status_str = "model_missing_heuristic_fallback"
+        else:
+            label = f"Heuristic Fallback (Ollama offline for {model})"
+            status_str = "ollama_offline_heuristic_fallback"
         return {
-            "ready": True,
+            "ready": is_ready,
             "configured": True,
             "provider": "ollama",
             "model": model,
-            "label": f"Local Gemma ({model})",
-            "key_rotation": {"total_keys": 1, "active_key_index": 0, "status": "local_gpu_active"},
-            "key_masked": "local-gpu",
+            "label": label,
+            "ollama_running": reachable,
+            "model_installed": model_installed,
+            "fallback_active": not is_ready,
+            "heuristic_ready": True,
+            "error": health.get("error"),
+            "key_rotation": {"total_keys": 1, "active_key_index": 0, "status": status_str},
+            "key_masked": "local-gpu" if is_ready else "heuristic-fallback",
         }
     if gemini_key:
         model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
@@ -712,6 +731,12 @@ async def get_peakcut_status():
             "configured": ai_info["configured"],
             "provider": ai_info["provider"],
             "model": ai_info["model"],
+            "label": ai_info.get("label", ""),
+            "ollama_running": ai_info.get("ollama_running"),
+            "model_installed": ai_info.get("model_installed"),
+            "fallback_active": ai_info.get("fallback_active", False),
+            "heuristic_ready": ai_info.get("heuristic_ready", False),
+            "error": ai_info.get("error"),
             "key_rotation": ai_info["key_rotation"],
             "key_masked": ai_info.get("key_masked", ""),
         },
@@ -1099,6 +1124,12 @@ async def sync_state(v: str = ""):
             "configured": ai_info["configured"],
             "provider": ai_info["provider"],
             "model": ai_info["model"],
+            "label": ai_info.get("label", ""),
+            "ollama_running": ai_info.get("ollama_running"),
+            "model_installed": ai_info.get("model_installed"),
+            "fallback_active": ai_info.get("fallback_active", False),
+            "heuristic_ready": ai_info.get("heuristic_ready", False),
+            "error": ai_info.get("error"),
             "key_rotation": ai_info["key_rotation"],
             "key_masked": ai_info.get("key_masked", ""),
         },

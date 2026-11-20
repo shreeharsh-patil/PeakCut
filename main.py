@@ -1396,7 +1396,7 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
     video, no words in range, AUTO_CAPTIONS=0, or any failure — a caption
     problem must never cost the user the clip they already paid for).
     """
-    if os.environ.get("AUTO_CAPTIONS", "1").strip() == "0":
+    if os.environ.get("AUTO_CAPTIONS", "1").strip() == "0" or os.environ.get("SUBTITLE_STYLE", "").strip().lower() == "none":
         return None
     if not transcript or not transcript.get('segments'):
         return None  # silent video: nothing to caption
@@ -2815,7 +2815,7 @@ if __name__ == '__main__':
     is_url = bool(args.url)
     input_target = args.url if is_url else args.input
 
-    process_video_pipeline(
+    res = process_video_pipeline(
         input_video_or_url=input_target,
         output_dir=args.output,
         is_url=is_url,
@@ -2828,3 +2828,4 @@ if __name__ == '__main__':
         transcript_path=args.transcript,
         skip_analysis=args.skip_analysis,
     )
+    sys.exit(0 if (isinstance(res, dict) and res.get("success")) else 1)

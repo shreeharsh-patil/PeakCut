@@ -26,13 +26,179 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Optional, Tuple, Type
+import time
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import httpx
 from pydantic import BaseModel
 
 DEFAULT_MODEL = "gemma2:2b"
 DEFAULT_TIMEOUT = 600.0  # local models on CPU are slow; a scoring batch can take minutes
+
+_HEALTH_CACHE: Dict[str, Any] = {"key": None, "ts": 0.0, "result": None}
+_HEALTH_CACHE_TTL = 3.0
+
+
+def invalidate_health_cache() -> None:
+    """Clear the cached local LLM health probe (useful after pulling a model or in tests)."""
+    _HEALTH_CACHE["key"] = None
+    _HEALTH_CACHE["ts"] = 0.0
+    _HEALTH_CACHE["result"] = None
+
+
+def _model_matches(installed: List[str], requested: str) -> bool:
+    """Match 'gemma2:2b' against 'gemma2:2b' or 'gemma2' against 'gemma2:latest'."""
+    req = (requested or "").strip().lower()
+    if not req:
+        return False
+    for name in installed:
+        cand = (name or "").strip().lower()
+        if not cand:
+            continue
+        if cand == req or cand == f"{req}:latest":
+            return True
+        if ":" not in req and cand.split(":", 1)[0] == req:
+            return True
+    return False
+
+
+def _ollama_root_url(url: str) -> str:
+    """Strip trailing '/v1' from an OpenAI-compatible Ollama base URL."""
+    base = (url or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        return base[:-3].rstrip("/")
+    return base
+
+
+def check_local_llm_health(
+    model: Optional[str] = None,
+    *,
+    run_test_inference: bool = False,
+    timeout: float = 3.0,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """Perform real readiness verification against the configured local LLM / Ollama server.
+
+    Checks:
+      1. Server responds on /api/tags (Ollama) or /v1/models (OpenAI-compatible).
+      2. Selected model is actually present in the server's installed model list.
+      3. (Optional) A tiny test inference succeeds end-to-end.
+
+    Never fabricates readiness when the server is down or the model is missing.
+    """
+    target_url = base_url()
+    target_model = (model or model_name()).strip()
+    cache_key = (target_url, target_model, bool(run_test_inference))
+    now = time.time()
+    if (
+        use_cache
+        and not run_test_inference
+        and _HEALTH_CACHE["key"] == cache_key
+        and (now - _HEALTH_CACHE["ts"]) < _HEALTH_CACHE_TTL
+        and _HEALTH_CACHE["result"] is not None
+    ):
+        return dict(_HEALTH_CACHE["result"])
+
+    result: Dict[str, Any] = {
+        "reachable": False,
+        "model_installed": False,
+        "inference_ok": None if not run_test_inference else False,
+        "ready": False,
+        "model": target_model,
+        "base_url": target_url,
+        "installed_models": [],
+        "error": None,
+        "checked_at": now,
+    }
+
+    if not target_url:
+        result["error"] = "LLM_BASE_URL not configured"
+        return result
+
+    installed: List[str] = []
+    root_url = _ollama_root_url(target_url)
+
+    try:
+        with _client(timeout=timeout) as client:
+            # 1a. Try Ollama native /api/tags first (gives authoritative installed models list)
+            tags_ok = False
+            try:
+                resp = client.get(f"{root_url}/api/tags")
+                if resp.status_code == 200:
+                    data = resp.json() or {}
+                    installed = [
+                        str(m.get("name") or m.get("model") or "").strip()
+                        for m in (data.get("models") or [])
+                        if isinstance(m, dict)
+                    ]
+                    installed = [m for m in installed if m]
+                    result["reachable"] = True
+                    tags_ok = True
+            except Exception:
+                pass
+
+            # 1b. Fall back to OpenAI-compatible GET {base}/models
+            if not tags_ok:
+                resp = client.get(f"{target_url}/models", headers=_headers())
+                if resp.status_code == 200:
+                    data = resp.json() or {}
+                    installed = [
+                        str(m.get("id") or "").strip()
+                        for m in (data.get("data") or [])
+                        if isinstance(m, dict)
+                    ]
+                    installed = [m for m in installed if m]
+                    result["reachable"] = True
+                else:
+                    result["error"] = f"Server returned HTTP {resp.status_code}"
+
+            result["installed_models"] = installed
+            if result["reachable"]:
+                result["model_installed"] = _model_matches(installed, target_model)
+                if not result["model_installed"]:
+                    result["error"] = (
+                        f"Model '{target_model}' not found on server "
+                        f"(installed: {', '.join(installed) if installed else 'none'})"
+                    )
+
+            # 3. Optional tiny end-to-end inference test
+            if result["reachable"] and result["model_installed"] and run_test_inference:
+                inf_timeout = max(float(timeout), 45.0)
+                with _client(timeout=inf_timeout) as inf_client:
+                    body = {
+                        "model": target_model,
+                        "messages": [{"role": "user", "content": 'Reply with JSON: {"ok": true}'}],
+                        "max_tokens": 24,
+                        "temperature": 0.0,
+                        "stream": False,
+                    }
+                    r_inf = inf_client.post(f"{target_url}/chat/completions", json=body, headers=_headers())
+                    if r_inf.status_code == 200:
+                        inf_data = r_inf.json() or {}
+                        choices = inf_data.get("choices") or []
+                        content = ((choices[0].get("message") or {}).get("content") or "") if choices else ""
+                        if str(content).strip():
+                            result["inference_ok"] = True
+                        else:
+                            result["inference_ok"] = False
+                            result["error"] = "Test inference returned empty content"
+                    else:
+                        result["inference_ok"] = False
+                        result["error"] = f"Test inference HTTP {r_inf.status_code}: {r_inf.text[:180]}"
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    result["ready"] = bool(
+        result["reachable"]
+        and result["model_installed"]
+        and (result["inference_ok"] is not False)
+    )
+
+    if not run_test_inference:
+        _HEALTH_CACHE["key"] = cache_key
+        _HEALTH_CACHE["ts"] = now
+        _HEALTH_CACHE["result"] = dict(result)
+    return result
 
 
 def is_colab() -> bool:
@@ -87,16 +253,10 @@ def active() -> bool:
 
 
 def is_local_llm_ready() -> bool:
-    """Check if the local OpenAI-compatible / Ollama server is responding."""
+    """Check if the local OpenAI-compatible / Ollama server is responding with the selected model."""
     if not active():
         return False
-    try:
-        url = f"{base_url()}/models"
-        with _client(timeout=2.0) as client:
-            resp = client.get(url, headers=_headers())
-            return resp.status_code == 200
-    except Exception:
-        return False
+    return bool(check_local_llm_health(timeout=2.0).get("ready", False))
 
 
 def get_available_models() -> list[str]:
@@ -163,7 +323,8 @@ def _headers() -> dict:
 
 def _client(**kwargs) -> httpx.Client:
     """Factory so tests can swap in ``httpx.MockTransport``."""
-    return httpx.Client(timeout=_timeout(), **kwargs)
+    kwargs.setdefault("timeout", _timeout())
+    return httpx.Client(**kwargs)
 
 
 def _response_formats(schema: Type[BaseModel]):

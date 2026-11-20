@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, RedirectResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
@@ -90,7 +90,9 @@ QUALITY_GATE_MIN_HEIGHT = int(os.environ.get("QUALITY_GATE_MIN_HEIGHT", "720"))
 # managed minutes and dies with "no usable clips" (prod 20-ago: 3 of 5 recent
 # failures were exactly this, one user retrying the same 24s video).
 MIN_SOURCE_SECONDS = int(os.environ.get("MIN_SOURCE_SECONDS", "45"))
-QUALITY_PROBE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quality_probe.py")
+QUALITY_PROBE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "engine", "utils", "quality_probe.py"
+)
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 
 # Every log line in this module is emoji-prefixed, and a Windows console is
@@ -1792,10 +1794,12 @@ import peakcut_bridge as _peakcut_bridge
 app.include_router(_peakcut_bridge.router)
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
-# self-host keeps the permissive wildcard it has always used.
+# self-host/Colab uses allow_origin_regex=".*" so credentialed requests (including
+# the tunnel session cookie) receive an explicit echoed Origin instead of "*".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else ["*"],
+    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else [],
+    allow_origin_regex=None if BILLING_ENABLED else r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1804,6 +1808,74 @@ app.add_middleware(
     # they only become readable to JS once they are named here.
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
+
+
+@app.middleware("http")
+async def _colab_access_token_gate(request: Request, call_next):
+    """Protect publicly tunneled Colab/self-host instances when PEAKCUT_ACCESS_TOKEN is set.
+
+    No-op when PEAKCUT_ACCESS_TOKEN is unset (preserves local dev, Docker, and tests).
+    Accepts the token via ?token= (upgraded into an HttpOnly cookie + clean redirect
+    stripping the token from the URL), X-PeakCut-Token header, Authorization Bearer,
+    or the peakcut_session cookie.
+    """
+    expected = (os.environ.get("PEAKCUT_ACCESS_TOKEN") or "").strip()
+    if not expected:
+        return await call_next(request)
+
+    path = request.url.path or "/"
+    if path in ("/health", "/health/ready") or request.method == "OPTIONS":
+        return await call_next(request)
+
+    import hmac as _hmac
+    from urllib.parse import urlencode as _urlencode, parse_qsl as _parse_qsl
+
+    cookie_tok = (request.cookies.get("peakcut_session") or "").strip()
+    header_tok = (request.headers.get("x-peakcut-token") or "").strip()
+    auth_hdr = (request.headers.get("authorization") or "").strip()
+    bearer_tok = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    query_tok = (request.query_params.get("token") or "").strip()
+
+    def _matches(candidate: str) -> bool:
+        return bool(candidate) and _hmac.compare_digest(candidate, expected)
+
+    if _matches(query_tok):
+        # Strip token from URL on browser navigation and set an HttpOnly session cookie
+        is_https = (
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        )
+        if request.method == "GET" and not path.startswith("/api/"):
+            remaining = [(k, v) for k, v in _parse_qsl(request.url.query, keep_blank_values=True) if k != "token"]
+            clean_url = path + (f"?{_urlencode(remaining)}" if remaining else "")
+            resp = RedirectResponse(url=clean_url, status_code=302)
+            resp.set_cookie(
+                "peakcut_session", expected, httponly=True, samesite="lax",
+                secure=is_https, path="/", max_age=86400,
+            )
+            return resp
+        resp = await call_next(request)
+        resp.set_cookie(
+            "peakcut_session", expected, httponly=True, samesite="lax",
+            secure=is_https, path="/", max_age=86400,
+        )
+        return resp
+
+    if _matches(cookie_tok) or _matches(header_tok) or _matches(bearer_tok):
+        return await call_next(request)
+
+    if path.startswith("/api/"):
+        return JSONResponse(
+            {"detail": "Authentication required. Open PeakCut using the tokenized dashboard URL from Colab."},
+            status_code=401,
+        )
+    return HTMLResponse(
+        "<!doctype html><html><body style='font-family:sans-serif;background:#09090b;color:#f4f4f5;padding:40px;'>"
+        "<h2>🔒 PeakCut Studio Access Protected</h2>"
+        "<p>This Colab tunnel requires your session token. Open the tokenized link displayed in the Google Colab notebook cell.</p>"
+        "</body></html>",
+        status_code=401,
+    )
 
 # Mount static files for serving videos
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -2088,8 +2160,8 @@ async def run_job(job_id, job_data):
                 if _relocate_root_job_artifacts(job_id, output_dir):
                     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if json_files:
-                target_json = json_files[0] 
-                with open(target_json, 'r') as f:
+                target_json = json_files[0]
+                with open(target_json, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
                 # Enhance result with video URLs
@@ -2105,6 +2177,17 @@ async def run_job(job_id, job_data):
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
                 clean_job_title = re.sub(r"_+", " ", base_name.removeprefix("source_")).strip()
                 _sync_job_status_disk(job_id, output_dir, "done", clips=clips, title=clean_job_title or None)
+                drive_sync_root = (os.environ.get("PEAKCUT_DRIVE_SYNC_DIR") or "").strip()
+                if drive_sync_root:
+                    try:
+                        import colab_runner as _cr
+                        sync_res = _cr.sync_job_directory_to_storage(
+                            output_dir, job_id, drive_root=drive_sync_root, cleanup_temp=False,
+                        )
+                        if sync_res.get("ok"):
+                            jobs[job_id]["logs"].append(f"📁 Synced verified clips to {sync_res['destination']}")
+                    except Exception as _sync_err:
+                        jobs[job_id]["logs"].append(f"⚠️ Drive sync warning: {_sync_err}")
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -2536,7 +2619,7 @@ async def process_endpoint(
     # outside Docker is whatever interpreter happens to be first — not the venv
     # running this server. Every job then dies on `import cv2`. The quality
     # probe above already gets this right.
-    cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
+    cmd = [sys.executable, "-u", os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")] # -u for unbuffered
     env = os.environ.copy()
     if not paid_allowed:
         # Daily paid-proxy budget hit: this job runs on the free routes only.
@@ -2754,7 +2837,7 @@ def start_job_process_background(
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
-    cmd = [sys.executable, "-u", "main.py"]
+    cmd = [sys.executable, "-u", os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")]
     env = os.environ.copy()
     default_clip_workers = str(min(max(os.cpu_count() or 4, 4), 8))
     env["CLIP_WORKERS"] = str(os.environ.get("CLIP_WORKERS", default_clip_workers))
