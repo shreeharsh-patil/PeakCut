@@ -626,6 +626,26 @@ def _recover_jobs_from_disk():
             continue
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
+            status_file = os.path.join(job_path, "status.json")
+            if os.path.exists(status_file):
+                try:
+                    with open(status_file, "r", encoding="utf-8") as f:
+                        sdata = json.load(f)
+                    st = sdata.get("status", "done")
+                    mapped_status = "completed" if st in ("done", "completed") else st
+                    err = sdata.get("error")
+                    clips = sdata.get("clips") or []
+                    owner = sdata.get("user_id")
+                    jobs[job_id] = {
+                        'status': mapped_status,
+                        'logs': [err] if err else sdata.get("logs", ["♻️ Job recovered from status.json."]),
+                        'output_dir': job_path,
+                        'user_id': owner,
+                        'result': {'clips': clips} if clips else None,
+                    }
+                    recovered += 1
+                except Exception:
+                    pass
             continue
         try:
             with open(json_files[0], 'r') as f:
@@ -707,6 +727,61 @@ _stopping = False                    # SIGTERM received: report not-ready so the
                                      # proxy stops routing here before the
                                      # listening socket closes
 _running_jobs: set = set()           # job ids with a live subprocess here
+_job_processes: Dict[str, subprocess.Popen] = {}
+_job_processes_lock = threading.Lock()
+
+
+def cancel_job(job_id: str) -> bool:
+    """Cancel a queued or running job, terminate its subprocess if alive, and sync state."""
+    cancelled = False
+    with _job_processes_lock:
+        proc = _job_processes.pop(job_id, None)
+        if proc:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                cancelled = True
+            except Exception as e:
+                print(f"⚠️ Error terminating process for {job_id}: {e}")
+
+    job = jobs.get(job_id)
+    if job:
+        cur_status = job.get("status")
+        if cur_status in ("queued", "processing", "running"):
+            job["status"] = "cancelled"
+            job.setdefault("logs", []).append("Job was cancelled by user.")
+            cancelled = True
+
+    _running_jobs.discard(job_id)
+    _clear_resume_manifest(job_id)
+
+    # Sync status.json on disk if output directory exists
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    if os.path.exists(output_dir):
+        try:
+            status_file = os.path.join(output_dir, "status.json")
+            sdata = {}
+            if os.path.exists(status_file):
+                with open(status_file, "r", encoding="utf-8") as f:
+                    sdata = json.load(f)
+            sdata["status"] = "cancelled"
+            sdata["error"] = "Job was cancelled by user."
+            sdata["cancelled_at"] = time.time()
+            with open(status_file, "w", encoding="utf-8") as f:
+                json.dump(sdata, f, indent=2)
+            cancelled = True
+        except Exception:
+            pass
+
+    try:
+        import peakcut_bridge as _pb
+        _pb.notify_state_changed()
+    except Exception:
+        pass
+    return cancelled
 
 
 def _manifest_path(job_id):
@@ -1249,6 +1324,8 @@ async def run_job_wrapper(job_id):
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
+        with _job_processes_lock:
+            _job_processes.pop(job_id, None)
         # The subprocess returned (success or genuine failure) — a terminal
         # state, so drop the resume manifest. It only survives if the container
         # was killed mid-run, which is exactly when we want to resume.
@@ -1924,6 +2001,8 @@ async def run_job(job_id, job_data):
             env=env,
             cwd=os.getcwd()
         )
+        with _job_processes_lock:
+            _job_processes[job_id] = process
         
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
@@ -1934,6 +2013,16 @@ async def run_job(job_id, job_data):
         start_wait = time.time()
         last_heartbeat = time.time()
         while process.poll() is None:
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                break
             await asyncio.sleep(2)
             if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
                 _touch_manifest(job_id)
@@ -2659,6 +2748,9 @@ def start_job_process_background(
 ) -> str:
     """Bridge PeakCut UI job submission directly into OpenShorts processing pipeline."""
     opts = options or {}
+    if job_id in _running_jobs or jobs.get(job_id, {}).get('status') in ('queued', 'processing', 'running'):
+        print(f"⚠️ [PeakCut Studio] Job {job_id} is already active/running; skipping duplicate launch.")
+        return job_id
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
@@ -2786,6 +2878,29 @@ def _job_view_from_disk(job_id):
     if glob.glob(os.path.join(job_path, "*_metadata.json")):
         _recover_jobs_from_disk()
         return jobs.get(job_id)
+    status_file = os.path.join(job_path, "status.json")
+    if os.path.exists(status_file):
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+            st = sdata.get("status", "done")
+            mapped_status = "completed" if st in ("done", "completed") else st
+            err = sdata.get("error")
+            clips = sdata.get("clips") or []
+            recovered_job = {
+                "status": mapped_status,
+                "logs": [err] if err else sdata.get("logs", ["Job restored from disk."]),
+                "user_id": sdata.get("user_id"),
+                "result": {"clips": clips} if clips else None,
+                "output_dir": job_path,
+                "title": sdata.get("title", ""),
+                "url": sdata.get("url", ""),
+                "clips": clips,
+            }
+            jobs[job_id] = recovered_job
+            return recovered_job
+        except Exception:
+            pass
     m = _read_manifest(job_id)
     if m is None:
         return None
@@ -2823,6 +2938,19 @@ async def get_status(job_id: str, request: Request):
         "logs": _visible_logs(job['logs']),
         "result": job.get('result')
     }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job_endpoint(job_id: str, request: Request):
+    """Cancel a queued or running job and terminate its subprocess."""
+    await _ensure_job_files(job_id, request)
+    job = jobs.get(job_id)
+    if not job and not os.path.exists(os.path.join(OUTPUT_DIR, job_id)):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job:
+        await _assert_job_owner(request, job)
+    success = cancel_job(job_id)
+    return {"status": "cancelled", "job_id": job_id, "success": success}
 
 
 def _locate_source(job_id: str):
@@ -3194,6 +3322,8 @@ async def edit_clip(
             filename = safe_name
         else:
             # Fallback to original clip
+            if req.clip_index < 0 or req.clip_index >= len(job['result']['clips']):
+                raise HTTPException(status_code=400, detail=f"Invalid clip index {req.clip_index}")
             clip = job['result']['clips'][req.clip_index]
             filename = clip['video_url'].split('/')[-1]
             input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
@@ -3321,6 +3451,10 @@ async def edit_clip(
             "edit_plan": plan
         }
 
+    except HTTPException:
+        if reservation_id:
+            await _metering.release_reservation(reservation_id)
+        raise
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
@@ -4167,6 +4301,8 @@ async def generate_effects_config(
             safe_name = os.path.basename(req.input_filename)
             input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_name)
         else:
+            if req.clip_index < 0 or req.clip_index >= len(job['result']['clips']):
+                raise HTTPException(status_code=400, detail=f"Invalid clip index {req.clip_index}")
             clip = job['result']['clips'][req.clip_index]
             filename = clip['video_url'].split('/')[-1]
             input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
@@ -4283,7 +4419,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         raise HTTPException(status_code=400, detail="Transcript not found in metadata. Please process a new video.")
         
     clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
         
     clip_data = clips[req.clip_index]
@@ -4490,7 +4626,7 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
     clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
 
     filename = os.path.basename(
@@ -4558,7 +4694,7 @@ async def add_hook(req: HookRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
         
     clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
         
     clip_data = clips[req.clip_index]
@@ -4713,7 +4849,7 @@ async def translate_clip(
         raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
     clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
 
     clip_data = clips[req.clip_index]
@@ -4794,9 +4930,20 @@ def resolve_youtube_privacy(*candidates: Optional[str]) -> str:
     return "private"
 
 
+def validate_clip_index(clip_index: Any, clips_len: int) -> int:
+    """Validate that clip_index is an integer in [0, clips_len - 1]."""
+    if clip_index is None:
+        raise HTTPException(status_code=400, detail="Missing clip index")
+    if not isinstance(clip_index, int) or isinstance(clip_index, bool):
+        raise HTTPException(status_code=400, detail=f"Invalid clip index {clip_index}: must be an integer")
+    if clip_index < 0 or clip_index >= clips_len:
+        raise HTTPException(status_code=400, detail=f"Invalid clip index {clip_index}")
+    return clip_index
+
+
 class SocialPostRequest(BaseModel):
     job_id: str
-    clip_index: int
+    clip_index: Optional[Any] = None
     api_key: Optional[str] = None  # BYOK; ignored for managed users
     user_id: Optional[str] = None  # BYOK profile; ignored for managed users
     platforms: List[str] # ["tiktok", "instagram", "youtube"]
@@ -4816,13 +4963,28 @@ import httpx
 async def post_to_socials(req: SocialPostRequest, request: Request):
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
+        _job_view_from_disk(req.job_id)
+    if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    if 'result' not in job or 'clips' not in job['result']:
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    # Step 1: Validate clip index BEFORE checking upload credentials
+    clips = job['result']['clips']
+    validated_idx = validate_clip_index(req.clip_index, len(clips))
+    clip = clips[validated_idx]
+    v_target = clip.get('video_url') or clip.get('file') or f"clip_{validated_idx}.mp4"
+    filename = str(v_target).split('/')[-1]
+    file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
+
+    # Step 2: Privacy resolution
     confirmed_privacy = resolve_youtube_privacy(req.privacy_status, req.privacyStatus, req.privacy)
     is_only_youtube = (req.platforms == ["youtube"])
 
-    # Resolve the Upload-Post key + profile. For managed users the server key is
-    # used and their own profile is forced (body api_key / user_id are ignored).
+    # Step 3: Resolve credentials and verify upload readiness
     upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
 
     from youtube_uploader import (
@@ -4857,21 +5019,11 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
     else:
         post_user = resolve_post_profile(forced_profile, req.user_id or os.environ.get("UPLOAD_POST_PROFILE"))
 
-    job = jobs[req.job_id]
-    await _assert_job_owner(request, job)
-    if 'result' not in job or 'clips' not in job['result']:
-        raise HTTPException(status_code=400, detail="Job result not available")
+    # Step 4: Ensure physical media presence
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
 
     try:
-        if req.clip_index < 0 or req.clip_index >= len(job['result']['clips']):
-            raise HTTPException(status_code=400, detail=f"Invalid clip index {req.clip_index}")
-        clip = job['result']['clips'][req.clip_index]
-        filename = clip['video_url'].split('/')[-1]
-        file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
-        if not os.path.exists(file_path):
-             raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
-
         # Construct parameters
         final_title = req.title or clip.get('title', 'Viral Short')
         final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
@@ -5031,7 +5183,7 @@ async def get_social_readiness(request: Request):
 
 class DirectYouTubeUploadRequest(BaseModel):
     job_id: Optional[str] = None
-    clip_index: Optional[int] = None
+    clip_index: Optional[Any] = None
     video_path: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
@@ -5059,16 +5211,19 @@ async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Req
     if req.job_id:
         await _ensure_job_files(req.job_id, request)
         if req.job_id not in jobs:
+            _job_view_from_disk(req.job_id)
+        if req.job_id not in jobs:
             raise HTTPException(status_code=404, detail="Job not found")
         job = jobs[req.job_id]
         await _assert_job_owner(request, job)
         if 'result' not in job or 'clips' not in job['result']:
             raise HTTPException(status_code=400, detail="Job result not available")
-        idx = req.clip_index or 0
-        if idx < 0 or idx >= len(job['result']['clips']):
-            raise HTTPException(status_code=400, detail="Invalid clip index")
+        if req.clip_index is None:
+            raise HTTPException(status_code=400, detail="Missing clip index")
+        idx = validate_clip_index(req.clip_index, len(job['result']['clips']))
         clip = job['result']['clips'][idx]
-        filename = clip['video_url'].split('/')[-1]
+        v_target = clip.get('video_url') or clip.get('file') or f"clip_{idx}.mp4"
+        filename = str(v_target).split('/')[-1]
         file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
         if not clip_title:
             clip_title = clip.get('video_title_for_youtube_short') or clip.get('title') or "Viral Short"
@@ -5078,6 +5233,8 @@ async def upload_direct_to_youtube(req: DirectYouTubeUploadRequest, request: Req
         file_path = req.video_path
         if not os.path.isabs(file_path):
             file_path = os.path.join(OUTPUT_DIR, file_path)
+    else:
+        raise HTTPException(status_code=400, detail="Either job_id or video_path must be provided")
 
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")

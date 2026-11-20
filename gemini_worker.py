@@ -567,28 +567,53 @@ def main() -> int:
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)
 
+    models_to_try = [model_name]
+    fallback_candidates = [m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash").split(",") if m.strip()]
+    for fb in fallback_candidates:
+        if fb not in models_to_try:
+            models_to_try.append(fb)
+
     keys_pool = api_key_rotator.get_all_keys("gemini")
     max_attempts = max(len(keys_pool), 3)
     response = None
+    last_error = None
 
-    for attempt in range(1, max_attempts + 1):
-        active_key = api_key_rotator.get_gemini_key()
-        try:
-            client = genai.Client(api_key=active_key)
-            _log(f"🤖 Gemini worker request (attempt {attempt}/{max_attempts}, key={api_key_rotator.mask_key(active_key)}): mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config,
-            )
-            api_key_rotator.report_gemini_success(active_key)
+    for candidate_model in models_to_try:
+        model_name = candidate_model
+        config = _config_for_strategy(args.strategy, args.mode, model_name)
+        model_failed = False
+        for attempt in range(1, max_attempts + 1):
+            active_key = api_key_rotator.get_gemini_key()
+            try:
+                client = genai.Client(api_key=active_key)
+                _log(f"🤖 Gemini worker request (attempt {attempt}/{max_attempts}, key={api_key_rotator.mask_key(active_key)}): mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config,
+                )
+                api_key_rotator.report_gemini_success(active_key)
+                break
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if "not found" in err_str or "404" in err_str or "deprecated" in err_str or "unsupported" in err_str:
+                    _log(f"⚠️ Model '{model_name}' not available ({e}). Trying fallback model...")
+                    model_failed = True
+                    break
+                if api_key_rotator.is_rotatable_error(e) and attempt < max_attempts:
+                    _log(f"⚠️ Gemini API key {api_key_rotator.mask_key(active_key)} encountered quota/rate-limit: {e}. Rotating to next key...")
+                    api_key_rotator.report_gemini_failure(active_key, error=e)
+                    continue
+                raise
+        if response is not None:
             break
-        except Exception as e:
-            if api_key_rotator.is_rotatable_error(e) and attempt < max_attempts:
-                _log(f"⚠️ Gemini API key {api_key_rotator.mask_key(active_key)} encountered quota/rate-limit: {e}. Rotating to next key...")
-                api_key_rotator.report_gemini_failure(active_key, error=e)
-                continue
-            raise
+        if not model_failed:
+            if last_error:
+                raise last_error
+            break
+    if response is None:
+        raise RuntimeError(f"Gemini worker failed across all models ({models_to_try}): {last_error}")
 
     raw_text = _get_response_text(response)
     # With response_schema the SDK returns an already-validated object; fall

@@ -92,11 +92,52 @@ def is_local_llm_ready() -> bool:
         return False
     try:
         url = f"{base_url()}/models"
-        with httpx.Client(timeout=2.0) as client:
+        with _client(timeout=2.0) as client:
             resp = client.get(url, headers=_headers())
             return resp.status_code == 200
     except Exception:
         return False
+
+
+def get_available_models() -> list[str]:
+    """Query the OpenAI-compatible endpoint to discover available models."""
+    if not active():
+        return []
+    url = f"{base_url()}/models"
+    try:
+        with _client(timeout=3.0) as client:
+            resp = client.get(url, headers=_headers())
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("data") or []
+                if isinstance(items, list):
+                    return [item.get("id") for item in items if isinstance(item, dict) and item.get("id")]
+    except Exception:
+        pass
+    return []
+
+
+def validate_model_availability(model: Optional[str] = None) -> bool:
+    """Check whether the requested model is available on the configured provider."""
+    target = model or model_name()
+    available = get_available_models()
+    if available:
+        return target in available
+    return is_local_llm_ready()
+
+
+def get_provider_health() -> dict:
+    """Provide health status, readiness, model telemetry, and connectivity details."""
+    p = provider()
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEYS")
+    is_ready = is_local_llm_ready() if p == "openai" else bool(gemini_key)
+    return {
+        "provider": p,
+        "ready": is_ready,
+        "model": model_name() if p == "openai" else os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        "base_url": base_url() if p == "openai" else None,
+        "available_models": get_available_models() if p == "openai" else [],
+    }
 
 
 def describe() -> Optional[dict]:

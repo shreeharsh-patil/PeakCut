@@ -12,6 +12,7 @@ Bridges OpenShorts backend into the PeakCut reactive studio UI:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import asyncio
 import json
@@ -225,7 +226,35 @@ def notify_state_changed() -> None:
 
 
 def _sync_token() -> str:
-    return f"{int(_BOOT_TIME)}.{_STATE_VERSION}"
+    base = f"{int(_BOOT_TIME)}.{_STATE_VERSION}"
+    active_sigs: List[str] = []
+    try:
+        app_jobs = _get_app_jobs()
+        for jid in sorted(app_jobs.keys()):
+            j = app_jobs[jid]
+            st = j.get("status")
+            if st in ("queued", "processing", "running"):
+                logs = j.get("logs") or []
+                log_len = len(logs)
+                last_log = logs[-1][:30] if logs else ""
+                ready_cnt = len(j.get("ready_files") or {})
+                clips_cnt = len((j.get("result") or {}).get("clips") or [])
+                active_sigs.append(f"{jid}:{st}:{log_len}:{last_log}:{ready_cnt}:{clips_cnt}")
+    except Exception:
+        pass
+    try:
+        live_mgr = LiveClipperManager.get_instance()
+        for sid in sorted(live_mgr.sessions.keys()):
+            s = live_mgr.sessions[sid]
+            if getattr(s, "is_running", False):
+                active_sigs.append(f"live:{sid}:{len(getattr(s, 'clips', []))}")
+    except Exception:
+        pass
+
+    if active_sigs:
+        active_hash = hashlib.md5("|".join(active_sigs).encode("utf-8")).hexdigest()[:8]
+        return f"{base}.{active_hash}"
+    return base
 
 
 def _get_worker_config() -> Dict[str, int]:
@@ -1026,7 +1055,6 @@ def _list_all_jobs_public() -> List[Dict[str, Any]]:
         for jid in list(_get_app_jobs().keys()):
             if jid not in seen:
                 j_dir = OUTPUT_DIR / jid
-                j_dir.mkdir(parents=True, exist_ok=True)
                 job_data = _format_job_public(j_dir)
                 if job_data:
                     jobs.append(job_data)
@@ -1041,8 +1069,7 @@ def _list_all_jobs_public() -> List[Dict[str, Any]]:
 async def sync_state(v: str = ""):
     """Reactive delta sync queried every few seconds by the Web UI."""
     token = _sync_token()
-    # Never short-circuit while jobs are actively running so live progress & partial clips update smoothly.
-    if v == token and not _has_active_jobs():
+    if v == token:
         return {"v": token}
     ai_info = _get_ai_status_info()
 
@@ -1691,8 +1718,46 @@ async def get_job_endpoint(jid: str):
     return data
 
 
+@router.post("/api/jobs/{jid}/cancel")
+async def cancel_job_endpoint(jid: str):
+    """Cancel an active background video job and kill running worker subprocesses."""
+    cancelled = False
+    try:
+        import app as app_module
+        fn = getattr(app_module, "cancel_job", None)
+        if callable(fn):
+            cancelled = fn(jid)
+    except Exception as e:
+        logger.warning(f"Error calling cancel_job on job {jid}: {e}")
+
+    job_dir = OUTPUT_DIR / jid
+    status_file = job_dir / "status.json"
+    if not cancelled and not status_file.exists():
+        raise HTTPException(status_code=404, detail="Video job not found.")
+
+    if status_file.exists():
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            data["status"] = "cancelled"
+            data["error"] = "Job was cancelled by user."
+            status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    _bump_version()
+    return {"status": "cancelled", "id": jid}
+
+
 @router.delete("/api/jobs/{jid}")
 async def delete_job_endpoint(jid: str):
+    try:
+        import app as app_module
+        fn = getattr(app_module, "cancel_job", None)
+        if callable(fn):
+            fn(jid)
+    except Exception:
+        pass
+
     job_dir = OUTPUT_DIR / jid
     if job_dir.exists():
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -2114,6 +2179,14 @@ async def update_connected_apps(req: Request):
     cid = str(data.get("client_id") or "").strip()
     csec = str(data.get("client_secret") or "").strip()
     rtoken = str(data.get("refresh_token") or "").strip()
+
+    supported_platforms = ("youtube", "instagram", "tiktok")
+    if platform not in supported_platforms:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported platform: '{platform}'. Must be one of: {', '.join(supported_platforms)}",
+        )
+
     if platform == "youtube":
         if cid:
             os.environ["YOUTUBE_CLIENT_ID"] = cid
@@ -2121,6 +2194,11 @@ async def update_connected_apps(req: Request):
             os.environ["YOUTUBE_CLIENT_SECRET"] = csec
         if rtoken:
             os.environ["YOUTUBE_REFRESH_TOKEN"] = rtoken
+        try:
+            from youtube_uploader import invalidate_cached_token
+            invalidate_cached_token()
+        except Exception:
+            pass
     elif platform == "instagram":
         if cid:
             os.environ["INSTAGRAM_CLIENT_ID"] = cid
@@ -2252,6 +2330,36 @@ async def retry_post_endpoint(pid: str):
     q.retry_post(pid)
     _bump_version()
     return {"ok": True}
+
+
+@router.post("/api/posts/pause")
+async def pause_publishing_queue_endpoint():
+    """Pause automated publishing queue execution."""
+    q = get_publishing_queue()
+    q.pause()
+    _bump_version()
+    return {"ok": True, "paused": True}
+
+
+@router.post("/api/posts/resume")
+async def resume_publishing_queue_endpoint():
+    """Resume automated publishing queue execution."""
+    q = get_publishing_queue()
+    q.resume()
+    _bump_version()
+    return {"ok": True, "paused": False}
+
+
+@router.get("/api/posts/status")
+async def get_publishing_queue_status():
+    """Get the current running and paused state of the publishing queue."""
+    q = get_publishing_queue()
+    return {
+        "paused": q.is_paused,
+        "count": len(q.list_posts()),
+        "post_gap_minutes": q.post_gap_minutes,
+        "daily_cap": q.daily_cap,
+    }
 
 
 # ---------------------------------------------------------------------------

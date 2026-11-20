@@ -31,8 +31,8 @@ DEFAULT_QUEUE_PATH = Path("output/posts_queue.json")
 def get_default_queue_path() -> Path:
     return Path(os.environ.get("POSTS_QUEUE_PATH", "output/posts_queue.json"))
 
-DEFAULT_POST_GAP_MINUTES = 45
-DEFAULT_DAILY_CAP = 5
+DEFAULT_POST_GAP_MINUTES = int(os.environ.get("PUBLISHING_INTERVAL_MINUTES", os.environ.get("POST_GAP_MINUTES", "45")))
+DEFAULT_DAILY_CAP = int(os.environ.get("PUBLISHING_DAILY_CAP", "5"))
 MAX_RETRY_ATTEMPTS = 5
 BASE_RETRY_DELAY_SEC = 60
 MAX_RETRY_DELAY_SEC = 3600
@@ -76,18 +76,84 @@ class PublishingQueue:
     ):
         self.queue_file = Path(queue_file) if queue_file is not None else get_default_queue_path()
         self.queue_file.parent.mkdir(parents=True, exist_ok=True)
+        self.meta_file = self.queue_file.with_name(f"{self.queue_file.stem}_meta.json")
         self.post_gap_minutes = post_gap_minutes
         self.daily_cap = daily_cap
+        self.is_paused: bool = False
         self.lock = threading.RLock()
+        self._load_meta()
         self._posts: List[PostItem] = self._load()
         self.post_dispatchers: Dict[str, Callable[[PostItem], Dict[str, Any]]] = {}
+
+    def _load_meta(self) -> None:
+        if not self.meta_file.exists():
+            return
+        try:
+            m = json.loads(self.meta_file.read_text(encoding="utf-8"))
+            if "is_paused" in m:
+                self.is_paused = bool(m["is_paused"])
+            if "post_gap_minutes" in m:
+                self.post_gap_minutes = int(m["post_gap_minutes"])
+            if "daily_cap" in m:
+                self.daily_cap = int(m["daily_cap"])
+        except Exception as e:
+            logger.warning(f"Error loading queue meta from {self.meta_file}: {e}")
+
+    def _save_meta(self) -> None:
+        with self.lock:
+            try:
+                tmp = self.meta_file.with_name(f"{self.meta_file.name}.{secrets.token_hex(4)}.tmp")
+                meta_data = {
+                    "is_paused": self.is_paused,
+                    "post_gap_minutes": self.post_gap_minutes,
+                    "daily_cap": self.daily_cap,
+                }
+                tmp.write_text(json.dumps(meta_data, indent=2), encoding="utf-8")
+                tmp.replace(self.meta_file)
+            except Exception as e:
+                logger.warning(f"Error saving queue meta to {self.meta_file}: {e}")
+
+    def pause(self) -> None:
+        """Pause processing of scheduled posts."""
+        with self.lock:
+            self.is_paused = True
+            self._save_meta()
+            logger.info("Publishing queue paused.")
+
+    def resume(self) -> None:
+        """Resume processing of scheduled posts."""
+        with self.lock:
+            self.is_paused = False
+            self._save_meta()
+            logger.info("Publishing queue resumed.")
+
+    def set_post_gap_minutes(self, gap: int) -> None:
+        with self.lock:
+            self.post_gap_minutes = max(1, int(gap))
+            self._save_meta()
+            logger.info(f"Publishing gap set to {self.post_gap_minutes} minutes.")
+
+    def set_daily_cap(self, cap: int) -> None:
+        with self.lock:
+            self.daily_cap = max(1, int(cap))
+            self._save_meta()
+            logger.info(f"Daily post cap set to {self.daily_cap}.")
 
     def _load(self) -> List[PostItem]:
         if not self.queue_file.exists():
             return []
         try:
             raw = json.loads(self.queue_file.read_text(encoding="utf-8"))
-            return [PostItem(**item) for item in raw]
+            items = []
+            for item in raw:
+                p = PostItem(**item)
+                # Restart recovery: reset interrupted in-flight posts back to scheduled
+                if p.status == "posting":
+                    logger.warning(f"Recovering interrupted post {p.id}: resetting status from 'posting' to 'scheduled'")
+                    p.status = "scheduled"
+                    p.due_at = time.time()
+                items.append(p)
+            return items
         except Exception as e:
             logger.warning(f"Error loading publishing queue from {self.queue_file}: {e}; resetting")
             return []
@@ -103,12 +169,31 @@ class PublishingQueue:
         """Register a function to execute uploads for a given platform."""
         self.post_dispatchers[platform.lower()] = dispatcher
 
-    def _day_string(self, timestamp: float) -> str:
-        """Format timestamp into YYYY-MM-DD local date."""
-        return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+    def _get_tz(self, tz: Optional[str | dt.tzinfo] = None) -> dt.tzinfo:
+        if isinstance(tz, dt.tzinfo):
+            return tz
+        if isinstance(tz, str) and tz.strip():
+            try:
+                import zoneinfo
+                return zoneinfo.ZoneInfo(tz.strip())
+            except Exception:
+                pass
+        # Default to local system timezone
+        return dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
 
-    def calculate_next_slot(self, account_id: str, platform: str, requested_time: Optional[float] = None) -> float:
-        """Calculate the earliest timestamp that respects the gap between posts and daily cap."""
+    def _day_string(self, timestamp: float, tz: Optional[str | dt.tzinfo] = None) -> str:
+        """Format timestamp into YYYY-MM-DD date in target timezone."""
+        t_zone = self._get_tz(tz)
+        return dt.datetime.fromtimestamp(timestamp, tz=t_zone).strftime("%Y-%m-%d")
+
+    def calculate_next_slot(
+        self,
+        account_id: str,
+        platform: str,
+        requested_time: Optional[float] = None,
+        tz: Optional[str | dt.tzinfo] = None,
+    ) -> float:
+        """Calculate the earliest timestamp that respects the gap between posts, daily cap, and timezone."""
         with self.lock:
             active_posts = [
                 p for p in self._posts
@@ -117,6 +202,7 @@ class PublishingQueue:
 
             now = time.time()
             start_search = max(now, requested_time or now)
+            t_zone = self._get_tz(tz)
 
             # Minimum gap constraint: last scheduled or posted item + gap
             account_times = [p.posted_at or p.due_at for p in active_posts]
@@ -126,26 +212,25 @@ class PublishingQueue:
 
                 # If last_time's day has reached or exceeded the daily cap,
                 # any subsequent post on or after that day rolls over to 9:00 AM the next day.
-                last_day_str = self._day_string(last_time)
-                posts_on_last_day = sum(1 for p in active_posts if self._day_string(p.posted_at or p.due_at) == last_day_str)
+                last_day_str = self._day_string(last_time, tz=t_zone)
+                posts_on_last_day = sum(1 for p in active_posts if self._day_string(p.posted_at or p.due_at, tz=t_zone) == last_day_str)
                 if posts_on_last_day >= self.daily_cap:
-                    lt_last = time.localtime(last_time + 86400)
-                    next_morning = dt.datetime(lt_last.tm_year, lt_last.tm_mon, lt_last.tm_mday, 9, 0, 0)
+                    d_last = dt.datetime.fromtimestamp(last_time, tz=t_zone)
+                    next_morning = dt.datetime(d_last.year, d_last.month, d_last.day, 9, 0, 0, tzinfo=t_zone) + dt.timedelta(days=1)
                     t = max(t, next_morning.timestamp())
             else:
                 t = start_search
 
             # Daily cap constraint: check up to 30 days ahead
             for _ in range(30):
-                day_str = self._day_string(t)
-                posts_on_day = sum(1 for p in active_posts if self._day_string(p.posted_at or p.due_at) == day_str)
+                day_str = self._day_string(t, tz=t_zone)
+                posts_on_day = sum(1 for p in active_posts if self._day_string(p.posted_at or p.due_at, tz=t_zone) == day_str)
                 if posts_on_day < self.daily_cap:
                     return t
 
-                # Advance to 9:00 AM next day
-                lt = time.localtime(t + 86400)
-                # Next day at 9:00 AM
-                next_morning = dt.datetime(lt.tm_year, lt.tm_mon, lt.tm_mday, 9, 0, 0)
+                # Advance to 9:00 AM next day in target timezone
+                d_curr = dt.datetime.fromtimestamp(t, tz=t_zone)
+                next_morning = dt.datetime(d_curr.year, d_curr.month, d_curr.day, 9, 0, 0, tzinfo=t_zone) + dt.timedelta(days=1)
                 t = next_morning.timestamp()
 
             return t
@@ -163,6 +248,7 @@ class PublishingQueue:
         schedule_now: bool = False,
         requested_time: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        tz: Optional[str | dt.tzinfo] = None,
     ) -> PostItem:
         """Enqueue a clip for publication with collision checks and slot spacing."""
         with self.lock:
@@ -177,10 +263,15 @@ class PublishingQueue:
                 logger.info(f"Clip {clip_id} is already in queue for account {account_id} (Post ID: {existing.id})")
                 return existing
 
-            due_at = time.time() if schedule_now else self.calculate_next_slot(account_id, platform, requested_time)
+            meta = dict(metadata or {})
+            if not tz:
+                tz = meta.get("timezone") or meta.get("tz")
+            if tz and "timezone" not in meta:
+                meta["timezone"] = str(tz)
+
+            due_at = time.time() if schedule_now else self.calculate_next_slot(account_id, platform, requested_time, tz=tz)
             post_id = f"post_{secrets.token_hex(6)}"
 
-            meta = dict(metadata or {})
             if "privacy" not in meta and "privacy_status" not in meta:
                 safe_priv = os.environ.get("DEFAULT_PRIVACY", os.environ.get("YOUTUBE_DEFAULT_PRIVACY", "unlisted")).lower().strip()
                 if safe_priv not in ("unlisted", "private"):
@@ -322,8 +413,14 @@ class QueueWorker:
     def _run(self) -> None:
         while not self.stop_event.is_set():
             try:
+                if self.queue.is_paused:
+                    self.stop_event.wait(self.poll_interval_sec)
+                    continue
+
                 due = self.queue.get_due_posts()
                 for post in due:
+                    if self.queue.is_paused or self.stop_event.is_set():
+                        break
                     self._dispatch_post(post)
             except Exception as e:
                 logger.error(f"Error in publishing queue worker loop: {e}")
@@ -333,6 +430,12 @@ class QueueWorker:
     def _dispatch_post(self, post: PostItem) -> None:
         if not self.queue.mark_posting(post.id):
             logger.info(f"Skipping dispatch of post {post.id} (no longer in scheduled state)")
+            return
+
+        if not post.video_path:
+            err = "Video file path is empty."
+            logger.error(f"Dispatch aborted for post {post.id}: {err}")
+            self.queue.mark_failed(post.id, err, is_rate_limit=False)
             return
 
         dispatcher = self.queue.post_dispatchers.get(post.platform)

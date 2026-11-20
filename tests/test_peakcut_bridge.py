@@ -251,14 +251,21 @@ def test_peakcut_sync_never_freezes_on_active_job():
         assert r1.status_code == 200
         token = r1.json()["v"]
 
-        # Even with the same sync token, an active running job must still stream fresh progress
+        # If active job has no new progress, repeated sync returns lightweight unchanged response
         r2 = _call("GET", "/api/sync", params={"v": token})
         assert r2.status_code == 200
-        body = r2.json()
+        assert r2.json() == {"v": token}
+
+        # When active running job updates with fresh progress, sync token advances and streams updated state
+        app_module.jobs[jid]["ready_files"][1] = "clip_2.mp4"
+        app_module.jobs[jid]["logs"].append("Processing Clip 2: 20s - 40s")
+        r3 = _call("GET", "/api/sync", params={"v": token})
+        assert r3.status_code == 200
+        body = r3.json()
         assert "jobs" in body
         active = next((j for j in body["jobs"] if j["id"] == jid), None)
         assert active is not None
-        assert "1/3 ready" in active["stage"]
+        assert "2/3 ready" in active["stage"]
     finally:
         app_module.jobs.pop(jid, None)
         import shutil

@@ -38,6 +38,17 @@ class YouTubeUploadError(Exception):
     pass
 
 
+_CACHED_ACCESS_TOKEN: Optional[str] = None
+_CACHED_TOKEN_EXPIRY: float = 0.0
+
+
+def invalidate_cached_token() -> None:
+    """Clear cached access token so the next call forces a fresh token refresh."""
+    global _CACHED_ACCESS_TOKEN, _CACHED_TOKEN_EXPIRY
+    _CACHED_ACCESS_TOKEN = None
+    _CACHED_TOKEN_EXPIRY = 0.0
+
+
 def refresh_access_token(
     client_id: Optional[str] = None,
     client_secret: Optional[str] = None,
@@ -74,6 +85,10 @@ def refresh_access_token(
             access_token = payload.get("access_token")
             if not access_token:
                 raise YouTubeAuthError(f"No access_token returned by Google: {payload}")
+            expires_in = float(payload.get("expires_in") or 3600)
+            global _CACHED_ACCESS_TOKEN, _CACHED_TOKEN_EXPIRY
+            _CACHED_ACCESS_TOKEN = access_token
+            _CACHED_TOKEN_EXPIRY = time.time() + expires_in
             return access_token
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
@@ -82,14 +97,31 @@ def refresh_access_token(
         raise YouTubeAuthError(f"Token refresh request failed: {e}") from e
 
 
-def get_authenticated_token() -> str:
+def get_authenticated_token(force_refresh: bool = False) -> str:
     """Return an active access token from direct environment or via refresh token."""
     # Check for direct access token (useful for short-lived test sessions or Colab OAuth)
     direct_token = os.environ.get("YOUTUBE_ACCESS_TOKEN", "").strip()
     if direct_token:
         return direct_token
 
+    global _CACHED_ACCESS_TOKEN, _CACHED_TOKEN_EXPIRY
+    if not force_refresh and _CACHED_ACCESS_TOKEN and time.time() < (_CACHED_TOKEN_EXPIRY - 60):
+        return _CACHED_ACCESS_TOKEN
+
     return refresh_access_token()
+
+
+def get_access_token(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    force_refresh: bool = False,
+) -> str:
+    """Return cached access token or refresh from Google OAuth."""
+    global _CACHED_ACCESS_TOKEN, _CACHED_TOKEN_EXPIRY
+    if not force_refresh and _CACHED_ACCESS_TOKEN and time.time() < (_CACHED_TOKEN_EXPIRY - 60):
+        return _CACHED_ACCESS_TOKEN
+    return refresh_access_token(client_id, client_secret, refresh_token)
 
 
 def is_youtube_auth_configured(
@@ -249,8 +281,27 @@ def upload_youtube_short(
             if not upload_url:
                 raise YouTubeUploadError("YouTube API did not return an upload Location header.")
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        raise YouTubeUploadError(f"YouTube upload initialization failed ({e.code}): {err_body}") from e
+        if e.code == 401 and not access_token:
+            logger.info("Access token expired (401). Refreshing token and retrying session init...")
+            invalidate_cached_token()
+            token = get_authenticated_token(force_refresh=True)
+            init_headers["Authorization"] = f"Bearer {token}"
+            init_req = urllib.request.Request(
+                YOUTUBE_UPLOAD_ENDPOINT,
+                data=metadata_bytes,
+                headers=init_headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(init_req, timeout=30) as retry_resp:
+                    upload_url = retry_resp.headers.get("Location")
+                    if not upload_url:
+                        raise YouTubeUploadError("YouTube API did not return an upload Location header on retry.")
+            except Exception as retry_err:
+                raise YouTubeUploadError(f"YouTube upload retry failed: {retry_err}") from retry_err
+        else:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            raise YouTubeUploadError(f"YouTube upload initialization failed ({e.code}): {err_body}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise YouTubeUploadError(f"YouTube upload connection failed (offline or unreachable): {e}") from e
 
@@ -265,43 +316,53 @@ def upload_youtube_short(
         "Content-Length": str(file_size),
     }
 
-    upload_req = urllib.request.Request(
-        upload_url,
-        data=video_data,
-        headers=upload_headers,
-        method="PUT",
-    )
+    max_upload_retries = 3
+    resp_data = None
+    for attempt in range(1, max_upload_retries + 1):
+        upload_req = urllib.request.Request(
+            upload_url,
+            data=video_data,
+            headers=upload_headers,
+            method="PUT",
+        )
+        try:
+            with urllib.request.urlopen(upload_req, timeout=120) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                break
+        except urllib.error.HTTPError as e:
+            if e.code in (500, 502, 503, 504) and attempt < max_upload_retries:
+                time.sleep(1.5 * attempt)
+                continue
+            err_body = e.read().decode("utf-8", errors="ignore")
+            raise YouTubeUploadError(f"YouTube video upload stream failed ({e.code}): {err_body}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt < max_upload_retries:
+                time.sleep(1.5 * attempt)
+                continue
+            raise YouTubeUploadError(f"YouTube video stream upload failed (offline or disconnected): {e}") from e
 
+    if not resp_data or not resp_data.get("id"):
+        raise YouTubeUploadError(f"YouTube response missing video id: {resp_data}")
+    video_id = resp_data.get("id")
+
+    short_url = f"https://youtube.com/shorts/{video_id}"
+    logger.info(f"✅ Successfully uploaded YouTube Short: {short_url}")
+
+    # Record quota if ClipMind key rotator is present
     try:
-        with urllib.request.urlopen(upload_req, timeout=120) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            video_id = resp_data.get("id")
-            if not video_id:
-                raise YouTubeUploadError(f"YouTube response missing video id: {resp_data}")
+        from clipmind.core.key_rotator import record_quota_usage
+        record_quota_usage("youtube", 1600)
+    except Exception:
+        pass
 
-            short_url = f"https://youtube.com/shorts/{video_id}"
-            logger.info(f"✅ Successfully uploaded YouTube Short: {short_url}")
-
-            # Record quota if ClipMind key rotator is present
-            try:
-                from clipmind.core.key_rotator import record_quota_usage
-                record_quota_usage("youtube", 1600)
-            except Exception:
-                pass
-
-            return {
-                "id": video_id,
-                "url": short_url,
-                "title": title,
-                "privacy": "private" if formatted_publish_at else privacy_status,
-                "publish_at": formatted_publish_at,
-                "raw_response": resp_data,
-            }
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        raise YouTubeUploadError(f"YouTube video upload stream failed ({e.code}): {err_body}") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise YouTubeUploadError(f"YouTube video stream upload failed (offline or disconnected): {e}") from e
+    return {
+        "id": video_id,
+        "url": short_url,
+        "title": title,
+        "privacy": "private" if formatted_publish_at else privacy_status,
+        "publish_at": formatted_publish_at,
+        "raw_response": resp_data,
+    }
 
 
 def register_youtube_dispatcher(queue: Any) -> None:

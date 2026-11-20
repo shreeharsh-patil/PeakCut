@@ -23,8 +23,11 @@ jobs:
         run: >
           pip install pytest pytest-asyncio pillow httpx pydantic "sqlalchemy[asyncio]" greenlet numpy
           opencv-python-headless python-dotenv google-genai fastapi boto3
-          PyJWT email-validator python-multipart yt-dlp tqdm
+          PyJWT email-validator python-multipart yt-dlp tqdm stripe
       - name: Run tests
+        env:
+          YOUTUBE_DRY_RUN: "1"
+          OUTPUT_DIR: "output"
         run: pytest tests/ -v
 
   frontend-build:
