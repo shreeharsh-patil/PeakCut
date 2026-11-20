@@ -25,7 +25,7 @@ import time
 import uuid
 
 from ffmpeg_utils import (METADATA_SCRUB, QUALITY_FAST, audio_encode_args,
-                          video_encode_args)
+                          run_ffmpeg_with_fallback, video_encode_args)
 
 # EDL limits. Deliberately generous — the editor is for humans fixing cuts,
 # not for stitching feature films.
@@ -149,13 +149,14 @@ def virtual_transcript(transcript, segments):
     slicing "words between clip_start and clip_end" exactly as before, against
     this transcript with clip_start=0.
     """
+    all_words = transcript_words(transcript)
     out_segments = []
     offset = 0.0
     for seg in segments:
         seg_start, seg_end = float(seg["start"]), float(seg["end"])
         seg_duration = seg_end - seg_start
         words = []
-        for w in transcript_words(transcript):
+        for w in all_words:
             if w["e"] <= seg_start or w["s"] >= seg_end:
                 continue
             words.append({
@@ -231,11 +232,11 @@ def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
     try:
         for command in cut_commands(input_path, segments, part_paths):
             run(command)
-        with open(list_path, "w") as f:
+        with open(list_path, "w", encoding="utf-8") as f:
             for part in part_paths:
-                # Absolute paths: the concat demuxer resolves relative entries
-                # against the LIST FILE's directory, not the process cwd.
-                f.write(f"file '{os.path.abspath(part)}'\n")
+                # Absolute paths with forward slashes (Windows concat demuxer treats '\' as escape).
+                safe_part = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{safe_part}'\n")
         run(concat_command(list_path, out_path))
     finally:
         for path in part_paths + [list_path]:
@@ -251,9 +252,9 @@ FFMPEG_TIMEOUT_SECONDS = 1800
 
 def _run_ffmpeg(command):
     try:
-        result = subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=FFMPEG_TIMEOUT_SECONDS)
+        result = run_ffmpeg_with_fallback(
+            command, timeout=FFMPEG_TIMEOUT_SECONDS, tier=QUALITY_FAST, check=False
+        )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"ffmpeg timed out after {FFMPEG_TIMEOUT_SECONDS}s ({command[1:6]}...)")

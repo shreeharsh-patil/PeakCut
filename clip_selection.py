@@ -200,27 +200,61 @@ def snap_clip_to_words(start, end, words, video_duration,
                        min_duration=15.0, max_duration=60.0,
                        search_window=1.5, max_lead=0.35, max_tail=0.45):
     """
-    Snap Gemini-proposed clip boundaries onto real word boundaries plus a bit
-    of the surrounding silence. LLMs are bad at millisecond arithmetic; the
-    word-level timestamps are ground truth, so cuts land in pauses instead of
-    mid-word.
+    Snap Gemini-proposed clip boundaries onto real word boundaries (preferring
+    natural sentence boundaries when nearby) plus a bit of surrounding silence.
+    LLMs are bad at millisecond arithmetic; the word-level timestamps are ground
+    truth, so cuts land in pauses instead of mid-word.
 
     words: [{'w','s','e'}, ...] for the whole video, sorted by start.
     Returns (start, end); falls back to the input if no words are nearby or
     snapping cannot satisfy the duration bounds.
     """
-    original = (round(float(start), 3), round(float(end), 3))
-    if not words:
+    orig_start = max(0.0, float(start))
+    orig_end = float(end)
+    vid_dur = float(video_duration or 0.0)
+    if vid_dur > 0:
+        orig_start = min(orig_start, vid_dur)
+        orig_end = min(orig_end, vid_dur)
+    original = (round(orig_start, 3), round(orig_end, 3))
+    if not words or vid_dur <= 0:
         return original
 
-    starts = [float(w.get("s", 0)) for w in words]
-    ends = [float(w.get("e", 0)) for w in words]
+    # Normalize & sort defensively so inverted/unsorted ASR words cannot corrupt snapping
+    norm_words = []
+    for w in words:
+        try:
+            ws = max(0.0, float(w.get("s", 0)))
+            we = max(ws, float(w.get("e", ws)))
+            wt = str(w.get("w", "") or "").strip()
+            norm_words.append((ws, we, wt))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if not norm_words:
+        return original
+    norm_words.sort(key=lambda item: item[0])
 
-    # START: snap to the nearest word start, then lead into the silence before it.
-    new_start = float(start)
-    candidates = [s for s in starts if abs(s - new_start) <= search_window]
-    if candidates:
-        word_start = min(candidates, key=lambda s: abs(s - new_start))
+    starts = [item[0] for item in norm_words]
+    ends = [item[1] for item in norm_words]
+    sentence_terminators = (".", "!", "?", "।")
+
+    # Identify natural sentence-start timestamps (first word or word after terminal punctuation)
+    sentence_starts = {norm_words[0][0]}
+    sentence_ends = set()
+    for idx, (ws, we, wt) in enumerate(norm_words):
+        if wt.endswith(sentence_terminators):
+            sentence_ends.add(we)
+            if idx + 1 < len(norm_words):
+                sentence_starts.add(norm_words[idx + 1][0])
+
+    # START: prefer nearest sentence start within search_window, else nearest word start.
+    new_start = orig_start
+    start_candidates = [s for s in starts if abs(s - new_start) <= search_window]
+    if start_candidates:
+        sent_start_cands = [s for s in start_candidates if s in sentence_starts]
+        if sent_start_cands:
+            word_start = min(sent_start_cands, key=lambda s: abs(s - new_start))
+        else:
+            word_start = min(start_candidates, key=lambda s: abs(s - new_start))
         prev_ends = [e for e in ends if e <= word_start]
         if prev_ends:
             gap = max(0.0, word_start - max(prev_ends))
@@ -229,33 +263,89 @@ def snap_clip_to_words(start, end, words, video_duration,
             lead = max_lead
         new_start = max(0.0, word_start - lead)
 
-    # END: snap to the nearest word end, then trail into the silence after it.
-    new_end = float(end)
-    candidates = [e for e in ends if abs(e - new_end) <= search_window]
-    if candidates:
-        word_end = min(candidates, key=lambda e: abs(e - new_end))
+    # END: prefer nearest sentence end within search_window, else nearest word end.
+    new_end = orig_end
+    end_candidates = [e for e in ends if abs(e - new_end) <= search_window]
+    if end_candidates:
+        sent_end_cands = [e for e in end_candidates if e in sentence_ends]
+        if sent_end_cands:
+            word_end = min(sent_end_cands, key=lambda e: abs(e - new_end))
+        else:
+            word_end = min(end_candidates, key=lambda e: abs(e - new_end))
         next_starts = [s for s in starts if s >= word_end]
         if next_starts:
             gap = max(0.0, min(next_starts) - word_end)
             tail = min(max_tail, gap / 2)
         else:
             tail = max_tail
-        new_end = min(float(video_duration), word_end + tail)
+        new_end = min(vid_dur, word_end + tail)
 
     # Repair duration bounds while staying on word boundaries.
     if new_end - new_start < min_duration:
         target = new_start + min_duration
-        later = sorted(e for e in ends if e >= target)
+        later_sent = sorted(e for e in sentence_ends if target <= e <= new_start + max_duration)
+        later = later_sent or sorted(e for e in ends if e >= target)
         if later and later[0] - new_start <= max_duration:
-            new_end = min(float(video_duration), later[0] + 0.2)
+            new_end = min(vid_dur, later[0] + 0.2)
         else:
             return original
     if new_end - new_start > max_duration:
         target = new_start + max_duration
-        earlier = [e for e in ends if new_start < e <= target]
+        earlier_sent = [e for e in sentence_ends if new_start + min_duration <= e <= target]
+        earlier = earlier_sent or [e for e in ends if new_start < e <= target]
         new_end = (max(earlier) + 0.2) if earlier else target
-        new_end = min(new_end, new_start + max_duration, float(video_duration))
+        new_end = min(new_end, new_start + max_duration, vid_dur)
 
     if new_end <= new_start or new_end - new_start < min_duration:
         return original
     return (round(new_start, 3), round(new_end, 3))
+
+
+def deduplicate_overlapping_clips(shorts, max_overlap_ratio=0.35):
+    """Remove duplicate or heavily overlapping clip candidates, keeping the highest-scored.
+
+    Overlap ratio is measured as ``overlap / min(dur_a, dur_b)`` so a short clip
+    nested inside a longer clip is caught reliably. Survivors are returned in
+    chronological order (start ascending).
+    """
+    if not shorts:
+        return []
+
+    valid_items = []
+    for idx, clip in enumerate(shorts):
+        if not isinstance(clip, dict):
+            continue
+        try:
+            s = float(clip.get("start", 0.0))
+            e = float(clip.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        try:
+            score = float(clip.get("predicted_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        valid_items.append((idx, s, e, score, clip))
+
+    # Rank highest-score first (ties keep earlier transcript order)
+    valid_items.sort(key=lambda item: (-item[3], item[0]))
+
+    kept = []
+    for item in valid_items:
+        _idx, s, e, _score, _clip = item
+        dur = e - s
+        is_dup = False
+        for _k_idx, ks, ke, _k_score, _k_clip in kept:
+            inter = min(e, ke) - max(s, ks)
+            if inter <= 0:
+                continue
+            denom = min(dur, ke - ks)
+            if denom > 0 and (inter / denom) >= max_overlap_ratio:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(item)
+
+    kept.sort(key=lambda item: (item[1], item[0]))
+    return [item[4] for item in kept]

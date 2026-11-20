@@ -172,16 +172,25 @@ def _transcribe_with_whisper(media_path):
 
     out_segments = []
     text_parts = []
+    prev_word_end = 0.0
     for segment in segments:
-        words = [
-            {"word": w.word, "start": float(w.start), "end": float(w.end)}
-            for w in (segment.words or [])
-        ]
+        words = []
+        for w in (segment.words or []):
+            ws = max(0.0, float(w.start))
+            we = max(ws, float(w.end))
+            if ws < prev_word_end and prev_word_end - ws < 0.25:
+                ws = prev_word_end
+                we = max(ws, we)
+            words.append({"word": w.word, "start": ws, "end": we})
+            prev_word_end = we
+        merged = merge_continuation_words(words)
+        seg_s = max(0.0, float(segment.start))
+        seg_e = max(seg_s, float(segment.end))
         out_segments.append({
-            "start": float(segment.start),
-            "end": float(segment.end),
+            "start": seg_s,
+            "end": seg_e,
             "text": segment.text,
-            "words": merge_continuation_words(words),
+            "words": merged,
         })
         text_parts.append(segment.text.strip())
 
@@ -220,8 +229,15 @@ def _extract_wav(media_path):
         "ffmpeg", "-y", "-loglevel", "error", "-i", media_path,
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.PIPE, timeout=1800)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=1800)
+    except Exception:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+        raise
     return wav_path
 
 
@@ -241,8 +257,10 @@ def _words_from_tokens(tokens, timestamps, seg_start, seg_end):
     for token, ts in zip(tokens, timestamps):
         if not token:
             continue
-        abs_ts = float(ts) + seg_start
+        abs_ts = max(0.0, float(ts) + float(seg_start))
         if token.startswith(" ") or not words:
+            if words and abs_ts < words[-1]["start"]:
+                abs_ts = words[-1]["start"]
             words.append({
                 "word": token if token.startswith(" ") else " " + token,
                 "start": abs_ts,
@@ -250,12 +268,15 @@ def _words_from_tokens(tokens, timestamps, seg_start, seg_end):
             last_token_ts.append(abs_ts)
         else:
             words[-1]["word"] += token
-            last_token_ts[-1] = abs_ts
+            last_token_ts[-1] = max(last_token_ts[-1], abs_ts)
 
     for i, word in enumerate(words):
-        next_start = words[i + 1]["start"] if i + 1 < len(words) else seg_end
+        next_start = words[i + 1]["start"] if i + 1 < len(words) else float(seg_end)
         cap = last_token_ts[i] + 0.6
-        word["end"] = float(max(word["start"] + 0.05, min(next_start, cap)))
+        end_ts = float(min(next_start, cap)) if next_start > word["start"] else float(word["start"] + 0.05)
+        word["end"] = float(max(word["start"] + 0.05, end_ts))
+        if i + 1 < len(words) and words[i + 1]["start"] > word["start"]:
+            word["end"] = float(min(word["end"], words[i + 1]["start"]))
 
     return words
 
@@ -358,7 +379,7 @@ def _has_audio_stream(media_path) -> bool:
              "-show_entries", "stream=index", "-of", "csv=p=0", media_path],
             capture_output=True, text=True, timeout=60,
         )
-        return bool(out.stdout.strip())
+        return out.returncode == 0 and bool(out.stdout.strip())
     except Exception:
         return True  # probe failed — don't block, let the backend try
 
