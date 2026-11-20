@@ -184,8 +184,7 @@ def hold(verdicts, min_windows=3):
     run = 0
     for v in verdicts:
         if v is None or v == current:
-            if v == current:
-                pending, run = None, 0
+            pending, run = None, 0
             out.append(current)
             continue
         if v == pending:
