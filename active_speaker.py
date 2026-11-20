@@ -88,6 +88,10 @@ def audio_envelope(video_path, start_s, duration_s, window_s=WINDOW_SECONDS):
         return []
     if not raw:
         return []
+    if len(raw) % 2 != 0:
+        raw = raw[:-1]
+    if not raw:
+        return []
 
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     per_window = max(1, int(8000 * window_s))
@@ -180,8 +184,7 @@ def hold(verdicts, min_windows=3):
     run = 0
     for v in verdicts:
         if v is None or v == current:
-            if v == current:
-                pending, run = None, 0
+            pending, run = None, 0
             out.append(current)
             continue
         if v == pending:
@@ -208,9 +211,11 @@ def speaker_xs(held, centres, crop_w, orig_w, n_frames, fps,
     Reuses the TRACK render path: a camera trajectory with hard jumps is still
     just a list of x positions, so no new filtergraph is needed.
     """
+    safe_fps = float(fps) if (fps and fps > 0) else 30.0
+    safe_win = float(window_s) if (window_s and window_s > 0) else WINDOW_SECONDS
     xs = []
     for f in range(n_frames):
-        idx = min(int((f / fps) / window_s), len(held) - 1) if held else 0
+        idx = min(int((f / safe_fps) / safe_win), len(held) - 1) if held else 0
         who = held[idx] if held else 0
         cx = centres[who if who is not None else 0][0]
         x = int(round(cx - crop_w / 2.0))
@@ -251,7 +256,7 @@ def decode_activity(video_path, start_s, duration_s, boxes, fps,
     small_h = max(int(orig_h * small_w / orig_w), 2)
     small_h += small_h % 2
     scale = orig_w / float(small_w)
-    frame_bytes = small_w * small_h * 3
+    gray_frame_bytes = small_w * small_h
 
     regions = [mouth_region(b, small_w, small_h, scale) for b in boxes]
 
@@ -261,14 +266,15 @@ def decode_activity(video_path, start_s, duration_s, boxes, fps,
          "-vf", f"scale={small_w}:{small_h}", "-f", "rawvideo",
          "-pix_fmt", "gray", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        bufsize=small_w * small_h * 4)
+        bufsize=gray_frame_bytes * 4)
 
-    per_window = max(1, int(round(fps * window_s)))
+    safe_fps = float(fps) if (fps and fps > 0) else 30.0
+    per_window = max(1, int(round(safe_fps * window_s)))
     activity, bucket, prev = [], [], None
     try:
         while True:
-            buf = proc.stdout.read(small_w * small_h)
-            if len(buf) < small_w * small_h:
+            buf = proc.stdout.read(gray_frame_bytes)
+            if len(buf) < gray_frame_bytes:
                 break
             frame = np.frombuffer(buf, dtype=np.uint8).reshape(small_h, small_w)
             if prev is not None:
@@ -283,7 +289,11 @@ def decode_activity(video_path, start_s, duration_s, boxes, fps,
                 bucket = []
     finally:
         proc.stdout.close()
-        proc.wait()
+        try:
+            proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     if bucket:
         activity.append(np.mean(bucket, axis=0).tolist())

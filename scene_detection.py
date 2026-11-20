@@ -19,14 +19,29 @@ Environment variables:
   TRANSNETV2_DEVICE     torch device: "auto" (default) | "cpu" | "cuda" | "mps"
 """
 
+import math
 import os
 import subprocess
 import threading
 
 import cv2
 import numpy as np
-from scenedetect import open_video, SceneManager, FrameTimecode
-from scenedetect.detectors import ContentDetector
+try:
+    from scenedetect import open_video, SceneManager, FrameTimecode
+    from scenedetect.detectors import ContentDetector
+except ImportError:
+    open_video = SceneManager = FrameTimecode = ContentDetector = None
+
+
+def _safe_fps(val, default=30.0):
+    """Return a valid positive finite FPS, falling back to default."""
+    try:
+        f = float(val)
+        if math.isfinite(f) and 0.1 <= f <= 240.0:
+            return f
+    except (TypeError, ValueError):
+        pass
+    return float(default)
 
 # TransNetV2 input size (width x height), fixed by the trained model.
 _TN2_W, _TN2_H = 48, 27
@@ -54,6 +69,8 @@ def detect_scenes(video_path):
 # --- legacy engine ----------------------------------------------------------
 
 def _detect_pyscenedetect(video_path):
+    if open_video is None or SceneManager is None or ContentDetector is None:
+        raise ImportError("scenedetect is not installed")
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
@@ -97,7 +114,7 @@ def _detect_transnetv2(video_path):
     import torch
 
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps = _safe_fps(cap.get(cv2.CAP_PROP_FPS), default=30.0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
@@ -114,9 +131,12 @@ def _detect_transnetv2(video_path):
     raw = model.predictions_to_scenes(single_frame_pred.numpy(), threshold=threshold)
     bounds = [(int(s), int(e) + 1) for s, e in raw]
 
-    # cv2's frame count can differ by a few frames from what ffmpeg decodes;
-    # downstream loops run to the decoder's count, so cover the gap.
-    if total_frames > bounds[-1][1]:
+    decoded_frames = len(frames)
+    if not bounds:
+        bounds = [(0, max(1, total_frames or decoded_frames))]
+    elif total_frames > bounds[-1][1]:
+        # cv2's frame count can differ by a few frames from what ffmpeg decodes;
+        # downstream loops run to the decoder's count, so cover the gap.
         bounds[-1] = (bounds[-1][0], total_frames)
 
     min_sec = float(os.environ.get("SCENE_MIN_SEC", "0.4"))

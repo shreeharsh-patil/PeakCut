@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -70,6 +71,7 @@ logger = logging.getLogger("clipmind.generation.pipeline")
 # ---------------------------------------------------------------------------
 
 _CACHED_FFMPEG_PATH: Optional[str] = None
+_CACHED_FFPROBE_PATH: Optional[str] = None
 
 
 def is_serverless() -> bool:
@@ -177,6 +179,33 @@ def find_ffmpeg() -> str:
     return "ffmpeg"
 
 
+def find_ffprobe() -> str:
+    """Locate the ffprobe executable across env, PATH, or sibling of ffmpeg."""
+    global _CACHED_FFPROBE_PATH
+    if _CACHED_FFPROBE_PATH and os.path.exists(_CACHED_FFPROBE_PATH):
+        return _CACHED_FFPROBE_PATH
+
+    env_path = os.environ.get("FFPROBE_PATH")
+    if env_path and os.path.exists(env_path):
+        _CACHED_FFPROBE_PATH = env_path
+        return env_path
+
+    which_ffprobe = shutil.which("ffprobe")
+    if which_ffprobe and os.path.exists(which_ffprobe):
+        _CACHED_FFPROBE_PATH = which_ffprobe
+        return which_ffprobe
+
+    ffmpeg_exe = find_ffmpeg()
+    if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+        exe_name = "ffprobe.exe" if ffmpeg_exe.lower().endswith(".exe") else "ffprobe"
+        sibling = os.path.join(os.path.dirname(ffmpeg_exe), exe_name)
+        if os.path.isfile(sibling):
+            _CACHED_FFPROBE_PATH = sibling
+            return sibling
+
+    return "ffprobe"
+
+
 def _add_to_env_path(directory: str) -> None:
     """Prepend directory to system PATH so subprocesses can resolve it."""
     if directory and directory not in os.environ.get("PATH", ""):
@@ -185,6 +214,7 @@ def _add_to_env_path(directory: str) -> None:
 
 # Initialize resolver
 find_ffmpeg()
+find_ffprobe()
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +286,7 @@ class ClipPipeline:
         self.loudnorm_filter = "I=-14:TP=-1.5:LRA=11"
         self.bg_music_duck_db = -18.0
         self.ffmpeg_bin = find_ffmpeg()
+        self.ffprobe_bin = find_ffprobe()
 
         # Output paths (Serverless / read-only filesystem safe)
         if is_serverless():
@@ -285,43 +316,47 @@ class ClipPipeline:
     # -----------------------------------------------------------------------
 
     def get_media_info(self, file_path: Union[str, Path]) -> Dict[str, Any]:
-        """Probe media file duration, resolution, and streams using FFmpeg."""
-        file_path = str(file_path)
-        if not os.path.exists(file_path):
-            return {"duration": 0.0, "width": 0, "height": 0, "has_audio": False}
+        """Probe media file duration, resolution, codecs, and streams via FFprobe/FFmpeg."""
+        from ffmpeg_utils import probe_media
 
-        cmd = [self.ffmpeg_bin, "-hide_banner", "-i", file_path]
-        try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-            stderr = res.stderr or ""
-            
-            # Duration parse: Duration: 00:01:23.45
-            dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", stderr)
-            duration = 0.0
-            if dur_match:
-                hours = float(dur_match.group(1))
-                minutes = float(dur_match.group(2))
-                seconds = float(dur_match.group(3))
-                duration = hours * 3600.0 + minutes * 60.0 + seconds
+        return probe_media(
+            file_path,
+            ffprobe_bin=self.ffprobe_bin,
+            ffmpeg_bin=self.ffmpeg_bin,
+            timeout=30,
+        )
 
-            # Resolution parse: Stream #0:0... 1920x1080
-            res_match = re.search(r"Stream.*Video:.*,\s*(\d+)x(\d+)", stderr)
-            width, height = 0, 0
-            if res_match:
-                width = int(res_match.group(1))
-                height = int(res_match.group(2))
+    def validate_clip_output(
+        self,
+        file_path: Union[str, Path],
+        *,
+        expected_duration: Optional[float] = None,
+        duration_tolerance: float = 2.0,
+        expected_resolution: Optional[Tuple[int, int]] = (1080, 1920),
+        require_audio: bool = False,
+        decode_check: bool = True,
+    ) -> Dict[str, Any]:
+        """Verify that a generated clip is playable and meets resolution/duration constraints.
 
-            has_audio = bool(re.search(r"Stream.*Audio:", stderr))
+        Raises RuntimeError if the file is missing, empty, corrupt, or fails constraints.
+        """
+        from ffmpeg_utils import validate_media_output
 
-            return {
-                "duration": duration,
-                "width": width,
-                "height": height,
-                "has_audio": has_audio,
-            }
-        except Exception as e:
-            logger.warning(f"Failed to probe media with FFmpeg ({file_path}): {e}")
-            return {"duration": 0.0, "width": 0, "height": 0, "has_audio": False}
+        ok, info, reason = validate_media_output(
+            file_path,
+            expected_duration=expected_duration,
+            duration_tolerance=duration_tolerance,
+            min_duration=0.5,
+            require_video=True,
+            require_audio=require_audio,
+            expected_resolution=expected_resolution,
+            decode_check=decode_check,
+            ffmpeg_bin=self.ffmpeg_bin,
+            ffprobe_bin=self.ffprobe_bin,
+        )
+        if not ok:
+            raise RuntimeError(f"Generated video validation failed for {file_path}: {reason}")
+        return info
 
     # -----------------------------------------------------------------------
     # Subtitle Generator
@@ -341,14 +376,21 @@ class ClipPipeline:
         """Generate high-contrast ASS subtitle script for bold center-frame burning."""
         output_ass_path = Path(output_ass_path)
         output_ass_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = max(0.1, float(duration or 0.1))
+
+        def _clean_ass_text(raw_text: str) -> str:
+            text = unicodedata.normalize("NFC", str(raw_text or ""))
+            text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            text = text.replace("\\", "/").replace("{", "(").replace("}", ")")
+            text = re.sub(r"\s+", " ", text).strip()
+            return text.upper()
 
         # Parse segments
         segments: List[Dict[str, Any]] = []
         if isinstance(transcript_data, str):
-            # Split raw script into 2-4 second bite-sized subtitle blocks
             words = transcript_data.split()
             words_per_block = 4
-            num_blocks = math.ceil(len(words) / words_per_block)
+            num_blocks = math.ceil(len(words) / words_per_block) if words else 0
             block_dur = max(1.5, min(3.5, duration / max(1, num_blocks)))
 
             for i in range(0, len(words), words_per_block):
@@ -356,55 +398,72 @@ class ClipPipeline:
                 idx = i // words_per_block
                 start = round(idx * block_dur, 2)
                 end = round(min(duration, (idx + 1) * block_dur), 2)
-                if start < duration:
-                    segments.append({"start": start, "end": end, "text": chunk.upper()})
+                if start < duration and end > start:
+                    segments.append({"start": start, "end": end, "text": _clean_ass_text(chunk)})
         elif isinstance(transcript_data, dict):
             raw_segs = transcript_data.get("segments", [])
             for s in raw_segs:
-                segments.append({
-                    "start": float(s.get("start", 0)),
-                    "end": float(s.get("end", 0)),
-                    "text": str(s.get("text", "")).strip().upper()
-                })
+                if isinstance(s, dict):
+                    segments.append({
+                        "start": float(s.get("start", 0)),
+                        "end": float(s.get("end", 0)),
+                        "text": _clean_ass_text(s.get("text", "")),
+                    })
         elif isinstance(transcript_data, list):
             for s in transcript_data:
                 if isinstance(s, dict):
                     segments.append({
                         "start": float(s.get("start", 0)),
                         "end": float(s.get("end", 0)),
-                        "text": str(s.get("text", "")).strip().upper()
+                        "text": _clean_ass_text(s.get("text", "")),
                     })
 
+        # Normalize, sort, clamp to [0, duration], and prevent overlaps
+        segments.sort(key=lambda s: (s["start"], s["end"]))
+        normalized_segments: List[Dict[str, Any]] = []
+        prev_end = 0.0
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if not text or not all(math.isfinite(seg[key]) for key in ("start", "end")):
+                continue
+            s_t = max(prev_end, max(0.0, float(seg["start"])))
+            e_t = min(duration, float(seg["end"]))
+            if round(e_t * 100) <= round(s_t * 100):
+                continue
+            normalized_segments.append({"start": s_t, "end": e_t, "text": text})
+            prev_end = e_t
+
         def to_ass_time(secs: float) -> str:
-            h = int(secs // 3600)
-            m = int((secs % 3600) // 60)
-            s = int(secs % 60)
-            cs = int(round((secs - int(secs)) * 100))
-            if cs >= 100:
-                cs = 99
+            secs = max(0.0, float(secs))
+            total_cs = int(round(secs * 100))
+            cs = total_cs % 100
+            total_s = total_cs // 100
+            h = total_s // 3600
+            m = (total_s % 3600) // 60
+            s = total_s % 60
             return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-        # Alignment 2 is Bottom-Center. MarginV 240 brings it comfortably into lower-third center.
+        # Alignment 2 is Bottom-Center. MarginV 280 keeps captions clear of Shorts/Reels UI.
+        safe_font = re.sub(r"[^A-Za-z0-9 _-]", "", str(font_name or "")).strip() or "Anton"
         header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: BoldYellow,{font_name},{font_size},{primary_color},&H000000FF,{outline_color},&H80000000,1,0,0,0,100,100,0,0,1,{outline_width},2,2,40,40,240,1
+Style: BoldYellow,{safe_font},{font_size},{primary_color},&H000000FF,{outline_color},&H80000000,1,0,0,0,100,100,0,0,1,{outline_width},2,2,60,60,280,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
         dialogue_lines = []
-        for seg in segments:
-            st = to_ass_time(max(0.0, seg["start"]))
-            et = to_ass_time(min(duration, seg["end"]))
-            text = seg["text"].replace("\n", " ").strip()
-            if text:
-                dialogue_lines.append(f"Dialogue: 0,{st},{et},BoldYellow,,0,0,0,,{text}")
+        for seg in normalized_segments:
+            st = to_ass_time(seg["start"])
+            et = to_ass_time(seg["end"])
+            dialogue_lines.append(f"Dialogue: 0,{st},{et},BoldYellow,,0,0,0,,{seg['text']}")
 
         content = header + "\n".join(dialogue_lines) + "\n"
         with open(output_ass_path, "w", encoding="utf-8-sig") as f:
@@ -438,10 +497,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         download_path = self.temp_dir / f"{cycle_prefix}source.mp4"
         info = self._download_youtube_video(target_url, download_path)
         
-        source_duration = float(info.get("duration", 0.0))
-        if source_duration <= 0.0:
-            probe = self.get_media_info(download_path)
-            source_duration = probe["duration"]
+        source_duration = info["duration"]
 
         if source_duration < self.min_duration:
             raise ValueError(f"Source video too short ({source_duration:.1f}s < {self.min_duration}s)")
@@ -449,12 +505,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # 3. Peak engagement window detection
         start_sec, end_sec, hook_text = self._detect_peak_engagement_window(
             info=info,
-            video_path=download_path,
             total_duration=source_duration,
-            topic=topic,
         )
 
-        target_duration = max(self.min_duration, min(self.max_duration, end_sec - start_sec))
+        target_duration = end_sec - start_sec
 
         # 4. Transcribe or fetch captions for the segment
         transcript_data = self._get_transcript_for_window(
@@ -462,15 +516,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             video_path=download_path,
             start_sec=start_sec,
             duration=target_duration,
-            fallback_text=hook_text or topic,
         )
 
         # 5. Burn subtitles & apply 9:16 reframe + loudnorm
         output_clip_path = self.output_dir / f"{cycle_prefix}final.mp4"
-        ass_sub_path = self.temp_dir / f"{cycle_prefix}subs.ass"
-        self.create_styled_ass_subtitles(transcript_data, ass_sub_path, duration=target_duration)
+        ass_sub_path = None
+        if transcript_data["segments"]:
+            ass_sub_path = self.temp_dir / f"{cycle_prefix}subs.ass"
+            self.create_styled_ass_subtitles(transcript_data, ass_sub_path, duration=target_duration)
 
-        self._render_ffmpeg_vertical_cut(
+        rendered = self._render_ffmpeg_vertical_cut(
             input_video=download_path,
             output_video=output_clip_path,
             start_sec=start_sec,
@@ -480,13 +535,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         return ClipResult(
             video_path=output_clip_path,
-            duration=target_duration,
+            duration=rendered["duration"],
             aspect_ratio="9:16",
-            resolution=(1080, 1920),
+            resolution=(rendered["width"], rendered["height"]),
             strategy_used=GenerationStrategy.YOUTUBE_EXTRACT.value,
             hook_text=hook_text,
             subtitles_path=ass_sub_path,
-            transcript=transcript_data if isinstance(transcript_data, dict) else {"text": str(transcript_data)},
+            transcript=transcript_data,
             audio_lufs=self.target_lufs,
             metadata={
                 "source_url": target_url,
@@ -535,70 +590,149 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         return None
 
-    def _download_youtube_video(self, url: str, target_path: Path) -> Dict[str, Any]:
-        """Download video using yt-dlp into target_path."""
+    def _download_youtube_video(self, url: str, target_path: Path, max_retries: int = 3) -> Dict[str, Any]:
+        """Download video using yt-dlp into target_path with bounded retries and validation."""
         try:
             import yt_dlp
         except ImportError:
             raise RuntimeError("yt-dlp is not installed; cannot download YouTube video")
 
-        # Formats: prioritize 1080p/720p mp4 video with aac audio
+        from security_utils import assert_public_url
+
+        url = assert_public_url(url)
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        non_retryable_tokens = (
+            "private video", "video unavailable", "this video has been removed",
+            "sign in to confirm your age", "age-restricted", "not available in your country",
+            "geo-restricted", "members-only", "copyright", "is not a valid url",
+            "unsupported url", "premieres in", "this live event will begin", "no usable audio stream",
+            "active live stream", "no video stream",
+        )
+        attempts = max(1, int(max_retries))
+        reported = {}
+
+        def report_progress(status):
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            if status.get("status") == "downloading" and total:
+                file = status.get("filename")
+                percent = min(100, int(100 * (status.get("downloaded_bytes") or 0) / total))
+                bucket = percent // 10
+                if bucket > reported.get(file, -1):
+                    reported[file] = bucket
+                    logger.info("Source download: %d%%", bucket * 10)
+
+        def reject_live(info, *, incomplete):
+            if info.get("is_live") or info.get("live_status") == "is_live":
+                return "An active live stream must finish before it can be clipped here."
+            return None
+
         ydl_opts = {
             "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "outtmpl": str(target_path.with_suffix(".%(ext)s")),
             "merge_output_format": "mp4",
+            "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "overwrites": True,
-            "nocheckcertificate": True,
+            "overwrites": False,
+            "continuedl": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "skip_unavailable_fragments": False,
+            "socket_timeout": 30,
+            "cachedir": False,
+            "progress_hooks": [report_progress],
+            "match_filter": reject_live,
         }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Find the actual downloaded file
-            actual_file = target_path.with_suffix(".mp4")
-            if not actual_file.exists():
-                # Check if it was saved with another extension
-                for ext in [".mkv", ".webm"]:
-                    alt = target_path.with_suffix(ext)
-                    if alt.exists():
-                        alt.rename(actual_file)
+        last_err: Optional[Exception] = None
+        # The same staging directory is used for retries so yt-dlp can resume.
+        # A previous job's similarly named file never becomes this job's source.
+        with tempfile.TemporaryDirectory(prefix="clipmind-download-", dir=target_path.parent) as staging:
+            download_dir = Path(staging)
+            ydl_opts["outtmpl"] = str(download_dir / "source.%(ext)s")
+            for attempt in range(1, attempts + 1):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    if not info:
+                        raise ValueError("No downloadable video was returned. Check the URL and live status.")
+                    if reason := reject_live(info, incomplete=False):
+                        raise ValueError(reason)
+                    mp4 = download_dir / "source.mp4"
+                    if not mp4.is_file():
+                        alt = next((p for p in download_dir.iterdir()
+                                    if p.is_file() and p.stem == "source" and p.suffix in
+                                    (".mkv", ".webm", ".mov")), None)
+                        if alt is None:
+                            raise FileNotFoundError("yt-dlp did not produce a completed download.")
+                        remuxed = download_dir / "remuxed.mp4"
+                        subprocess.run(
+                            [self.ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-i", str(alt),
+                             "-map", "0:V:0", "-map", "0:a:0?", "-c", "copy", str(remuxed)],
+                            capture_output=True, text=True, errors="replace", timeout=300, check=True,
+                        )
+                        mp4 = remuxed
+
+                    media = self.get_media_info(mp4)
+                    if not media["valid"] or not media["has_video"]:
+                        mp4.unlink(missing_ok=True)
+                        raise RuntimeError(f"Downloaded file has no video stream: {media.get('error') or 'unreadable video'}")
+                    if not media["has_audio"]:
+                        raise RuntimeError("Downloaded video has no usable audio stream.")
+                    mp4.replace(target_path)
+                    return {**info, "duration": media["video_duration"] or media["duration"]}
+                except (ValueError, subprocess.CalledProcessError) as e:
+                    last_err = e
+                    break
+                except Exception as e:
+                    last_err = e
+                    if any(token in str(e).lower() for token in non_retryable_tokens) or attempt == attempts:
                         break
-
-            if not actual_file.exists():
-                raise FileNotFoundError(f"yt-dlp downloaded file not found at {actual_file}")
-
-            return info
+                    backoff = min(10.0, 2.0 ** attempt)
+                    logger.warning("Source download attempt %d/%d failed: %s. Retrying in %.1fs.",
+                                   attempt, attempts, type(e).__name__, backoff)
+                    time.sleep(backoff)
+        detail = str(last_err)
+        if isinstance(last_err, subprocess.CalledProcessError) and last_err.stderr:
+            detail = last_err.stderr.strip()[-300:]
+        raise RuntimeError(f"YouTube download failed: {detail}") from last_err
 
     def _detect_peak_engagement_window(
         self,
         info: Dict[str, Any],
-        video_path: Path,
         total_duration: float,
-        topic: str,
     ) -> Tuple[float, float, str]:
-        """Calculate the 45-58s window containing the strongest retention hook (0-3s)."""
-        target_span = 52.0  # Ideal target duration
-        if total_duration <= target_span:
-            return 0.0, total_duration, f"Shocking Truth About {topic}"
+        """Prefer actual replay peaks and use chapter boundaries for context."""
+        span = min(total_duration, self.max_duration, max(self.min_duration, 52.0))
+        last_start = total_duration - span
+        peaks = []
+        for sample in info.get("heatmap") or []:
+            try:
+                start = float(sample["start_time"])
+                end = float(sample["end_time"])
+                weight = float(sample["value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= start < end <= total_duration and 0 < weight <= 1:
+                peaks.append((weight, (start + end) / 2))
 
-        # 1. Check if heatmap / chapters available in info
-        chapters = info.get("chapters") or []
-        for ch in chapters:
-            title = str(ch.get("title", "")).lower()
-            start = float(ch.get("start_time", 0.0))
-            end = float(ch.get("end_time", 0.0))
-            if any(k in title for k in ["hook", "secret", "best", "climax", "truth", "reveal"]):
-                if (end - start) >= self.min_duration:
-                    return start, min(total_duration, start + target_span), ch.get("title", "")
-
-        # 2. Heuristic selection: Avoid first 5% (channel intro) and select around 15-25% mark
-        safe_start = max(5.0, total_duration * 0.15)
-        if safe_start + target_span > total_duration:
-            safe_start = max(0.0, total_duration - target_span)
-
-        hook_text = f"The Insane Truth About {topic} You Never Knew!"
-        return round(safe_start, 2), round(safe_start + target_span, 2), hook_text
+        peak = max(peaks, key=lambda sample: sample[0])[1] if peaks else None
+        proposed_start = peak - 6.0 if peak is not None else total_duration * 0.15
+        start = min(last_start, max(0.0, proposed_start))
+        chapter_title = ""
+        for chapter in info.get("chapters") or []:
+            try:
+                left = float(chapter["start_time"])
+                right = float(chapter["end_time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= left <= last_start and right - left >= span and abs(left - start) <= 5.0:
+                if peak is not None and not left <= peak <= left + span:
+                    continue
+                start = left
+                chapter_title = str(chapter.get("title") or "").strip()
+                break
+        return start, start + span, chapter_title
 
     def _get_transcript_for_window(
         self,
@@ -606,28 +740,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_path: Path,
         start_sec: float,
         duration: float,
-        fallback_text: str,
-    ) -> Union[Dict[str, Any], str]:
-        """Fetch transcript segments for the window via youtube_transcript_api or fallback."""
+    ) -> Dict[str, Any]:
+        """Use supplied captions or transcribe just the audio selected for the clip."""
         video_id = info.get("id")
         if video_id:
             try:
+                import requests
                 from youtube_transcript_api import YouTubeTranscriptApi
-                transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-                # Filter for segments overlapping our window
+
+                with requests.Session() as session:
+                    # youtube-transcript-api otherwise uses requests without a timeout.
+                    from functools import partial
+                    session.request = partial(session.request, timeout=10)
+                    languages = list(dict.fromkeys([info.get("language") or "en", "en"]))
+                    transcript_list = YouTubeTranscriptApi(http_client=session).fetch(
+                        video_id, languages=languages,
+                    ).to_raw_data()
                 window_end = start_sec + duration
                 matched_segs = []
                 for item in transcript_list:
                     item_start = item["start"]
-                    item_dur = item.get("duration", 2.0)
-                    item_end = item_start + item_dur
-                    if item_end >= start_sec and item_start <= window_end:
-                        # Normalize timestamp relative to 0.0
-                        rel_start = max(0.0, item_start - start_sec)
-                        rel_end = min(duration, item_end - start_sec)
+                    item_end = item_start + item["duration"]
+                    if item_end > start_sec and item_start < window_end and item_end > item_start:
                         matched_segs.append({
-                            "start": round(rel_start, 2),
-                            "end": round(rel_end, 2),
+                            "start": max(0.0, item_start - start_sec),
+                            "end": min(duration, item_end - start_sec),
                             "text": item.get("text", "")
                         })
                 if matched_segs:
@@ -635,8 +772,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             except Exception as e:
                 logger.debug(f"YouTube transcript extraction skipped/failed: {e}")
 
-        # Fallback to high-retention structured text
-        return fallback_text
+        try:
+            from transcribe_backends import transcribe_media
+
+            with tempfile.TemporaryDirectory(dir=self.temp_dir) as staging:
+                wav = Path(staging) / "clip.wav"
+                subprocess.run(
+                    [self.ffmpeg_bin, "-nostdin", "-v", "error", "-ss", f"{start_sec:.6f}",
+                     "-i", str(video_path), "-t", f"{duration:.6f}", "-map", "0:a:0",
+                     "-ac", "1", "-ar", "16000", str(wav)],
+                    capture_output=True, check=True, timeout=60,
+                )
+                return transcribe_media(wav)
+        except Exception as e:
+            logger.warning("Clip captions unavailable: %s", e)
+            return {"segments": []}
 
     # -----------------------------------------------------------------------
     # Priority 2: Text-to-Video / AI Narration Script Fallback
@@ -768,7 +918,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         f.write(resp.content)
                     probe = self.get_media_info(output_path)
                     dur = probe["duration"]
-                    if dur > 0:
+                    if probe["valid"] and probe["has_audio"] and dur > 0:
                         logger.info(f"ElevenLabs TTS succeeded ({dur:.1f}s)")
                         return output_path, dur
                 elif resp.status_code in (401, 403, 429):
@@ -785,28 +935,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 communicate = edge_tts.Communicate(text, voice)
                 await communicate.save(str(output_path))
 
-            asyncio.run(_run_edge())
+            output_path.unlink(missing_ok=True)
+            asyncio.run(asyncio.wait_for(_run_edge(), timeout=60))
             probe = self.get_media_info(output_path)
             dur = probe["duration"]
-            if dur > 0:
+            if probe["valid"] and probe["has_audio"] and dur > 0:
                 logger.info(f"Edge-TTS synthesized speech ({dur:.1f}s)")
                 return output_path, dur
+            raise RuntimeError("Edge-TTS returned no playable audio.")
         except Exception as e:
-            logger.warning(f"Edge-TTS synthesis failed: {e}")
-
-        # 3. Fallback: Generate synthetic speech or silent audio track using FFmpeg
-        dur = 50.0
-        cmd = [
-            self.ffmpeg_bin, "-y", "-f", "lavfi",
-            "-i", f"sine=frequency=440:duration={dur}",
-            "-af", "volume=0.01",
-            str(output_path)
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            return output_path, dur
-        except Exception:
-            return output_path, dur
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError(f"No narration was generated: {e}") from e
 
     def _acquire_or_generate_broll(self, topic: str, duration: float, cycle_prefix: str) -> Path:
         """Fetch stock video via Pexels or dynamically render high-contrast 9:16 background."""
@@ -999,15 +1138,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "-i", str(concat_txt),
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
             "-c:v", "libx264",
+            "-preset", "fast",
             "-pix_fmt", "yuv420p",
             "-t", f"{total_duration:.2f}",
             str(out_video)
         ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except Exception as e:
-            logger.warning(f"Slideshow video assembly failed: {e}")
-            self._create_simulated_video_file(out_video, duration=total_duration)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=600)
+        if res.returncode != 0:
+            if out_video.exists():
+                out_video.unlink(missing_ok=True)
+            raise RuntimeError(f"Slideshow video assembly failed (rc={res.returncode}): {(res.stderr or '')[-300:]}")
+        self.validate_clip_output(
+            out_video,
+            expected_duration=total_duration,
+            duration_tolerance=2.5,
+            expected_resolution=(1080, 1920),
+            require_audio=False,
+            decode_check=False,
+        )
 
     # -----------------------------------------------------------------------
     # Video & Audio FFmpeg Processing Pipeline
@@ -1020,12 +1168,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start_sec: float,
         duration: float,
         ass_subtitles_path: Optional[Path] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Cut, reframe to 9:16 (1080x1920), burn subtitles, and normalize audio to -14 LUFS."""
         output_video.parent.mkdir(parents=True, exist_ok=True)
 
-        # 9:16 Vertical reframing with smart aspect ratio preservation and subtle blurred background
-        # Or direct center-crop for high-impact Shorts
         vf_filters = [
             "scale=1080:1920:force_original_aspect_ratio=increase",
             "crop=1080:1920",
@@ -1034,21 +1180,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ]
 
         if ass_subtitles_path and ass_subtitles_path.exists():
-            # Escape path properly for FFmpeg libass filter on Windows
-            # E.g. C\:/path/to/subs.ass with colons and slashes escaped
             clean_sub_path = str(ass_subtitles_path).replace("\\", "/").replace(":", "\\:")
-            vf_filters.append(f"ass='{clean_sub_path}'")
+            vf_filters.append(f"ass=filename='{clean_sub_path}'")
 
         vf_str = ",".join(vf_filters)
-
-        # Audio filter: loudnorm normalization
         af_str = f"loudnorm={self.loudnorm_filter}"
 
         cmd = [
-            self.ffmpeg_bin, "-y",
-            "-ss", f"{start_sec:.2f}",
-            "-t", f"{duration:.2f}",
+            self.ffmpeg_bin, "-nostdin", "-y",
+            "-ss", f"{start_sec:.6f}",
             "-i", str(input_video),
+            "-t", f"{duration:.6f}",
+            "-map", "0:V:0", "-map", "0:a:0",
             "-vf", vf_str,
             "-af", af_str,
             "-c:v", "libx264",
@@ -1062,16 +1205,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             str(output_video)
         ]
 
+        logger.info(f"Executing FFmpeg vertical cut: start={start_sec:.2f}s, dur={duration:.2f}s")
         try:
-            logger.info(f"Executing FFmpeg vertical cut: start={start_sec:.2f}s, dur={duration:.2f}s")
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", timeout=600,
+            )
             if res.returncode != 0:
-                logger.warning(f"FFmpeg render returned code {res.returncode}: {res.stderr[:300]}")
-                # Fallback to direct simple copy/cut if complex filters fail
-                self._fallback_render_direct(input_video, output_video, start_sec, duration)
-        except Exception as e:
-            logger.warning(f"FFmpeg vertical render failed: {e}")
-            self._create_simulated_video_file(output_video, duration=duration)
+                raise RuntimeError(f"FFmpeg vertical render failed (rc={res.returncode}): {(res.stderr or '')[-300:]}")
+            return self.validate_clip_output(
+                output_video,
+                expected_duration=duration,
+                duration_tolerance=0.5,
+                require_audio=True,
+            )
+        except Exception:
+            output_video.unlink(missing_ok=True)
+            raise
 
     def _composite_video_with_audio(
         self,
@@ -1094,13 +1243,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         if ass_subtitles_path and ass_subtitles_path.exists():
             clean_sub_path = str(ass_subtitles_path).replace("\\", "/").replace(":", "\\:")
-            vf_filters.append(f"ass='{clean_sub_path}'")
+            vf_filters.append(f"ass=filename='{clean_sub_path}'")
 
         vf_str = ",".join(vf_filters)
 
-        # Audio ducking filter
         if background_music_path and background_music_path.exists():
-            # Duck music by -18dB relative to voiceover
             filter_complex = (
                 f"[0:v]{vf_str}[v];"
                 f"[2:a]volume=0.125[bgm];"
@@ -1116,13 +1263,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "-map", "[v]", "-map", "[a]",
                 "-t", f"{duration:.2f}",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                "-c:a", "aac", "-b:a", "192k",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 str(output_video)
             ]
         else:
-            # Voiceover only normalized to -14 LUFS
             cmd = [
                 self.ffmpeg_bin, "-y",
                 "-stream_loop", "-1", "-i", str(visual_source),
@@ -1132,74 +1278,129 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-t", f"{duration:.2f}",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                "-c:a", "aac", "-b:a", "192k",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 str(output_video)
             ]
 
-        try:
-            logger.info(f"Compositing video and audio: dur={duration:.2f}s")
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-            if res.returncode != 0:
-                logger.warning(f"FFmpeg composite failed ({res.returncode}): {res.stderr[:300]}")
-                self._create_simulated_video_file(output_video, duration=duration)
-        except Exception as e:
-            logger.warning(f"FFmpeg composite exception: {e}")
-            self._create_simulated_video_file(output_video, duration=duration)
-
-    def _fallback_render_direct(self, in_v: Path, out_v: Path, start: float, dur: float) -> None:
-        """Simplified direct FFmpeg transcode if complex filter graphs encounter codec issues."""
-        cmd = [
-            self.ffmpeg_bin, "-y",
-            "-ss", f"{start:.2f}",
-            "-t", f"{dur:.2f}",
-            "-i", str(in_v),
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-            "-c:v", "libx264", "-preset", "ultrafast",
-            "-c:a", "aac",
-            str(out_v)
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except Exception:
-            self._create_simulated_video_file(out_v, duration=dur)
+        logger.info(f"Compositing video and audio: dur={duration:.2f}s")
+        res = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", timeout=600,
+        )
+        if res.returncode != 0:
+            if output_video.exists():
+                output_video.unlink(missing_ok=True)
+            raise RuntimeError(f"FFmpeg composite failed (rc={res.returncode}): {(res.stderr or '')[-300:]}")
+        self.validate_clip_output(
+            output_video,
+            expected_duration=duration,
+            duration_tolerance=2.5,
+            expected_resolution=(1080, 1920),
+            require_audio=True,
+            decode_check=True,
+        )
 
     def _create_simulated_video_file(self, target_path: Path, duration: float = 50.0) -> Path:
-        """Generate a lightweight valid vertical MP4 video file for simulation / dry-run."""
+        """Generate a lightweight, genuinely playable vertical MP4 for simulation / dry-run.
+
+        Uses low-framerate still-image H.264 encoding (2 fps + ``-tune stillimage``)
+        so a 50s 1080x1920 MP4 encodes in <1.5s even on 2-vCPU CI runners while
+        remaining a fully valid, playable H.264/AAC container verified with FFprobe.
+        """
+        target_path = Path(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            cmd = [
-                self.ffmpeg_bin, "-y",
-                "-f", "lavfi", "-i", f"color=c=navy:s=1080x1920:r=30:d={duration:.2f}",
-                "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration:.2f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "64k",
-                "-t", f"{duration:.2f}",
-                str(target_path)
-            ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=12)
-            return target_path
-        except Exception as e:
-            logger.debug(f"FFmpeg synthetic generator skipped: {e}")
+        duration = max(1.0, float(duration))
 
-        # Check if reference video file exists to copy as simulation artifact
-        ref_candidates = [
-            Path("test_input.mp4"),
-            Path(__file__).resolve().parent.parent.parent / "test_input.mp4",
+        # Primary: H.264/AAC with stillimage tuning (fast & universally playable).
+        # Secondary: MPEG-4/AAC only if libx264 is absent in a custom FFmpeg build.
+        codec_attempts = [
+            ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-g", "10", "-pix_fmt", "yuv420p"],
+            ["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"],
         ]
-        for ref in ref_candidates:
-            if ref.exists():
-                try:
-                    shutil.copyfile(ref, target_path)
-                    return target_path
-                except Exception:
-                    pass
 
-        # Minimal valid MP4 container atom structure
-        with open(target_path, "wb") as f:
-            f.write(b"\x00\x00\x00 ftypmp42\x00\x00\x00\x00isommp42\x00\x00\x00\x08free\x00\x00\x00\x10mdat\x00\x00\x00\x00")
-        return target_path
+        last_error = ""
+        ffmpeg_missing = False
+        for vcodec_args in codec_attempts:
+            cmd = [
+                self.ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"color=c=navy:s=1080x1920:r=2:d={duration:.2f}",
+                "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={duration:.2f}",
+                *vcodec_args,
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                "-shortest",
+                "-t", f"{duration:.2f}",
+                str(target_path),
+            ]
+            try:
+                res = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, errors="replace", timeout=60,
+                )
+                if res.returncode != 0:
+                    last_error = f"exit code {res.returncode}: {(res.stderr or '').strip()[-300:]}"
+                    target_path.unlink(missing_ok=True)
+                    continue
+                self.validate_clip_output(
+                    target_path,
+                    expected_duration=duration,
+                    duration_tolerance=1.5,
+                    expected_resolution=(1080, 1920),
+                    require_audio=True,
+                    decode_check=True,
+                )
+                return target_path
+            except FileNotFoundError as e:
+                ffmpeg_missing = True
+                last_error = str(e)
+                target_path.unlink(missing_ok=True)
+                break
+            except subprocess.TimeoutExpired:
+                last_error = f"FFmpeg timed out after 60s generating {duration:.2f}s synthetic video"
+                target_path.unlink(missing_ok=True)
+            except Exception as e:
+                last_error = str(e)
+                target_path.unlink(missing_ok=True)
+
+        # When the ffmpeg CLI binary is not installed (e.g. GitHub Actions ubuntu-24.04),
+        # generate a genuinely playable, valid 1080x1920 MP4 using OpenCV's bundled
+        # FFmpeg/libavcodec VideoWriter — never write corrupt/unplayable stub bytes.
+        if ffmpeg_missing:
+            try:
+                import cv2  # type: ignore
+                import numpy as np  # type: ignore
+
+                fps = 1.0
+                n_frames = max(1, int(round(duration * fps)))
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(target_path), fourcc, fps, (1080, 1920))
+                if not writer.isOpened():
+                    raise RuntimeError("OpenCV VideoWriter could not open MP4 output")
+                try:
+                    frame = np.full((1920, 1080, 3), (128, 0, 0), dtype=np.uint8)
+                    for _ in range(n_frames):
+                        writer.write(frame)
+                finally:
+                    writer.release()
+
+                self.validate_clip_output(
+                    target_path,
+                    expected_duration=duration,
+                    duration_tolerance=1.5,
+                    expected_resolution=(1080, 1920),
+                    require_audio=False,
+                    decode_check=True,
+                )
+                return target_path
+            except Exception as cv_err:
+                target_path.unlink(missing_ok=True)
+                last_error = f"{last_error}; OpenCV MP4 fallback failed: {cv_err}"
+
+        raise RuntimeError(
+            f"Failed to generate valid simulated MP4 at {target_path} (duration={duration:.2f}s): {last_error}"
+        )
 
     def _wrap_text_pillow(self, draw: Any, text: str, font: Any, max_width: int) -> List[str]:
         """Wrap words to fit inside specified pixel width."""
@@ -1237,7 +1438,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         1. Priority 1 (YouTube download & 45-58s viral cut)
         2. Priority 2 (Text-to-Video AI narration & B-roll)
         3. Priority 3 (Image slideshow & AI voiceover)
-        4. Simulation / Dry-run fallback
+        Simulation is available in explicit dry-run mode.
         """
         logger.info(f"=== Starting ClipMind Video Pipeline for: '{topic}' ===")
 
@@ -1246,81 +1447,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             logger.info("Operating in SIMULATION / DRY_RUN mode: Generating simulated vertical Short")
             out_path = self.output_dir / f"cycle_{cycle_id or int(time.time())}_simulated.mp4"
             self._create_simulated_video_file(out_path, duration=50.0)
+            media_info = self.get_media_info(out_path)
             return ClipResult(
                 video_path=out_path,
-                duration=50.0,
+                duration=round(media_info["duration"], 2),
                 aspect_ratio="9:16",
-                resolution=(1080, 1920),
+                resolution=(media_info["width"], media_info["height"]),
                 strategy_used=GenerationStrategy.SIMULATION.value,
                 hook_text=f"The Shocking Truth About {topic}",
                 audio_lufs=-14.0,
                 metadata={"dry_run": True, "topic": topic},
             )
 
-        # Explicit strategy request
-        if source_type == GenerationStrategy.YOUTUBE_EXTRACT.value or youtube_url:
-            try:
-                return self.extract_from_youtube(topic=topic, youtube_url=youtube_url, cycle_id=cycle_id)
-            except Exception as e:
-                logger.warning(f"Direct YouTube extraction failed ({e}), falling back to AI script")
-
-        elif source_type == GenerationStrategy.AI_SCRIPT_BROLL.value:
-            try:
-                return self.generate_from_ai_script(topic=topic, cycle_id=cycle_id)
-            except Exception as e:
-                logger.warning(f"AI script pipeline failed ({e}), falling back to slideshow")
-
-        elif source_type == GenerationStrategy.SLIDESHOW.value:
-            try:
-                return self.generate_from_slideshow(topic=topic, cycle_id=cycle_id)
-            except Exception as e:
-                logger.warning(f"Slideshow generation failed ({e}), using simulation")
-
-        # Fallback Ladder: Tier 1 -> Tier 2 -> Tier 3 -> Simulation
-        # In serverless environments (Vercel/Lambda) without explicit URL, prioritize AI script / slideshow
-        if is_serverless() and not youtube_url and not source_type:
-            logger.info("Serverless environment detected: optimizing pipeline for execution time limits")
-            try:
-                return self.generate_from_ai_script(topic=topic, cycle_id=cycle_id)
-            except Exception as e_serv:
-                logger.warning(f"Serverless AI script fallback to slideshow: {e_serv}")
-                try:
-                    return self.generate_from_slideshow(topic=topic, cycle_id=cycle_id)
-                except Exception:
-                    pass
-
-        # Tier 1
-        try:
+        if youtube_url or source_type == GenerationStrategy.YOUTUBE_EXTRACT.value:
             return self.extract_from_youtube(topic=topic, youtube_url=youtube_url, cycle_id=cycle_id)
-        except Exception as e1:
-            logger.warning(f"Priority 1 (YouTube source) failed: {e1}")
 
-        # Tier 2
-        try:
-            return self.generate_from_ai_script(topic=topic, cycle_id=cycle_id)
-        except Exception as e2:
-            logger.warning(f"Priority 2 (AI script / narration) failed: {e2}")
-
-        # Tier 3
-        try:
-            return self.generate_from_slideshow(topic=topic, cycle_id=cycle_id)
-        except Exception as e3:
-            logger.warning(f"Priority 3 (Slideshow fallback) failed: {e3}")
-
-        # Tier 4: Robust graceful simulation fallback
-        logger.info("All live rendering tiers exhausted: generating compliant simulation clip")
-        out_path = self.output_dir / f"cycle_{cycle_id or int(time.time())}_fallback.mp4"
-        self._create_simulated_video_file(out_path, duration=50.0)
-        return ClipResult(
-            video_path=out_path,
-            duration=50.0,
-            aspect_ratio="9:16",
-            resolution=(1080, 1920),
-            strategy_used=GenerationStrategy.SIMULATION.value,
-            hook_text=f"The Hidden Secret Behind {topic}",
-            audio_lufs=-14.0,
-            metadata={"fallback_simulation": True, "topic": topic},
-        )
+        strategies = {
+            GenerationStrategy.YOUTUBE_EXTRACT.value: self.extract_from_youtube,
+            GenerationStrategy.AI_SCRIPT_BROLL.value: self.generate_from_ai_script,
+            GenerationStrategy.SLIDESHOW.value: self.generate_from_slideshow,
+        }
+        if source_type:
+            if source_type not in strategies:
+                raise ValueError(f"Unknown generation strategy: {source_type}")
+            return strategies[source_type](topic=topic, cycle_id=cycle_id)
+        order = list(strategies)
+        if is_serverless():
+            order = order[1:] + order[:1]
+        failures = []
+        last_error = None
+        for strategy in order:
+            try:
+                return strategies[strategy](topic=topic, cycle_id=cycle_id)
+            except Exception as e:
+                last_error = e
+                failures.append(f"{strategy}: {e}")
+                logger.warning("ClipMind strategy %s failed: %s", strategy, e)
+        raise RuntimeError("Clip generation failed: " + "; ".join(failures)) from last_error
 
 
 # Module-level convenience function

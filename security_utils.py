@@ -44,7 +44,7 @@ def normalize_media_url(raw_url: str) -> str:
     # Extract embedded http(s) URL if user pasted share text ("Watch this https://youtu.be/...")
     embedded = re.search(r"https?://[^\s\"'<>]+", s, flags=re.IGNORECASE)
     if embedded:
-        s = embedded.group(0)
+        s = embedded.group(0).rstrip(".,);]")
 
     # Check for bare YouTube video ID (11 chars), possibly with query params (?si=... etc)
     # e.g. BgeNDG5jD60?si=zSjxkinw2zPaaAPH or BgeNDG5jD60
@@ -63,15 +63,16 @@ def normalize_media_url(raw_url: str) -> str:
     # If scheme is missing (e.g. youtube.com/watch?v=... or youtu.be/...)
     if not s.startswith(("http://", "https://")):
         if any(s.lower().startswith(prefix) for prefix in (
-            "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "studio.youtube.com", "youtu.be",
+            "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+            "studio.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com", "youtu.be",
             "twitch.tv", "www.twitch.tv", "kick.com", "www.kick.com",
             "tiktok.com", "www.tiktok.com", "instagram.com", "www.instagram.com",
         )):
             s = "https://" + s
 
-    # Canonicalize any youtu.be, /shorts/, /live/, /embed/, /v/, studio.youtube.com/video/ID
+    # Canonicalize any youtu.be, /shorts/, /live/, /embed/, /v/, studio.youtube.com/video/ID, youtube-nocookie.com
     yt_match = re.search(
-        r"(?:youtu\.be/|youtube\.com/(?:embed/|v/|shorts/|live/|video/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
+        r"(?:youtu\.be/|(?:youtube(?:-nocookie)?\.com)/(?:embed/|v/|shorts/|live/|video/|(?:watch\?(?:.*&)?v=)))([a-zA-Z0-9_-]{11})",
         s,
         flags=re.IGNORECASE,
     )

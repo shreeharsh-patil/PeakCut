@@ -15,6 +15,8 @@ import logging
 import math
 import os
 import subprocess
+import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,42 +43,77 @@ def extract_audio_energy(
     video_or_audio_path: Path | str,
     sample_rate: int = 8000,
     window_sec: float = 0.5,
+    timeout: int = 600,
 ) -> Tuple[np.ndarray, float]:
-    """Decode audio via FFmpeg to raw mono PCM and compute RMS energy per window."""
+    """Decode audio via FFmpeg to raw mono PCM and compute RMS energy per window.
+
+    Streams PCM window-by-window so multi-hour videos use O(num_windows) RAM
+    instead of buffering gigabytes of decoded samples into memory.
+    """
+    samples_per_win = int(sample_rate * window_sec)
+    if sample_rate <= 0 or samples_per_win <= 0:
+        return np.array([], dtype=np.float32), 0.0
+
+    chunk_bytes = samples_per_win * 2  # 16-bit signed mono PCM
     cmd = [
         "ffmpeg",
-        "-v", "error",
+        "-nostdin", "-v", "error", "-xerror",
         "-i", str(video_or_audio_path),
+        "-vn",
         "-ac", "1",
         "-ar", str(sample_rate),
         "-f", "s16le",
         "-",
     ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, check=True)
-        raw_pcm = proc.stdout
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg audio extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
-        return np.array([]), 0.0
+    rms_values: List[float] = []
+    total_samples = 0
+    # A second pipe can fill while stdout is being read. Use a file for
+    # diagnostics and start the deadline before any potentially blocking read.
+    with tempfile.TemporaryFile() as stderr:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr)
+        except OSError as e:
+            logger.error("FFmpeg audio extraction failed to start: %s", e)
+            return np.array([], dtype=np.float32), 0.0
 
-    if len(raw_pcm) % 2 != 0:
-        raw_pcm = raw_pcm[:len(raw_pcm) - (len(raw_pcm) % 2)]
-    if not raw_pcm:
-        return np.array([]), 0.0
+        expired = threading.Event()
 
-    samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    total_samples = len(samples)
+        def stop_on_timeout():
+            if proc.poll() is None:
+                expired.set()
+                proc.kill()
+
+        watchdog = threading.Timer(timeout, stop_on_timeout)
+        watchdog.start()
+        try:
+            while data := proc.stdout.read(chunk_bytes):
+                total_samples += len(data) // 2
+                if len(data) == chunk_bytes:
+                    samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+                    rms_values.append(float(np.sqrt(np.mean(samples ** 2) + 1e-10)))
+            proc.wait()
+        finally:
+            watchdog.cancel()
+            watchdog.join()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        if expired.is_set():
+            logger.error("FFmpeg audio extraction timed out after %ss", timeout)
+            return np.array([], dtype=np.float32), 0.0
+        if proc.returncode != 0:
+            stderr.seek(max(0, stderr.tell() - 300))
+            error = stderr.read().decode("utf-8", errors="replace")
+            logger.error("FFmpeg audio extraction failed (rc=%d): %s", proc.returncode, error)
+            return np.array([], dtype=np.float32), 0.0
+
     duration_sec = total_samples / float(sample_rate) if sample_rate else 0.0
-
-    samples_per_win = int(sample_rate * window_sec)
-    if samples_per_win <= 0 or total_samples < samples_per_win:
-        return np.array([]), duration_sec
-
-    num_windows = total_samples // samples_per_win
-    truncated = samples[: num_windows * samples_per_win].reshape(-1, samples_per_win)
-    rms_envelope = np.sqrt(np.mean(truncated ** 2, axis=1) + 1e-10)
-
-    return rms_envelope, duration_sec
+    if not rms_values:
+        return np.array([], dtype=np.float32), duration_sec
+    return np.asarray(rms_values, dtype=np.float32), duration_sec
 
 
 def detect_highlights(
@@ -98,30 +135,40 @@ def detect_hype_moments(
     min_gap_sec: float = 25.0,
     smooth_sec: float = 3.0,
     percentile_threshold: float = 85.0,
+    min_rms_floor: float = 0.008,
 ) -> List[HighlightMoment]:
-    """Identify the top hype moments in audio energy."""
+    """Identify the top non-overlapping hype moments in audio energy."""
     window_sec = 0.5
     envelope, duration = extract_audio_energy(media_path, sample_rate=8000, window_sec=window_sec)
     if envelope.size == 0 or duration < 10.0:
         return []
 
+    # Reject completely silent / digital-zero audio tracks instead of scoring noise floor
+    if float(np.max(envelope)) < min_rms_floor:
+        return []
+
     # Apply convolution smoothing kernel to detect sustained energy
     kernel_size = max(1, int(round(smooth_sec / window_sec)))
-    kernel = np.ones(kernel_size) / kernel_size
+    kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
     smoothed = np.convolve(envelope, kernel, mode="same")
 
-    # Threshold based on percentile
-    thresh = float(np.percentile(smoothed, percentile_threshold))
+    # Threshold based on percentile and absolute noise floor
+    baseline = float(np.median(smoothed))
+    thresh = max(float(np.percentile(smoothed, percentile_threshold)), min_rms_floor)
     peak_candidates: List[Tuple[float, float]] = []  # (time_sec, smoothed_score)
 
     for i in range(1, len(smoothed) - 1):
-        val = smoothed[i]
-        if val > thresh and val >= smoothed[i - 1] and val >= smoothed[i + 1]:
+        val = float(smoothed[i])
+        if val > thresh and val >= float(smoothed[i - 1]) and val >= float(smoothed[i + 1]):
             time_sec = i * window_sec
-            peak_candidates.append((time_sec, float(val)))
+            peak_candidates.append((time_sec, val))
+
+    if not peak_candidates:
+        return []
 
     # Sort peaks by score descending
     peak_candidates.sort(key=lambda x: x[1], reverse=True)
+    max_peak = max(p[1] for p in peak_candidates)
 
     selected_moments: List[HighlightMoment] = []
     used_times: List[float] = []
@@ -130,12 +177,23 @@ def detect_hype_moments(
         if any(abs(peak_t - u) < min_gap_sec for u in used_times):
             continue
 
+        clip_span = min(float(target_clip_duration), float(duration))
         start_t = max(0.0, peak_t - pre_peak_sec)
-        end_t = min(duration, start_t + target_clip_duration)
+        end_t = start_t + clip_span
+        if end_t > duration:
+            end_t = float(duration)
+            start_t = max(0.0, end_t - clip_span)
         actual_dur = end_t - start_t
 
+        # Prevent interval overlap with already-selected moments
+        if any(not (end_t <= m.start or start_t >= m.end) for m in selected_moments):
+            continue
+
         if actual_dur >= 5.0:
-            norm_score = min(100.0, round(score * 300.0, 1))
+            # Score from measurable prominence over baseline + absolute RMS loudness
+            prominence = min(1.0, (score - baseline) / max(max_peak - baseline, 1e-4))
+            loudness_factor = min(1.0, score / 0.35)
+            norm_score = round(min(100.0, max(1.0, (0.55 * prominence + 0.45 * loudness_factor) * 100.0)), 1)
             moment = HighlightMoment(
                 start=round(start_t, 2),
                 end=round(end_t, 2),

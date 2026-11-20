@@ -191,55 +191,30 @@ class MasterOrchestrator:
         cycle_dir = self.config.paths.output_dir / f"cycle_{cycle_id}"
         cycle_dir.mkdir(parents=True, exist_ok=True)
         final_video_path = cycle_dir / "final_clip.mp4"
-        captions_path = cycle_dir / "captions.srt"
-
         def _do_video_pipeline() -> Dict[str, Any]:
-            # Priority 1: Use ClipPipeline
-            try:
-                from clipmind.generation.clip_pipeline import generate_clip
-                clip_result = generate_clip(topic=topic, cycle_id=cycle_id, config=self.config)
-                if clip_result and hasattr(clip_result, "video_path") and Path(clip_result.video_path).exists():
-                    # Copy or link to final_clip.mp4 inside cycle_dir
-                    res_path = Path(clip_result.video_path)
-                    if res_path.resolve() != final_video_path.resolve():
-                        import shutil
-                        shutil.copyfile(res_path, final_video_path)
+            import shutil
+            from clipmind.generation.clip_pipeline import GenerationStrategy, generate_clip
 
-                    return {
-                        "video_path": str(final_video_path),
-                        "duration_seconds": clip_result.duration,
-                        "aspect_ratio": clip_result.aspect_ratio,
-                        "resolution": f"{clip_result.resolution[0]}x{clip_result.resolution[1]}" if isinstance(clip_result.resolution, tuple) else str(clip_result.resolution),
-                        "strategy_used": clip_result.strategy_used,
-                        "hook_text": clip_result.hook_text,
-                        "audio_lufs": clip_result.audio_lufs,
-                    }
-            except Exception as e:
-                logger.warning(f"ClipPipeline direct generation note: {e}. Ensuring compliant fallback asset.")
-
-            # Fallback compliant video generation
-            srt_content = (
-                "1\n00:00:00,000 --> 00:00:03,500\nDid you know about this secret?\n\n"
-                "2\n00:00:03,600 --> 00:00:08,200\nThis will completely blow your mind!\n\n"
-                "3\n00:00:08,300 --> 00:00:28,000\nEverything you were told about this was wrong.\n\n"
-                "4\n00:00:28,100 --> 00:00:48,000\nHere is how top experts use it today.\n\n"
-                "5\n00:00:48,100 --> 00:00:52,000\nSubscribe for more daily secrets!\n"
-            )
-            with open(captions_path, "w", encoding="utf-8") as f:
-                f.write(srt_content)
-
-            if not final_video_path.exists():
-                with open(final_video_path, "wb") as f:
-                    f.write(b"ClipMind compliant vertical video container (1080x1920, 52s, -14 LUFS)")
+            clip = generate_clip(topic=topic, cycle_id=cycle_id, config=self.config)
+            if clip.strategy_used == GenerationStrategy.SIMULATION.value and not self.config.dry_run:
+                raise RuntimeError("Cannot use a simulated clip in a live cycle.")
+            source = Path(clip.video_path)
+            if source.resolve() != final_video_path.resolve():
+                staged_video = final_video_path.with_suffix(".mp4.part")
+                try:
+                    shutil.copyfile(source, staged_video)
+                    staged_video.replace(final_video_path)
+                finally:
+                    staged_video.unlink(missing_ok=True)
 
             return {
                 "video_path": str(final_video_path),
-                "captions_path": str(captions_path),
-                "duration_seconds": 52.0,
-                "aspect_ratio": "9:16",
-                "resolution": "1080x1920",
-                "audio_lufs": -14.0,
-                "strategy_used": "Priority 2 (AI Script + Narration + B-Roll)",
+                "duration_seconds": clip.duration,
+                "aspect_ratio": clip.aspect_ratio,
+                "resolution": f"{clip.resolution[0]}x{clip.resolution[1]}",
+                "strategy_used": clip.strategy_used,
+                "hook_text": clip.hook_text,
+                "audio_lufs": clip.audio_lufs,
             }
 
         try:

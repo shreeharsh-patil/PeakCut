@@ -14,9 +14,19 @@ import json
 import logging
 import re
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from ffmpeg_utils import (
+    DELIVERY,
+    METADATA_SCRUB,
+    probe_media,
+    run_ffmpeg_with_fallback,
+    validate_media_output,
+    video_encode_args,
+)
 
 logger = logging.getLogger("openshorts.smartcut")
 
@@ -39,6 +49,8 @@ def detect_silences(
     media_path: Path | str,
     noise_db: float = -32.0,
     min_silence_sec: float = 0.5,
+    total_duration: Optional[float] = None,
+    timeout: int = 300,
 ) -> List[Tuple[float, float]]:
     """Detect non-talking silence ranges using FFmpeg's silencedetect filter."""
     cmd = [
@@ -50,8 +62,8 @@ def detect_silences(
         "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="ignore")
-        stderr = proc.stderr
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="ignore", timeout=timeout)
+        stderr = proc.stderr or ""
     except Exception as e:
         logger.error(f"FFmpeg silencedetect execution failed: {e}")
         return []
@@ -71,6 +83,10 @@ def detect_silences(
                 if silence_end > current_start:
                     silences.append((current_start, silence_end))
                 current_start = None
+
+    # Trailing silence reaching EOF has silence_start without a closing silence_end
+    if current_start is not None and total_duration is not None and total_duration > current_start:
+        silences.append((current_start, float(total_duration)))
 
     return silences
 
@@ -128,20 +144,33 @@ def compute_speech_segments(
     min_speech_len: float = 0.3,
 ) -> List[Tuple[float, float]]:
     """Invert silence intervals to active speech segments with protective padding."""
+    if total_duration <= 0:
+        return []
     if not silences:
-        return [(0.0, total_duration)] if total_duration > 0 else []
+        return [(0.0, total_duration)]
+
+    # Normalize, clamp, and sort silence ranges
+    cleaned_silences = sorted(
+        (max(0.0, float(s)), min(float(total_duration), float(e)))
+        for s, e in silences
+        if float(e) > float(s)
+    )
+    if not cleaned_silences:
+        return [(0.0, total_duration)]
 
     speech: List[Tuple[float, float]] = []
     cursor = 0.0
 
-    for s_start, s_end in silences:
+    for s_start, s_end in cleaned_silences:
+        if s_end <= cursor:
+            continue
         seg_start = cursor
-        seg_end = max(seg_start, s_start + pad_pre)
+        seg_end = min(float(total_duration), max(seg_start, s_start + pad_pre))
 
         if seg_end - seg_start >= min_speech_len:
             speech.append((round(seg_start, 3), round(seg_end, 3)))
 
-        cursor = max(cursor, s_end - pad_post)
+        cursor = max(cursor, max(0.0, s_end - pad_post))
 
     if total_duration - cursor >= min_speech_len:
         speech.append((round(cursor, 3), round(total_duration, 3)))
@@ -174,22 +203,34 @@ def apply_smartcut(
         raise ValueError("input_video and output_video cannot be the same file")
     output_p.parent.mkdir(parents=True, exist_ok=True)
 
-    total_dur = get_media_duration(input_p)
+    probe = probe_media(input_p)
+    total_dur = probe["duration"] if probe.get("valid") else get_media_duration(input_p)
     if total_dur <= 0:
         raise ValueError(f"Could not read duration of {input_p}")
 
-    has_audio = has_audio_stream(input_p)
-    silences = detect_silences(input_p, noise_db=noise_db, min_silence_sec=min_silence_sec) if has_audio else []
+    has_audio = probe.get("has_audio", False) if probe.get("valid") else has_audio_stream(input_p)
+    silences = (
+        detect_silences(input_p, noise_db=noise_db, min_silence_sec=min_silence_sec, total_duration=total_dur)
+        if has_audio
+        else []
+    )
     speech = compute_speech_segments(total_dur, silences)
 
-    if not speech or len(speech) <= 1 and (speech[0][1] - speech[0][0]) >= total_dur - 0.5:
-        # No significant silences found: stream copy
-        subprocess.run(["ffmpeg", "-y", "-i", str(input_p), "-c", "copy", str(output_p)], check=True)
+    if not speech or (len(speech) <= 1 and (speech[0][1] - speech[0][0]) >= total_dur - 0.5):
+        # No significant silences (or 100% silent track): stream copy safely
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(input_p), "-c", "copy", *METADATA_SCRUB, "-movflags", "+faststart", str(output_p)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300,
+        )
+        ok, info, reason = validate_media_output(output_p, require_video=True)
+        if not ok:
+            output_p.unlink(missing_ok=True)
+            raise RuntimeError(f"SmartCut stream copy validation failed: {reason}")
         return SmartCutResult(
             input_path=str(input_p),
             output_path=str(output_p),
-            original_duration=total_dur,
-            tightened_duration=total_dur,
+            original_duration=round(total_dur, 2),
+            tightened_duration=round(info["duration"], 2),
             seconds_saved=0.0,
             time_saved_percent=0.0,
             cuts_count=0,
@@ -219,7 +260,7 @@ def apply_smartcut(
     script_path = None
     cmd = ["ffmpeg", "-y", "-i", str(input_p)]
     if len(full_filter) > 2000:
-        script_path = output_p.parent / f"filter_{int(time.time()*1000)}.txt"
+        script_path = output_p.parent / f"filter_{int(time.time() * 1000)}.txt"
         script_path.write_text(full_filter, encoding="utf-8")
         cmd.extend(["-filter_complex_script", str(script_path)])
     else:
@@ -229,33 +270,32 @@ def apply_smartcut(
     if has_audio:
         cmd.extend(["-map", "[outa]"])
 
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-    ])
+    cmd.extend(video_encode_args(DELIVERY))
+    if "-pix_fmt" not in cmd:
+        cmd.extend(["-pix_fmt", "yuv420p"])
     if has_audio:
-        cmd.extend([
-            "-c:a", "aac",
-            "-b:a", "160k",
-        ])
-    cmd.extend([
-        "-movflags", "+faststart",
-        str(output_p),
-    ])
+        cmd.extend(["-c:a", "aac", "-b:a", "160k", "-ar", "48000"])
+    cmd.extend([*METADATA_SCRUB, "-movflags", "+faststart", str(output_p)])
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = run_ffmpeg_with_fallback(cmd, timeout=600, tier=DELIVERY)
     finally:
         if script_path and script_path.exists():
             try:
                 script_path.unlink()
-            except Exception:
+            except OSError:
                 pass
     if res.returncode != 0:
-        raise RuntimeError(f"FFmpeg SmartCut failed: {res.stderr[-300:]}")
+        output_p.unlink(missing_ok=True)
+        err_text = (res.stderr or b"").decode("utf-8", errors="replace")[-300:]
+        raise RuntimeError(f"FFmpeg SmartCut failed: {err_text}")
 
-    new_dur = get_media_duration(output_p)
+    ok, out_info, reason = validate_media_output(output_p, require_video=True, require_audio=has_audio)
+    if not ok:
+        output_p.unlink(missing_ok=True)
+        raise RuntimeError(f"SmartCut output validation failed: {reason}")
+
+    new_dur = out_info["duration"]
     saved = max(0.0, total_dur - new_dur)
     saved_pct = (saved / total_dur * 100.0) if total_dur > 0 else 0.0
 

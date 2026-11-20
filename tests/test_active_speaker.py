@@ -96,6 +96,10 @@ class TestHold:
     def test_unclear_windows_inherit_the_current_speaker(self):
         assert hold([0, None, None, 0], min_windows=3) == [0, 0, 0, 0]
 
+    def test_unclear_windows_break_the_pending_speaker_run(self):
+        verdicts = [0, 1, 1, None, 1, 1, 1]
+        assert hold(verdicts, min_windows=3) == [0, 0, 0, 0, 0, 0, 1]
+
     def test_lead_in_is_backfilled(self):
         assert hold([None, None, 1, 1, 1], min_windows=1)[0] == 1
 
